@@ -168,7 +168,7 @@ fn main() {
         use_connected_socket: !matches.get_flag("disable-connected-udp"),
         #[cfg(target_os = "linux")]
         use_multi_queue: !matches.get_flag("disable-multi-queue"),
-        open_uapi_socket: false,
+        open_uapi_socket: true,
         protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
         firewall_process_inbound_callback: None,
         firewall_process_outbound_callback: None,
