@@ -6,6 +6,7 @@ use super::errors::WireGuardError;
 use crate::noise::{safe_duration::SafeDuration as Duration, Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::AtomicU16;
 use std::time::SystemTime;
 
 #[cfg(feature = "mock-instant")]
@@ -42,7 +43,7 @@ pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TimerName {
     /// Current time, updated each call to `update_timers`
     TimeCurrent,
@@ -65,6 +66,19 @@ pub enum TimerName {
     Top,
 }
 
+impl TimerName {
+    pub const VALUES: [Self; TimerName::Top as usize - 1] = [
+        Self::TimeSessionEstablished,
+        Self::TimeLastHandshakeStarted,
+        Self::TimeLastPacketReceived,
+        Self::TimeLastPacketSent,
+        Self::TimeLastDataPacketReceived,
+        Self::TimeLastDataPacketSent,
+        Self::TimeCookieReceived,
+        Self::TimePersistentKeepalive,
+    ];
+}
+
 use self::TimerName::*;
 
 #[derive(Debug)]
@@ -82,6 +96,7 @@ pub struct Timers {
     persistent_keepalive: usize,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
+    timers_to_update_mask: AtomicU16,
 }
 
 impl Timers {
@@ -95,6 +110,7 @@ impl Timers {
             want_handshake_since: Default::default(),
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             should_reset_rr: reset_rr,
+            timers_to_update_mask: Default::default(),
         }
     }
 
@@ -128,7 +144,13 @@ impl IndexMut<TimerName> for Timers {
 }
 
 impl Tunn {
-    pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
+    pub(super) fn mark_timer_to_update(&self, timer_name: TimerName) {
+        self.timers
+            .timers_to_update_mask
+            .fetch_or(1 << timer_name as u16, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn timer_tick(&mut self, timer_name: TimerName) {
         let time = self.timers[TimeCurrent];
         match timer_name {
             TimeLastPacketReceived => {
@@ -206,6 +228,21 @@ impl Tunn {
         // to a second, as there is no real benefit to having highly accurate timers.
         let now = time.duration_since(self.timers.time_started).into();
         self.timers[TimeCurrent] = now;
+
+        // Check which timers to update, and update them
+        let timer_mask = self
+            .timers
+            .timers_to_update_mask
+            .load(std::sync::atomic::Ordering::Relaxed);
+        for timer_name in TimerName::VALUES {
+            if (timer_mask & (1 << (timer_name as u16))) != 0 {
+                self.timer_tick(timer_name);
+            }
+        }
+        // Reset all marked bits
+        self.timers
+            .timers_to_update_mask
+            .store(0, std::sync::atomic::Ordering::Relaxed);
 
         self.update_session_timers(now);
 
@@ -378,5 +415,57 @@ impl Tunn {
 
     pub fn set_persistent_keepalive(&mut self, keepalive: u16) {
         self.timers.persistent_keepalive = keepalive as usize;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::RngCore;
+    use rand_core::OsRng;
+
+    use crate::noise::{safe_duration::SafeDuration, Tunn};
+
+    use super::TimerName;
+
+    #[test]
+    fn test_update_marked_timers() {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_idx = OsRng.next_u32();
+
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        let mut my_tun =
+            Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
+
+        // Mark timers to update
+        my_tun.mark_timer_to_update(super::TimerName::TimeLastDataPacketSent);
+        my_tun.mark_timer_to_update(super::TimerName::TimeLastDataPacketReceived);
+        my_tun.mark_timer_to_update(super::TimerName::TimePersistentKeepalive);
+
+        // Update timers
+        my_tun.update_timers(&mut [0]);
+
+        // Only those timers marked should be udpated
+        assert!(!my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());
+        assert!(!my_tun.timers[TimerName::TimeLastDataPacketReceived].is_zero());
+        assert!(!my_tun.timers[TimerName::TimePersistentKeepalive].is_zero());
+
+        // Unmarked timers should still be 0
+        assert!(my_tun.timers[TimerName::TimeCookieReceived].is_zero());
+        assert!(my_tun.timers[TimerName::TimeLastHandshakeStarted].is_zero());
+        assert!(my_tun.timers[TimerName::TimeLastPacketReceived].is_zero());
+
+        // Reset the timers
+        my_tun.timers[TimerName::TimeLastDataPacketSent] = SafeDuration::from_millis(0);
+        my_tun.timers[TimerName::TimeLastDataPacketReceived] = SafeDuration::from_millis(0);
+        my_tun.timers[TimerName::TimePersistentKeepalive] = SafeDuration::from_millis(0);
+
+        my_tun.update_timers(&mut [0]);
+
+        // Now the timers should not update
+        assert!(my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());
+        assert!(my_tun.timers[TimerName::TimeLastDataPacketReceived].is_zero());
+        assert!(my_tun.timers[TimerName::TimePersistentKeepalive].is_zero());
     }
 }
