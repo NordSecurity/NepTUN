@@ -38,13 +38,21 @@ impl Client {
             unexpected => println!("Received unexpected TunnResult: {unexpected:?}"),
         }
         let mut handshake_buf = vec![0; 512];
+        let handshake_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(3));
+        tokio::pin!(handshake_timeout);
         loop {
-            let recv_type = self.recv_encrypted(&mut handshake_buf).await;
-            if matches!(recv_type, RecvType::Handshake) {
-                break;
+            tokio::select! {
+                recv_type = self.recv_encrypted(&mut handshake_buf) => {
+                    if matches!(recv_type, RecvType::Handshake) {
+                        println!("Handshake: done");
+                        return;
+                    }
+                }
+                _ = &mut handshake_timeout => {
+                    panic!("Handshake timed out");
+                }
             }
         }
-        println!("Handshake: done");
     }
 
     pub async fn send_packet(

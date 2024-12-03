@@ -165,7 +165,7 @@ impl EventLoop {
         loop {
             tokio::select! {
                 _ = &mut finish_timeout, if self.is_done => {
-                    self.on_finished("Exceeded timeout").await;
+                    self.on_finished(self.packets.len()).await;
                     break;
                 },
                 _ = wg_tick_interval.tick() => {
@@ -280,11 +280,6 @@ impl EventLoop {
                     self.packets[index as usize].recv_ts = Some(recv_ts);
                     self.recv_packet += 1;
                 }
-                if self.recv_packet >= self.cli_args.packet_count {
-                    self.on_finished("Got all packets").await;
-                    self.is_done = true;
-                    return true;
-                }
             }
         }
         false
@@ -308,17 +303,12 @@ impl EventLoop {
                 self.packets[index as usize].recv_ts = Some(recv_ts);
                 self.recv_packet += 1;
             }
-            if self.recv_packet >= self.cli_args.packet_count {
-                self.on_finished("Got all packets").await;
-                self.is_done = true;
-                return true;
-            }
         }
         false
     }
 
-    async fn on_finished(&mut self, msg: &str) {
-        println!("{msg}. Breaking");
+    async fn on_finished(&mut self, recv_packet_count: usize) {
+        println!("Test done, received {recv_packet_count} packets");
         write_to_csv(&self.cli_args.csv_name, &self.packets);
         self.done_tx.send(()).await.unwrap();
     }

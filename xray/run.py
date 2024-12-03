@@ -13,7 +13,7 @@ WG_IFC_NAME = "xraywg1"
 
 def run_command(cmd, capture_output=False):
     args = shlex.split(cmd)
-    run = subprocess.run(args, capture_output=capture_output)
+    run = subprocess.run(args, capture_output=capture_output,check=True)
     return (run.stdout, run.stderr)
 
 
@@ -76,10 +76,13 @@ def start_tcpdump(pcap_name):
     )
 
 
-def run_xray(wg, test_type, count):
-    run_command(
-        f"cargo run --release -- {wg} {test_type} {count} {get_csv_name(wg, test_type, count)}"
-    )
+def run_xray(wg, test_type, count, build_xray):
+    if build_xray:
+        run_command(
+            f"cargo run --release -- {wg} {test_type} {count} {get_csv_name(wg, test_type, count)}"
+        )
+    else:
+        run_command(f"sudo ../target/release/xray {wg} {test_type} {count} {get_csv_name(wg, test_type, count)}")
 
 
 def stop_tcpdump(tcpdump):
@@ -88,9 +91,9 @@ def stop_tcpdump(tcpdump):
 
 def destroy_wireguard(wg):
     if wg == Wireguard.NepTUN:
-        run_command("killall neptun-cli")
+        run_command("killall -9 neptun-cli")
     elif wg == Wireguard.BoringTun:
-        run_command("killall boringtun-cli")
+        run_command("killall -9 boringtun-cli")
     else:
         run_command(f"sudo ip link delete {WG_IFC_NAME}")
 
@@ -98,9 +101,10 @@ def destroy_wireguard(wg):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wg")
-    parser.add_argument("--test_type")
+    parser.add_argument("--test-type")
     parser.add_argument("--count")
-    parser.add_argument("--nobuild", action="store_true")
+    parser.add_argument("--nobuild-neptun", action="store_true")
+    parser.add_argument("--nobuild-xray", action="store_true")
     args = parser.parse_args()
 
     wg = Wireguard.from_str(args.wg)
@@ -111,7 +115,8 @@ def main():
     ], f"Invalid test type '{test_type}'. Valid options are 'crypto' and 'pt'"
     count = int(args.count) if args.count is not None else 10
     assert count > 0, f"Count must be at least one, but got {count}"
-    build_neptun = args.nobuild is None
+    build_neptun = args.nobuild_neptun is False
+    build_xray = args.nobuild_xray is False
 
     Path("results/").mkdir(parents=True, exist_ok=True)
     try:
@@ -125,8 +130,9 @@ def main():
 
     succeeded = True
     try:
-        run_xray(wg.name, test_type, count)
+        run_xray(wg.name, test_type, count, build_xray)
     except:  # noqa: E722
+        print("xray failed. Exiting...")
         succeeded = False
     finally:
         stop_tcpdump(tcpdump)

@@ -4,7 +4,7 @@ A tool to inspect the performance of different wireguard implementations
 
 ## How it works
 
-The setup consists of two clients and a wireguard interface. One of the clients sends and receives encrypted packets (let's call this the crypto socket), and the other sends and receives plaintext packets (let's call this the plaintext socket). The packets that are being sent contain a sequence number so that the receivning socket can now which packet it is, and a timestamp of when it was sent. 
+The setup consists of two clients and a wireguard interface. One of the clients sends and receives encrypted packets (let's call this the crypto socket), and the other sends and receives plaintext packets (let's call this the plaintext socket). The packets that are being sent contain a sequence number so that the receiving socket can now which packet it is, and a timestamp of when it was sent. 
 
 Execution consists of these steps:
 1. The wireguard interface is started
@@ -21,6 +21,8 @@ Execution consists of these steps:
 ## Running it
 
 X-Ray currently only works on linux
+
+Nordlayer and/or nordvpn might interfere with xray, so try disabling them if you're not receving any of the packets
 
 ### Support
 
@@ -50,4 +52,4 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 - There are multiple inefficiencies that could potentially impact the test results, the main one being not reusing buffers when creating and sending packets. Each packet that gets constructed allocates a new buffer when they could all reuse the same one
 
-- Sometimes the program hangs doing a handshake with the wg interface. When that happens, cancelling the execution with `ctrl+c` and then running again "fixes" it. Sometimes you might need to `ctrl+c` and rerun multiple times, but that has been quite rare so far
+- Sometimes the wireguard handshake times out. When that happens, just rerun and it should be fine. Having to rerun multiple times is rare, but it happens
