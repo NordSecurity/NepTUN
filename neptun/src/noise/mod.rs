@@ -46,6 +46,9 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+/// Where encrypted data resides in a data packet
+pub const DATA_OFFSET: usize = 16;
+
 #[derive(Debug)]
 pub enum TunnResult<'a> {
     Done,
@@ -271,29 +274,29 @@ impl Tunn {
     /// # Panics
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn encapsulate<'a>(&mut self, buffer: &'a mut [u8], data_len: usize) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.format_packet_data(buffer, data_len);
             self.mark_timer_to_update(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if !data_len != 0 {
                 self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.len();
             return TunnResult::WriteToNetwork(packet);
         }
 
-        if !src.is_empty() {
+        if !data_len != 0 {
             // If there is no session, queue the packet for future retry,
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
-            self.queue_packet(src);
+            self.queue_packet(&buffer[..data_len]);
         }
 
         // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        self.format_handshake_initiation(buffer, false)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -393,7 +396,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = session.format_packet_data(dst, 0);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -560,7 +563,9 @@ impl Tunn {
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         if let Some(packet) = self.dequeue_packet() {
-            match self.encapsulate(&packet, dst) {
+            let len = packet.len();
+            dst[..len].copy_from_slice(&packet);
+            match self.encapsulate(dst, len) {
                 TunnResult::Err(_) => {
                     // On error, return packet to the queue
                     self.requeue_packet(packet);
@@ -824,9 +829,9 @@ mod tests {
         let mut my_dst = [0u8; 1024];
         let mut their_dst = [0u8; 1024];
 
-        let sent_packet_buf = create_ipv4_udp_packet();
+        let mut sent_packet_buf = create_ipv4_udp_packet();
 
-        let data = my_tun.encapsulate(&sent_packet_buf, &mut my_dst);
+        let data = my_tun.encapsulate(&mut sent_packet_buf, sent_packet_buf.len());
         assert!(matches!(data, TunnResult::WriteToNetwork(_)));
         let data = if let TunnResult::WriteToNetwork(sent) = data {
             sent
