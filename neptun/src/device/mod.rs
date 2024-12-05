@@ -40,6 +40,7 @@ use std::thread;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::DATA_OFFSET;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -1025,8 +1026,9 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
+                    let src_buf = &mut t.src_buf[DATA_OFFSET..];
+                    let src_len = match iface.read(&mut src_buf[..mtu]) {
+                        Ok(src) => src.len(),
                         Err(Error::IfaceRead(e)) => {
                             let ek = e.kind();
                             if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
@@ -1045,7 +1047,7 @@ impl Device {
                         }
                     };
 
-                    let dst_addr = match Tunn::dst_address(src) {
+                    let dst_addr = match Tunn::dst_address(&src_buf[..src_len]) {
                         Some(addr) => addr,
                         None => continue,
                     };
@@ -1057,14 +1059,14 @@ impl Device {
 
 
                     if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                        if !callback(&peer.public_key.0, src) {
+                        if !callback(&peer.public_key.0, &src_buf[..src_len]) {
                             continue;
                         }
                     }
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
+                        tun.encapsulate(&mut t.src_buf[..], src_len)
                     };
                     match res {
                         TunnResult::Done => {}
