@@ -3,6 +3,7 @@ use std::{
     process::Command,
 };
 
+use serde::Serialize;
 use tokio::net::UnixStream;
 
 use crate::{
@@ -28,14 +29,23 @@ pub enum RecvType {
 
 /// A `send_index` is not stored in the packet since they are added, in order, to a vector when they're sent
 /// so their index in that vector accurately represents the send index
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default, Serialize)]
 pub struct Packet {
-    pub send_ts: u128,
     pub recv_index: Option<u64>,
+    pub send_ts: u128,
+    pub pre_wg_ts: Option<u128>,
+    pub post_wg_ts: Option<u128>,
     pub recv_ts: Option<u128>,
 }
 
 impl Packet {
+    pub fn new(send_ts: u128) -> Self {
+        Self {
+            send_ts,
+            ..Default::default()
+        }
+    }
+
     pub const fn send_size() -> usize {
         std::mem::size_of::<u64>() + std::mem::size_of::<u128>()
     }
@@ -69,12 +79,12 @@ pub fn run_command(cmd: String) -> Result<String, String> {
         Ok(output) => {
             if output.status.success() {
                 Ok(format!(
-                    "Command ran successfully with output: {}",
+                    "Command ran successfully with output: \n{}",
                     String::from_utf8(output.stdout).expect("Command output should be valid utf-8")
                 ))
             } else {
                 Err(format!(
-                    "Command failed with output: {}",
+                    "Command failed with output: \n{}",
                     String::from_utf8(output.stderr).expect("Command output should be valid utf-8")
                 ))
             }
@@ -85,21 +95,13 @@ pub fn run_command(cmd: String) -> Result<String, String> {
 
 pub fn write_to_csv(name: &str, packets: &[Packet]) -> XRayResult<()> {
     let file = std::fs::File::create(name)?;
-    let mut csv = csv::Writer::from_writer(file);
+    let mut writer = csv::Writer::from_writer(file);
 
-    csv.write_record(["Recv Index", "Send TS", "Recv TS"])?;
-    for info in packets {
-        csv.write_record([
-            info.recv_index
-                .map(|i| i.to_string())
-                .unwrap_or_else(String::new),
-            info.send_ts.to_string(),
-            info.recv_ts
-                .map(|ts| ts.to_string())
-                .unwrap_or_else(String::new),
-        ])?;
+    for packet in packets {
+        writer.serialize(packet)?;
     }
-    csv.flush()?;
+
+    writer.flush()?;
     Ok(())
 }
 
