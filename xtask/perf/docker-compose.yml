@@ -1,0 +1,45 @@
+version: '3.2'
+
+services:
+  left:
+    hostname: left
+    container_name: left
+    image: neptun-runner:0.0.1
+    entrypoint: /neptun/config/left.sh
+    privileged: true
+    depends_on:
+      right:
+        condition: service_healthy
+    networks:
+      default:
+        ipv4_address: 176.0.0.2
+    volumes:
+      - ../../target/release:/neptun/current
+      - ../../base/target/release:/neptun/base
+      - .:/neptun/config
+
+  right:
+    hostname: right
+    container_name: right
+    image: neptun-runner:0.0.1
+    entrypoint: /neptun/config/right.sh
+    privileged: true
+    healthcheck:
+      test: ["CMD-SHELL", "cat /.iperf_ready"]
+      interval: 1s
+      start_interval: 1s
+      start_period: 60s
+    networks:
+      default:
+        ipv4_address: 176.0.0.3
+    volumes:
+      - ../../target/release:/neptun/current
+      - ../../base/target/release:/neptun/base
+      - .:/neptun/config
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 176.0.0.0/24

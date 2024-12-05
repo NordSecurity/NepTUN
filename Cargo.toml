@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["neptun", "neptun-cli"]
+members = ["neptun", "neptun-cli", "xtask"]
 
 [profile.release]
 lto = true        # Enable full link-time optimization.
