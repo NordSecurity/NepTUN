@@ -13,15 +13,15 @@ WG_IFC_NAME = "xraywg1"
 
 def run_command(cmd, capture_output=False):
     args = shlex.split(cmd)
-    run = subprocess.run(args, capture_output=capture_output,check=True)
+    run = subprocess.run(args, capture_output=capture_output, check=True)
     return (run.stdout, run.stderr)
 
 
-def get_csv_name(wg, test_type, count):
+def get_csv_path(wg, test_type, count):
     return f"results/xray_metrics_{wg.lower()}_{test_type}_{count}.csv"
 
 
-def get_pcap_name(wg, test_type, count):
+def get_pcap_path(wg, test_type, count):
     return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.pcap"
 
 
@@ -58,7 +58,7 @@ def setup_wireguard(wg, build_neptun):
         run_command(f"sudo ../target/release/boringtun-cli {WG_IFC_NAME}")
     else:
         if build_neptun:
-            run_command(f"cargo build --release -p neptun-cli")
+            run_command("cargo build --release -p neptun-cli")
         run_command(f"sudo ../target/release/neptun-cli {WG_IFC_NAME}")
     run_command(f"sudo ip link set dev {WG_IFC_NAME} mtu 1420")
     run_command(f"sudo ip link set dev {WG_IFC_NAME} up")
@@ -67,9 +67,17 @@ def setup_wireguard(wg, build_neptun):
     )  # Not strictly necessary but keeps the pcaps a bit cleaner
 
 
-def start_tcpdump(pcap_name):
+def start_tcpdump(pcap_path):
     return subprocess.Popen(
-        ["sudo", "tcpdump", "-ni", "any", "-w", pcap_name],
+        [
+            "sudo",
+            "tcpdump",
+            "-ni",
+            "any",
+            "-w",
+            pcap_path,
+            "udp and (port 41414 or port 52525 or port 63636)",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -78,10 +86,10 @@ def start_tcpdump(pcap_name):
 
 def run_xray(wg, test_type, count, build_xray):
     if build_xray:
-        run_command(
-            f"cargo build --release"
-        )
-    run_command(f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {get_csv_name(wg, test_type, count)}")
+        run_command("cargo build --release")
+    run_command(
+        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-path {get_csv_path(wg, test_type, count)} --pcap-path {get_pcap_path(wg, test_type, count)}"
+    )
 
 
 def stop_tcpdump(tcpdump):
@@ -119,13 +127,13 @@ def main():
 
     Path("results/").mkdir(parents=True, exist_ok=True)
     try:
-        os.remove(get_csv_name(wg.name, test_type, count))
-        os.remove(get_pcap_name(wg.name, test_type, count))
+        os.remove(get_csv_path(wg.name, test_type, count))
+        os.remove(get_pcap_path(wg.name, test_type, count))
     except:  # noqa: E722
         pass
 
     setup_wireguard(wg, build_neptun)
-    tcpdump = start_tcpdump(get_pcap_name(wg.name, test_type, count))
+    tcpdump = start_tcpdump(get_pcap_path(wg.name, test_type, count))
 
     succeeded = True
     try:
@@ -139,8 +147,8 @@ def main():
 
     if succeeded:
         analyze(
-            get_csv_name(wg.name, test_type, count),
-            get_pcap_name(wg.name, test_type, count),
+            get_csv_path(wg.name, test_type, count),
+            get_pcap_path(wg.name, test_type, count),
             count,
             test_type,
         )
