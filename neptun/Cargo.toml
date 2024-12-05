@@ -15,6 +15,7 @@ default = []
 device = ["socket2", "thiserror"]
 # mocks std::time::Instant with mock_instant
 mock-instant = ["mock_instant"]
+xray = []
 
 [dependencies]
 base64 = "0.13"

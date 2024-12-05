@@ -2,75 +2,63 @@ import csv
 import math
 from functools import reduce
 
-import matplotlib as mpl
+import matplotlib as mpl  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
-import mpl_ascii
+import mpl_ascii  # type: ignore
 from paths import PathGenerator
-from scapy.all import PcapReader  # type: ignore
-from scapy.layers.inet import UDP  # type: ignore
 
 
-def analyze(paths, count, test_type, ascii, save_output):
-    Analyzer(paths, count, test_type, ascii, save_output)
+def analyze(paths, count, ascii, save_output):
+    Analyzer(paths, count, ascii, save_output)
+
+
+def parse_int(val):
+    if val is None or val == "":
+        return None
+    else:
+        return int(val)
+
+
+class PacketInfo:
+    def __init__(self, csv_row):
+        self.recv_index = parse_int(csv_row[0])
+        self.send_ts = int(csv_row[1])
+        self.pre_wg_ts = parse_int(csv_row[2])
+        self.post_wg_ts = parse_int(csv_row[3])
+        self.recv_ts = parse_int(csv_row[4])
+
+    def get_latencies(self):
+        pre_wg = self.get_latency(self.send_ts, self.pre_wg_ts)
+        post_wg = self.get_latency(self.pre_wg_ts, self.post_wg_ts)
+        recv = self.get_latency(self.post_wg_ts, self.recv_ts)
+        total = self.get_latency(self.send_ts, self.recv_ts)
+        return (pre_wg, post_wg, recv, total)
+
+    def get_latency(self, left, right):
+        if left is not None and right is not None:
+            return right - left
+        else:
+            return None
 
 
 class CsvData:
     def __init__(self, csv_path):
-        self.indices = []
-        self.timestamps = []
-        self.latencies = []
-        self.min_latency = -1
-        self.max_latency = -1
+        self.packets = []
 
         with open(csv_path, newline="") as csvfile:
-            reader = csv.reader(csvfile, delimiter=",", quotechar="|")
-            next(reader)
+            reader = csv.reader(csvfile, delimiter=",")
+            next(reader)  # skip header row
             for row in reader:
-                if len(row[0]) > 0:
-                    self.indices.append(int(row[0]))
-                send_ts = int(row[1])
-                if len(row[2]) > 0:
-                    recv_ts = int(row[2])
-                else:
-                    recv_ts = -1
-                self.timestamps.append((send_ts, recv_ts))
-                if recv_ts >= 0:
-                    latency = recv_ts - send_ts
-                    self.latencies.append(latency)
-                    if self.min_latency < 0 or latency < self.min_latency:
-                        self.min_latency = latency
-                    if self.max_latency < 0 or latency > self.max_latency:
-                        self.max_latency = latency
-
-
-class PcapData:
-    def __init__(self, pcap_path, test_type):
-        self.before_wg_packets = []
-        self.after_wg_packets = []
-        with PcapReader(pcap_path) as pcap_reader:
-            for pkt in pcap_reader:
-                if not pkt.haslayer(UDP):
-                    continue
-
-                if test_type == "crypto" and pkt.sport == 63636:
-                    if pkt.dport == 41414:
-                        self.before_wg_packets.append(pkt)
-                    elif pkt.dport == 52525:
-                        self.after_wg_packets.append(pkt)
-                elif test_type == "pt" and pkt.dport == 63636:
-                    if pkt.sport == 52525:
-                        self.before_wg_packets.append(pkt)
-                    elif pkt.sport == 41414:
-                        self.after_wg_packets.append(pkt)
+                packet_info = PacketInfo(row)
+                self.packets.append(packet_info)
 
 
 class Analyzer:
     def __init__(
-        self, paths: PathGenerator, count, test_type, ascii_output, save_output
+        self, paths: PathGenerator, count, ascii_output, save_output
     ):
         self.count = count
         self.csv_data = CsvData(paths.csv())
-        self.pcap_data = PcapData(paths.pcap(), test_type)
 
         graphs = [
             self.ordering_pie_chart,
@@ -112,9 +100,11 @@ class Analyzer:
         return ax[row, col]
 
     def ordering_pie_chart(self, ax):
-        in_order = count_ordered(self.csv_data.indices, self.count)
+        in_order = count_ordered(self.csv_data.packets, self.count)
         dropped = reduce(
-            lambda count, e: count + (1 if e == 0 else 0), self.csv_data.indices, 0
+            lambda count, packet: count + (1 if packet.recv_index is None else 0),
+            self.csv_data.packets,
+            0,
         )
         reordered = self.count - in_order - dropped
         data = []
@@ -132,46 +122,36 @@ class Analyzer:
         ax.pie(data, labels=labels)
 
     def packet_ordering(self, ax):
-        y_axis = [None]
-        x_axis = [0]
-        for iter, index in enumerate(self.csv_data.indices):
-            if self.csv_data.timestamps[iter][1] >= 0:
-                y_axis.append(self.csv_data.indices[iter])
-            else:
-                y_axis.append(None)
-            x_axis.append(iter + 1)
+        data = list(map(lambda p: p.recv_index, self.csv_data.packets))
         ax.set_title("Packet order")
         ax.set_xlabel("Received order")
         ax.set_ylabel("Packet index")
-        ax.plot(x_axis, y_axis)
+        ax.plot(data)
 
     def packet_latency(self, ax):
-        millisec = 1000
-        sec = 1000 * millisec
-        if self.csv_data.min_latency > sec:
-            divisor = sec
-            timeunit = "Seconds"
-        elif self.csv_data.min_latency > millisec:
-            divisor = millisec
-            timeunit = "Milliseconds"
-        else:
-            divisor = 1
-            timeunit = "Microseconds"
+        data = list(map(lambda pi: pi.get_latencies(), self.csv_data.packets))
+        pre_wg = []
+        post_wg = []
+        recv = []
+        for l in data:  # noqa: E741 (ambiguous name)
+            if l[0] is not None:
+                pre_wg.append(l[0])
+            if l[1] is not None:
+                post_wg.append(l[1])
+            if l[2] is not None:
+                recv.append(l[2])
 
-        num_buckets = 15
-        bucket_size = int(
-            (self.csv_data.max_latency - self.csv_data.min_latency) / (num_buckets - 1)
-        )
-        buckets = []
-        for latency in self.csv_data.latencies:
-            bucket_index = int((latency - self.csv_data.min_latency) / bucket_size)
-            buckets.append(
-                (self.csv_data.min_latency + (bucket_index * bucket_size)) / divisor
-            )
         ax.set_title("Latency")
-        ax.set_xlabel(f"Latency ({timeunit})")
+        ax.set_xlabel("Latency (Microseconds)")
         ax.set_ylabel("Count")
-        ax.hist(buckets, color="blue", bins=num_buckets)
+        ax.hist(
+            [pre_wg, post_wg, recv],
+            label=["PreWG", "PostWG", "Recv"],
+            color=["orange", "green", "blue"],
+            stacked=True,
+            bins=15,
+        )
+        ax.legend()
 
     def dropped_packets(self, ax):
         if self.count >= 100:
@@ -180,36 +160,43 @@ class Analyzer:
             num_buckets = 10
         else:
             num_buckets = self.count
-        bucket_size = int(self.count / (num_buckets - 1))
-        buckets = []
-        for iter, index in enumerate(self.csv_data.indices):
-            if self.csv_data.timestamps[iter][1] < 0:
-                bucket_index = int(iter / bucket_size)
-                buckets.append(bucket_index * bucket_size)
+
+        pre_wg = []
+        post_wg = []
+        recv = []
+        for i, packet in enumerate(self.csv_data.packets):
+            if packet.pre_wg_ts is None:
+                pre_wg.append(i)
+            if packet.post_wg_ts is None:
+                post_wg.append(i)
+            if packet.recv_ts is None:
+                recv.append(i)
+
         ax.set_title("Dropped packets")
         ax.set_xlabel("Index")
         ax.set_ylabel("Count")
-        ax.hist(buckets, color="blue", bins=num_buckets)
-
-    def dropped_packets2(self, ax):
-        data = []
-        for iter, index in enumerate(self.csv_data.indices):
-            if self.csv_data.timestamps[iter][1] < 0:
-                data.append(index)
-        ax.set_title("Dropped packets 2")
-        ax.set_xlabel("Packet index")
-        ax.set_ylabel("Count")
-        ax.plot(data)
+        ax.hist(
+            [pre_wg, post_wg, recv],
+            label=["PreWG", "PostWG", "Recv"],
+            color=["orange", "green", "blue"],
+            stacked=True,
+            bins=num_buckets,
+        )
+        ax.legend()
 
     def packet_funnel(self, ax):
         count = self.count
-        before_wg = len(self.pcap_data.before_wg_packets)
-        after_wg = len(self.pcap_data.after_wg_packets)
-        recv = len(list(filter(lambda x: x > 0, self.csv_data.indices)))
+        before_wg = 0
+        after_wg = 0
+        recv = 0
+        for p in self.csv_data.packets:
+            before_wg += 1 if p.pre_wg_ts is not None else 0
+            after_wg += 1 if p.post_wg_ts is not None else 0
+            recv += 1 if p.recv_ts is not None else 0
         categories = [
             f"Count ({count})",
-            f"before wg ({before_wg})",
-            f"after_wg ({after_wg})",
+            f"Before wg ({before_wg})",
+            f"After_wg ({after_wg})",
             f"Recv ({recv})",
         ]
         values = [self.count, before_wg, after_wg, recv]
@@ -223,19 +210,20 @@ class Analyzer:
 def count_ordered(data, count):
     if len(data) == 0:
         return 0
+    indices = list(map(lambda p: p.recv_index, data))
     ordered = 0
-    range_good_start = data[0] == 1
+    range_good_start = indices[0] == 1
     range_len = 1
-    prev = data[0]
-    for i in range(1, len(data)):
-        if data[i] == 0:
+    prev = indices[0]
+    for i in range(1, len(indices)):
+        if indices[i] is None:
             continue
-        elif data[i] == prev + 1:
+        elif indices[i] == prev + 1:
             range_len += 1
         else:
             ordered += range_len - (0 if range_good_start else 1)
-            range_good_start = data[i] = i
+            range_good_start = indices[i] == i
             range_len = 1
-        prev = data[i]
+        prev = indices[i]
     ordered += range_len - (0 if range_good_start else 1)
     return ordered

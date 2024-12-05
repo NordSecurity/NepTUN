@@ -1,10 +1,11 @@
 use std::{net::SocketAddrV4, pin::Pin, time::Duration};
 
+use neptun::noise::Tunn;
 use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
     client::Client,
-    utils::{write_to_csv, Packet, RecvType, SendType, TestCmd},
+    utils::{Packet, RecvType, SendType, TestCmd},
     CliArgs, XRayResult,
 };
 
@@ -14,7 +15,7 @@ pub struct EventLoop {
     crypto_client: Client,
     plaintext_client: Client,
     cmd_rx: mpsc::Receiver<TestCmd>,
-    packets: Vec<Packet>,
+    pub packets: Vec<Packet>,
     can_send: bool,
     is_done: bool,
     crypto_buf: Vec<u8>,
@@ -46,7 +47,7 @@ impl EventLoop {
         }
     }
 
-    pub async fn run(mut self) -> XRayResult<()> {
+    pub async fn run(mut self) -> XRayResult<Self> {
         let mut wg_tick_interval = tokio::time::interval(Duration::from_millis(250));
         // This timeout is only actually used when the test is otherwise done
         // It is here set to one second just to initialize it, but is reset before it's actually used
@@ -55,7 +56,7 @@ impl EventLoop {
         loop {
             tokio::select! {
                 _ = &mut finish_timeout, if self.is_done => {
-                    self.on_finished(self.recv_counter).await?;
+                    println!("Test done, received {} packets", self.recv_counter);
                     break;
                 },
                 _ = wg_tick_interval.tick() => {
@@ -72,7 +73,14 @@ impl EventLoop {
                 }
             }
         }
-        Ok(())
+        Ok(self)
+    }
+
+    pub fn tunn(&mut self) -> Tunn {
+        self.crypto_client
+            .tunn
+            .take()
+            .expect("Crypto client is expected to have a Tunn object")
     }
 
     async fn on_recv_cmd(
@@ -84,11 +92,7 @@ impl EventLoop {
             let send_ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_micros();
-            let packet = Packet {
-                send_ts,
-                recv_index: None,
-                recv_ts: None,
-            };
+            let packet = Packet::new(send_ts);
 
             let mut payload = vec![0; Packet::send_size()];
             payload[0..Packet::index_size()].copy_from_slice(&send_index.to_le_bytes());
@@ -110,7 +114,7 @@ impl EventLoop {
                 packet_dst,
                 send_index,
             } => {
-                if send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
+                if send_index > 0 && send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
                     println!("[Crypto] Sending packet with index {send_index}");
                 }
                 let (packet, payload) = prepare_packet(send_index)?;
@@ -123,7 +127,7 @@ impl EventLoop {
                 self.can_send = !matches!(sr, SendType::HandshakeInitiation);
             }
             TestCmd::SendPlaintext { dst, send_index } => {
-                if send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
+                if send_index > 0 && send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
                     println!("[Plaintext] Sending packet with index {send_index}");
                 }
                 let (packet, payload) = prepare_packet(send_index)?;
@@ -149,8 +153,10 @@ impl EventLoop {
             }
             RecvType::Data { length: bytes_read } => {
                 if bytes_read == Packet::send_size() {
-                    if self.recv_counter % (self.cli_args.packet_count / 10) == 0 {
-                        println!("[Crypto] Received {} packets", self.recv_counter + 1);
+                    if self.recv_counter > 0
+                        && self.recv_counter % (self.cli_args.packet_count / 10) == 0
+                    {
+                        println!("[Crypto] Received {} packets", self.recv_counter);
                     }
                     self.recv_counter += 1;
                     let send_index = u64::from_le_bytes(
@@ -177,8 +183,10 @@ impl EventLoop {
     ) -> XRayResult<()> {
         if let RecvType::Data { length: bytes_read } = rt {
             if bytes_read == Packet::send_size() {
-                if self.recv_counter % (self.cli_args.packet_count / 10) == 0 {
-                    println!("[Plaintext] Received {} packets", self.recv_counter + 1);
+                if self.recv_counter > 0
+                    && self.recv_counter % (self.cli_args.packet_count / 10) == 0
+                {
+                    println!("[Plaintext] Received {} packets", self.recv_counter);
                 }
                 self.recv_counter += 1;
                 let send_index = u64::from_le_bytes(
@@ -204,10 +212,5 @@ impl EventLoop {
                 .as_mut()
                 .reset(Instant::now() + Duration::from_secs(1));
         }
-    }
-
-    async fn on_finished(&mut self, recv_packet_count: usize) -> XRayResult<()> {
-        println!("Test done, received {recv_packet_count} packets");
-        write_to_csv(&self.cli_args.csv_name(), &self.packets)
     }
 }
