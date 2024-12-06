@@ -111,8 +111,8 @@ def main():
     test_type = args.test_type.lower() if args.test_type is not None else "crypto"
     assert test_type in [
         "crypto",
-        "pt",
-    ], f"Invalid test type '{test_type}'. Valid options are 'crypto' and 'pt'"
+        "plaintext",
+    ], f"Invalid test type '{test_type}'. Valid options are 'crypto' and 'plaintext'"
     count = int(args.count) if args.count is not None else 10
     assert count > 0, f"Count must be at least one, but got {count}"
     build_neptun = args.nobuild_neptun is False

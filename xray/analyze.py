@@ -1,4 +1,5 @@
 import csv
+import math
 import matplotlib.pyplot as plt  # type: ignore
 from functools import reduce
 from scapy.all import PcapReader  # type: ignore
@@ -64,20 +65,21 @@ class Analyzer:
         self.csv_data = CsvData(csv_name)
         self.pcap_data = PcapData(pcap_name, test_type)
 
-        csv = [
+        graphs = [
             self.ordering_pie_chart,
             self.packet_ordering,
             self.dropped_packets,
             self.packet_latency,
+            self.packet_funnel,
         ]
-        pcap = [self.packet_funnel]
+        rows = math.ceil(len(graphs) / 2)
 
-        fig, ax = plt.subplots(nrows=max(len(csv), len(pcap)), ncols=2)
+        fig, ax = plt.subplots(nrows=rows, ncols=2)
         fig.tight_layout(pad=1)
 
-        for i, fn in enumerate(csv):
+        for i, fn in enumerate(graphs[0:rows]):
             fn(ax[i, 0])
-        for i, fn in enumerate(pcap):
+        for i, fn in enumerate(graphs[rows:]):
             fn(ax[i, 1])
 
         plt.show()

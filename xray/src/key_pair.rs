@@ -2,6 +2,7 @@ use std::{fs::File, io::Write};
 
 use base64::prelude::*;
 use neptun::x25519::{PublicKey, StaticSecret};
+use rand::rngs::OsRng;
 
 pub struct KeyPair {
     pub private: StaticSecret,
@@ -10,7 +11,7 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn new() -> Self {
-        let private = StaticSecret::random_from_rng(rand::thread_rng());
+        let private = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&private);
         Self { private, public }
     }

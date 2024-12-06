@@ -156,12 +156,3 @@ pub async fn write_to_uapi(sock: &UnixStream, cmd: &str) {
     let bytes_written = sock.try_write(cmd).unwrap();
     assert_eq!(bytes_written, cmd.len());
 }
-
-// pub async fn read_from_uapi(sock: &UnixStream) -> String {
-//     sock.readable().await.unwrap();
-//     let mut buf = vec![0; 1024];
-//     let bytes_read = sock.try_read(&mut buf).unwrap();
-//     buf.truncate(bytes_read);
-
-//     String::from_utf8(buf).unwrap()
-// }

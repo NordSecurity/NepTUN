@@ -202,7 +202,7 @@ impl Client {
             udp.set_destination(dst.port());
             udp.set_length(8 + payload.len() as u16);
             udp.set_payload(payload);
-            // TODO: Calculate checksum
+            // TODO(mathiaspeters): Calculate checksum
             udp.set_checksum(0);
         }
         udp_packet
