@@ -10,10 +10,10 @@ Execution consists of these steps:
 1. The wireguard interface is started
 2. `tcpdump` is started, with packets being written to a pcap file
 3. The main X-Ray executable is started
-  1. The crypto client performs a handshake with the wireguard interface
-  2. The specified number of packets are sent in the specified direction (crypto->wg interface->plaintext, or plaintext->wg interface->crypto)
-  3. The receiving socket registers the packets it receives that are part of the test
-  4. The packets are written to a `.csv` file with each row containing the sequence number, the time it was sent and, if it was received, the time it was received
+    1. The crypto client performs a handshake with the wireguard interface
+    2. The specified number of packets are sent in the specified direction (crypto->wg interface->plaintext, or plaintext->wg interface->crypto)
+    3. The receiving socket registers the packets it receives that are part of the test
+    4. The packets are written to a `.csv` file with each row containing the sequence number, the time it was sent and, if it was received, the time it was received
 4. `tcpdump` is stopped
 5. The wireguard interface is destroyed
 6. The `.csv` file and pcap are analyzed
