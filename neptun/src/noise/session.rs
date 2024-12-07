@@ -198,7 +198,7 @@ impl Session {
         buffer: &'a mut [u8],
         data_len: usize,
     ) -> &'a mut [u8] {
-        if data_len < buffer.len() + super::DATA_OVERHEAD_SZ {
+        if buffer.len() < data_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
