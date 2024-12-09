@@ -5,7 +5,10 @@ use std::{
 
 use tokio::net::UnixStream;
 
-use crate::key_pair::{KeyPair, NepTUNKey};
+use crate::{
+    key_pair::{KeyPair, NepTUNKey},
+    XRayError, XRayResult,
+};
 
 #[derive(Debug)]
 pub enum SendType {
@@ -63,12 +66,12 @@ pub fn run_command(cmd: String) -> Result<String, String> {
             if output.status.success() {
                 Ok(format!(
                     "Command ran successfully with output: {}",
-                    String::from_utf8(output.stdout).unwrap()
+                    String::from_utf8(output.stdout).expect("Command output should be valid utf-8")
                 ))
             } else {
                 Err(format!(
                     "Command failed with output: {}",
-                    String::from_utf8(output.stderr).unwrap()
+                    String::from_utf8(output.stderr).expect("Command output should be valid utf-8")
                 ))
             }
         }
@@ -76,11 +79,11 @@ pub fn run_command(cmd: String) -> Result<String, String> {
     }
 }
 
-pub fn write_to_csv(name: &str, packets: &[Packet]) {
-    let file = std::fs::File::create(name).unwrap();
+pub fn write_to_csv(name: &str, packets: &[Packet]) -> XRayResult<()> {
+    let file = std::fs::File::create(name)?;
     let mut csv = csv::Writer::from_writer(file);
 
-    csv.write_record(["Index", "Send TS", "Recv TS"]).unwrap();
+    csv.write_record(["Index", "Send TS", "Recv TS"])?;
     for info in packets {
         csv.write_record([
             info.index.to_string(),
@@ -90,10 +93,10 @@ pub fn write_to_csv(name: &str, packets: &[Packet]) {
             } else {
                 "".to_owned()
             },
-        ])
-        .unwrap();
+        ])?;
     }
-    csv.flush().unwrap();
+    csv.flush()?;
+    Ok(())
 }
 
 pub async fn configure_wg(
@@ -103,26 +106,32 @@ pub async fn configure_wg(
     peer_keys: &KeyPair,
     wg_port: u16,
     ips: &[Ipv4Addr],
-) {
+) -> XRayResult<()> {
     for ip in ips {
         let ipnet = format!("{}/24", ip);
-        run_command(format!("ip addr add {ipnet} dev {wg_name}")).unwrap();
+        run_command(format!("ip addr add {ipnet} dev {wg_name}"))
+            .map_err(XRayError::ShellCommand)?;
     }
 
     match adapter_type {
         "native" | "boringtun" => configure_native_wg(wg_name, wg_keys, peer_keys, wg_port),
         "wggo" | "neptun" => configure_userspace_wg(wg_name, wg_keys, peer_keys, wg_port).await,
-        _ => panic!("Unknown adapter type {adapter_type}"),
+        _ => Err(XRayError::UnknownAdapter(adapter_type.to_owned())),
     }
 }
 
-pub fn configure_native_wg(wg_name: &str, wg_keys: &KeyPair, peer_keys: &KeyPair, wg_port: u16) {
-    wg_keys.private.write_to_file("wg.sk");
-
+pub fn configure_native_wg(
+    wg_name: &str,
+    wg_keys: &KeyPair,
+    peer_keys: &KeyPair,
+    wg_port: u16,
+) -> XRayResult<()> {
+    wg_keys.private.write_to_file("wg.sk")?;
     let wg_setup = format!("private-key wg.sk listen-port {wg_port}");
     let peer_setup = format!("peer {} allowed-ips 0.0.0.0/0", peer_keys.public.as_b64());
     let uapi_cmd = format!("sudo wg set {wg_name} {wg_setup} {peer_setup}");
-    run_command(uapi_cmd).unwrap();
+    run_command(uapi_cmd).map_err(XRayError::ShellCommand)?;
+    Ok(())
 }
 
 pub async fn configure_userspace_wg(
@@ -130,7 +139,7 @@ pub async fn configure_userspace_wg(
     wg_keys: &KeyPair,
     peer_keys: &KeyPair,
     wg_port: u16,
-) {
+) -> XRayResult<()> {
     let uapi_cmd = format!(
         r#"set=1
 private_key={}
@@ -143,16 +152,11 @@ allowed_ip=0.0.0.0/0
     )
     .replace('\"', "");
 
-    let uapi_sock = UnixStream::connect(format!("/var/run/wireguard/{}.sock", wg_name))
-        .await
-        .unwrap();
+    let uapi_sock = UnixStream::connect(format!("/var/run/wireguard/{}.sock", wg_name)).await?;
+    uapi_sock.writable().await?;
 
-    write_to_uapi(&uapi_sock, &uapi_cmd).await;
-}
+    let bytes_written = uapi_sock.try_write(uapi_cmd.as_bytes())?;
+    assert_eq!(bytes_written, uapi_cmd.len());
 
-pub async fn write_to_uapi(sock: &UnixStream, cmd: &str) {
-    let cmd = cmd.as_bytes();
-    sock.writable().await.unwrap();
-    let bytes_written = sock.try_write(cmd).unwrap();
-    assert_eq!(bytes_written, cmd.len());
+    Ok(())
 }

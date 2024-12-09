@@ -50,8 +50,6 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 -  The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
 
-- There is currently no proper error handling, with errors being either ignored or `unwrap`-ed. Given the nature of the program, proper error handling is not necessary, but moving to `expect` instead of `unwrap` and adding better diagnostics would make it easier to use
-
 - There are multiple inefficiencies that could potentially impact the test results, the main one being not reusing buffers when creating and sending packets. Each packet that gets constructed allocates a new buffer when they could all reuse the same one
 
 - Sometimes the wireguard handshake times out. When that happens, just rerun and it should be fine. Having to rerun multiple times is rare, but it happens

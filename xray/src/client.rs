@@ -4,12 +4,15 @@ use neptun::noise::{Tunn, TunnResult};
 use pnet::packet::{
     ip::IpNextHeaderProtocols,
     ipv4::{self, Ipv4Packet, MutableIpv4Packet},
-    udp::{MutableUdpPacket, UdpPacket},
+    udp::{self, MutableUdpPacket, UdpPacket},
     Packet,
 };
 use tokio::net::UdpSocket;
 
-use crate::utils::{RecvType, SendType};
+use crate::{
+    utils::{RecvType, SendType},
+    XRayError, XRayResult,
+};
 
 pub struct Client {
     pub addr: SocketAddrV4,
@@ -28,28 +31,33 @@ impl Client {
         }
     }
 
-    pub async fn do_handshake(&mut self, wg_addr: SocketAddrV4) {
+    pub async fn do_handshake(&mut self, wg_addr: SocketAddrV4) -> XRayResult<()> {
         println!("Handshake: starting");
-        let tunn = self.tunn.as_mut().unwrap();
+        let tunn = self
+            .tunn
+            .as_mut()
+            .expect("This function should only be called on clients with a Tunn object");
         match tunn.format_handshake_initiation(&mut self.buf, true) {
             TunnResult::WriteToNetwork(packet) => {
-                self.sock.send_to(packet, wg_addr).await.unwrap();
+                self.sock.send_to(packet, wg_addr).await?;
             }
-            unexpected => println!("Received unexpected TunnResult: {unexpected:?}"),
+            unexpected => {
+                return Err(XRayError::UnexpectedTunnResult(format!("{unexpected:?}")));
+            }
         }
         let mut handshake_buf = vec![0; 512];
         let handshake_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(3));
         tokio::pin!(handshake_timeout);
         loop {
             tokio::select! {
-                recv_type = self.recv_encrypted(&mut handshake_buf) => {
+                Ok(recv_type) = self.recv_encrypted(&mut handshake_buf) => {
                     if matches!(recv_type, RecvType::Handshake) {
                         println!("Handshake: done");
-                        return;
+                        return Ok(());
                     }
                 }
                 _ = &mut handshake_timeout => {
-                    panic!("Handshake timed out");
+                    return Err(XRayError::HandshakeTimedOut);
                 }
             }
         }
@@ -60,7 +68,7 @@ impl Client {
         sock_dst: SocketAddrV4,
         packet_dst: SocketAddrV4,
         payload: &[u8],
-    ) -> SendType {
+    ) -> XRayResult<SendType> {
         if self.tunn.is_some() {
             self.send_encrypted(sock_dst, packet_dst, payload).await
         } else {
@@ -68,7 +76,7 @@ impl Client {
         }
     }
 
-    pub async fn recv_packet(&mut self, buf: &mut [u8]) -> RecvType {
+    pub async fn recv_packet(&mut self, buf: &mut [u8]) -> XRayResult<RecvType> {
         if self.tunn.is_some() {
             self.recv_encrypted(buf).await
         } else {
@@ -101,59 +109,60 @@ impl Client {
         sock_dst: SocketAddrV4,
         packet_dst: SocketAddrV4,
         payload: &[u8],
-    ) -> SendType {
-        let tunn = &mut self.tunn.as_mut().unwrap();
-        let packet = Self::make_udp_packet(self.addr, packet_dst, payload);
+    ) -> XRayResult<SendType> {
+        let tunn = &mut self
+            .tunn
+            .as_mut()
+            .expect("This function should only be called on clients with a Tunn object");
+        let packet = Self::make_udp_packet(self.addr, packet_dst, payload)?;
         let tr = tunn.encapsulate(&packet, &mut self.buf);
         let (send_type, packet): (SendType, &[u8]) = match tr {
             TunnResult::Done => (SendType::None, &[]),
             TunnResult::WriteToNetwork(p) => match p[0] {
                 1 => (SendType::Handshake, p),
                 4 => (SendType::Data, p),
-                unexpected => panic!("Unexpected packet type {unexpected}"),
+                unexpected => return Err(XRayError::UnexpectedPacketType(unexpected)),
             },
             TunnResult::WriteToTunnelV4(p, _) => (SendType::Tunn, p),
-            unexpected => panic!("Unexpected TunnResult: {unexpected:?}"),
+            unexpected => return Err(XRayError::from(unexpected)),
         };
         if !matches!(send_type, SendType::None) {
-            self.sock.send_to(packet, sock_dst).await.unwrap();
+            self.sock.send_to(packet, sock_dst).await?;
         }
-        send_type
+        Ok(send_type)
     }
 
-    async fn send_plaintext(&mut self, dst: SocketAddrV4, payload: &[u8]) -> SendType {
-        self.sock.send_to(payload, dst).await.unwrap();
-        SendType::Plaintext
+    async fn send_plaintext(&mut self, dst: SocketAddrV4, payload: &[u8]) -> XRayResult<SendType> {
+        self.sock.send_to(payload, dst).await?;
+        Ok(SendType::Plaintext)
     }
 
-    async fn recv_encrypted(&mut self, buf: &mut [u8]) -> RecvType {
-        let (mut bytes_read, from) = self.sock.recv_from(&mut self.buf).await.unwrap();
+    async fn recv_encrypted(&mut self, buf: &mut [u8]) -> XRayResult<RecvType> {
+        let (mut bytes_read, from) = self.sock.recv_from(&mut self.buf).await?;
         let from = match from {
             SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => panic!("IPv6 not supported"),
+            SocketAddr::V6(_) => return Err(XRayError::Ipv6),
         };
-        let mut ret = if self.buf[0] == 2 {
-            RecvType::Handshake
-        } else if self.buf[0] == 4 {
-            RecvType::Data { from, length: 0 }
-        } else {
-            panic!("Unexpected packet type {}", self.buf[0])
+        let mut ret = match self.buf[0] {
+            2 => RecvType::Handshake,
+            4 => RecvType::Data { from, length: 0 },
+            unexpected => return Err(XRayError::UnexpectedPacketType(unexpected)),
         };
         let mut decap_buf = vec![0; 1024];
         loop {
-            let tr = self.tunn.as_mut().unwrap().decapsulate(
-                None,
-                &self.buf[0..bytes_read],
-                &mut decap_buf,
-            );
+            let tr = self
+                .tunn
+                .as_mut()
+                .expect("This function should only be called on clients with a Tunn object")
+                .decapsulate(None, &self.buf[0..bytes_read], &mut decap_buf);
             match tr {
                 TunnResult::Done => break,
                 TunnResult::WriteToNetwork(p) => {
-                    self.sock.send_to(p, from).await.unwrap();
+                    self.sock.send_to(p, from).await?;
                     bytes_read = 0;
                 }
                 TunnResult::WriteToTunnelV4(p, _) => {
-                    let (pfrom, payload_start, payload_end) = Self::parse_udp_packet(p);
+                    let (pfrom, payload_start, payload_end) = Self::parse_udp_packet(p)?;
                     assert!(buf.len() >= payload_end - payload_start);
                     buf.iter_mut()
                         .zip(p[payload_start..payload_end].iter())
@@ -164,29 +173,29 @@ impl Client {
                     };
                     break;
                 }
-                unexpected => panic!("Unexpected TunnResult: {unexpected:?}"),
+                unexpected => return Err(XRayError::from(unexpected)),
             }
         }
-        ret
+        Ok(ret)
     }
 
-    async fn recv_plaintext(&mut self, buf: &mut [u8]) -> RecvType {
-        let (bytes_read, from) = self.sock.recv_from(buf).await.unwrap();
-        let from = match from {
-            SocketAddr::V4(addr) => addr,
-            SocketAddr::V6(_) => panic!("IPv6 not supported"),
-        };
-        RecvType::Data {
-            length: bytes_read,
-            from,
+    async fn recv_plaintext(&mut self, buf: &mut [u8]) -> XRayResult<RecvType> {
+        let (length, from) = self.sock.recv_from(buf).await?;
+        match from {
+            SocketAddr::V4(from) => Ok(RecvType::Data { length, from }),
+            SocketAddr::V6(_) => Err(XRayError::Ipv6),
         }
     }
 
-    fn make_udp_packet(src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    fn make_udp_packet(
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        payload: &[u8],
+    ) -> XRayResult<Vec<u8>> {
         let len = 28 + payload.len(); // IP header (20 bytes) + UDP heder (8 bytes) + payload length
         let mut udp_packet = vec![0; len];
         {
-            let mut ipv4 = MutableIpv4Packet::new(&mut udp_packet).unwrap();
+            let mut ipv4 = MutableIpv4Packet::new(&mut udp_packet).ok_or(XRayError::PacketParse)?;
             ipv4.set_version(4);
             ipv4.set_header_length(5);
             ipv4.set_total_length(len as u16);
@@ -197,26 +206,26 @@ impl Client {
             ipv4.set_checksum(ipv4::checksum(&ipv4.to_immutable()));
         }
         {
-            let mut udp = MutableUdpPacket::new(&mut udp_packet[20..]).unwrap();
+            let mut udp =
+                MutableUdpPacket::new(&mut udp_packet[20..]).ok_or(XRayError::PacketParse)?;
             udp.set_source(src.port());
             udp.set_destination(dst.port());
             udp.set_length(8 + payload.len() as u16);
             udp.set_payload(payload);
-            // TODO(mathiaspeters): Calculate checksum
-            udp.set_checksum(0);
+            udp.set_checksum(udp::ipv4_checksum(&udp.to_immutable(), src.ip(), dst.ip()));
         }
-        udp_packet
+        Ok(udp_packet)
     }
 
-    fn parse_udp_packet(packet: &[u8]) -> (SocketAddrV4, usize, usize) {
-        let ip_packet = Ipv4Packet::new(packet).unwrap();
-        let udp_packet = UdpPacket::new(ip_packet.payload()).unwrap();
+    fn parse_udp_packet(packet: &[u8]) -> XRayResult<(SocketAddrV4, usize, usize)> {
+        let ip_packet = Ipv4Packet::new(packet).ok_or(XRayError::PacketParse)?;
+        let udp_packet = UdpPacket::new(ip_packet.payload()).ok_or(XRayError::PacketParse)?;
         let from = SocketAddrV4::new(ip_packet.get_source(), udp_packet.get_source());
         let payload_start = (ip_packet.get_header_length() as usize * 4) + 8;
-        (
+        Ok((
             from,
             payload_start,
             payload_start + udp_packet.payload().len(),
-        )
+        ))
     }
 }

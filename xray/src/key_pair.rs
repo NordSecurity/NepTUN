@@ -4,6 +4,8 @@ use base64::prelude::*;
 use neptun::x25519::{PublicKey, StaticSecret};
 use rand::rngs::OsRng;
 
+use crate::XRayResult;
+
 pub struct KeyPair {
     pub private: StaticSecret,
     pub public: PublicKey,
@@ -28,9 +30,10 @@ pub trait NepTUNKey {
         BASE64_STANDARD.encode(self.bytes())
     }
 
-    fn write_to_file(&self, file_name: &str) {
-        let mut f = File::create(file_name).unwrap();
-        f.write_all(self.as_b64().as_bytes()).unwrap();
+    fn write_to_file(&self, file_name: &str) -> XRayResult<()> {
+        let mut f = File::create(file_name)?;
+        f.write_all(self.as_b64().as_bytes())?;
+        Ok(())
     }
 }
 
