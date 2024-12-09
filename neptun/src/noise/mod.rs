@@ -96,6 +96,7 @@ const DATA_OVERHEAD_SZ: usize = 32;
 
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
+    msg_buffer: &'a [u8],
     sender_idx: u32,
     unencrypted_ephemeral: &'a [u8; 32],
     encrypted_static: &'a [u8],
@@ -104,6 +105,7 @@ pub struct HandshakeInit<'a> {
 
 #[derive(Debug)]
 pub struct HandshakeResponse<'a> {
+    msg_buffer: &'a [u8],
     sender_idx: u32,
     pub receiver_idx: u32,
     unencrypted_ephemeral: &'a [u8; 32],
@@ -121,7 +123,8 @@ pub struct PacketCookieReply<'a> {
 pub struct PacketData<'a> {
     pub receiver_idx: u32,
     counter: u64,
-    encrypted_encapsulated_packet: &'a [u8],
+    encrypted_encapsulated_packet: &'a mut [u8],
+    data_len: usize,
 }
 
 /// Describes a packet from network
@@ -139,7 +142,10 @@ impl Tunn {
     }
 
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet<'a>(
+        src: &'a mut [u8],
+        data_len: usize,
+    ) -> Result<Packet<'a>, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -149,6 +155,7 @@ impl Tunn {
 
         Ok(match (packet_type, src.len()) {
             (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
+                msg_buffer: &src[..data_len],
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
                     .expect("length already checked above"),
@@ -156,6 +163,7 @@ impl Tunn {
                 encrypted_timestamp: &src[88..116],
             }),
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
+                msg_buffer: &src[..data_len],
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
@@ -170,7 +178,8 @@ impl Tunn {
             (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                encrypted_encapsulated_packet: &src[16..],
+                encrypted_encapsulated_packet: &mut src[16..],
+                data_len,
             }),
             _ => return Err(WireGuardError::InvalidPacket),
         })
@@ -308,42 +317,44 @@ impl Tunn {
     pub fn decapsulate<'a>(
         &mut self,
         src_addr: Option<IpAddr>,
-        datagram: &[u8],
+        data_buffer: &'a mut [u8],
+        data_len: usize,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        if datagram.is_empty() {
+        if data_len == 0 {
             // Indicates a repeated call
             return self.send_queued_packet(dst);
         }
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
-        {
-            Ok(packet) => packet,
-            Err(TunnResult::WriteToNetwork(cookie)) => {
-                dst[..cookie.len()].copy_from_slice(cookie);
-                self.tx_bytes += cookie.len();
-                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
-            }
-            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
-            _ => unreachable!(),
-        };
+        let packet =
+            match self
+                .rate_limiter
+                .verify_packet(src_addr, data_buffer, data_len, &mut cookie)
+            {
+                Ok(packet) => packet,
+                Err(TunnResult::WriteToNetwork(cookie)) => {
+                    dst[..cookie.len()].copy_from_slice(cookie);
+                    self.tx_bytes += cookie.len();
+                    return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+                }
+                Err(TunnResult::Err(e)) => return TunnResult::Err(e),
+                _ => unreachable!(),
+            };
 
         self.handle_verified_packet(packet, dst)
     }
 
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
-        packet: Packet,
+        packet: Packet<'a>,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         match packet {
             Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
             Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
             Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            Packet::PacketData(p) => self.handle_data(p),
         }
         .unwrap_or_else(TunnResult::from)
     }
@@ -454,8 +465,7 @@ impl Tunn {
     /// Decrypts a data packet, and stores the decapsulated packet in dst.
     fn handle_data<'a>(
         &mut self,
-        packet: PacketData,
-        dst: &'a mut [u8],
+        packet: PacketData<'a>,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
         let idx = r_idx % N_SESSIONS;
@@ -467,7 +477,7 @@ impl Tunn {
                 tracing::trace!(message = "No current session available", remote_idx = r_idx);
                 WireGuardError::NoCurrentSession
             })?;
-            session.receive_packet_data(packet, dst)?
+            session.receive_packet_data(packet)?
         };
 
         self.set_current_session(r_idx);
@@ -679,9 +689,9 @@ mod tests {
         handshake_init.into()
     }
 
-    fn create_handshake_response(tun: &mut Tunn, handshake_init: &[u8]) -> Vec<u8> {
+    fn create_handshake_response(tun: &mut Tunn, mut handshake_init: &[u8]) -> Vec<u8> {
         let mut dst = vec![0u8; 2048];
-        let handshake_resp = tun.decapsulate(None, handshake_init, &mut dst);
+        let handshake_resp = tun.decapsulate(None, &mut handshake_init, handshake_init.len(), &mut dst);
         assert!(matches!(handshake_resp, TunnResult::WriteToNetwork(_)));
 
         let handshake_resp = if let TunnResult::WriteToNetwork(sent) = handshake_resp {
@@ -693,9 +703,9 @@ mod tests {
         handshake_resp.into()
     }
 
-    fn parse_handshake_resp(tun: &mut Tunn, handshake_resp: &[u8]) -> Vec<u8> {
+    fn parse_handshake_resp(tun: &mut Tunn, mut handshake_resp: &[u8]) -> Vec<u8> {
         let mut dst = vec![0u8; 2048];
-        let keepalive = tun.decapsulate(None, handshake_resp, &mut dst);
+        let keepalive = tun.decapsulate(None, &mut handshake_resp, handshake_resp.len(), &mut dst);
         assert!(matches!(keepalive, TunnResult::WriteToNetwork(_)));
 
         let keepalive = if let TunnResult::WriteToNetwork(sent) = keepalive {
@@ -707,9 +717,9 @@ mod tests {
         keepalive.into()
     }
 
-    fn parse_keepalive(tun: &mut Tunn, keepalive: &[u8]) {
+    fn parse_keepalive(tun: &mut Tunn, mut keepalive: &[u8]) {
         let mut dst = vec![0u8; 2048];
-        let keepalive = tun.decapsulate(None, keepalive, &mut dst);
+        let keepalive = tun.decapsulate(None, &mut keepalive, 0, &mut dst);
         assert!(matches!(keepalive, TunnResult::Done));
     }
 
@@ -755,7 +765,7 @@ mod tests {
     fn handshake_init() {
         let (mut my_tun, _their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
-        let packet = Tunn::parse_incoming_packet(&init).unwrap();
+        let packet = Tunn::parse_incoming_packet(&mut &init, init.len()).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
     }
 
@@ -764,7 +774,7 @@ mod tests {
         let (mut my_tun, mut their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
-        let packet = Tunn::parse_incoming_packet(&resp).unwrap();
+        let packet = Tunn::parse_incoming_packet(&mut &resp, resp.len()).unwrap();
         assert!(matches!(packet, Packet::HandshakeResponse(_)));
     }
 
@@ -774,7 +784,7 @@ mod tests {
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
-        let packet = Tunn::parse_incoming_packet(&keepalive).unwrap();
+        let packet = Tunn::parse_incoming_packet(&mut &keepalive, 0).unwrap();
         assert!(matches!(packet, Packet::PacketData(_)));
     }
 
@@ -839,7 +849,7 @@ mod tests {
             unreachable!();
         };
 
-        let data = their_tun.decapsulate(None, data, &mut their_dst);
+        let data = their_tun.decapsulate(None, data, data.len(), &mut their_dst);
         assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
         let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = data {
             recv

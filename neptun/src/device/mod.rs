@@ -775,10 +775,10 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                    // let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
-                        match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
+                        match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), &mut t.src_buf, packet_len, &mut t.dst_buf) {
                             Ok(packet) => packet,
                             Err(TunnResult::WriteToNetwork(cookie)) => {
                                 if let Err(err) = udp.send_to(cookie, &addr) {
@@ -866,7 +866,7 @@ impl Device {
                         loop {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                                tun.decapsulate(None, &mut [], 0, &mut t.dst_buf[..])
                             };
 
                             let TunnResult::WriteToNetwork(packet) = res else {
@@ -926,11 +926,7 @@ impl Device {
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.decapsulate(
-                            Some(peer_addr),
-                            &t.src_buf[..read_bytes],
-                            &mut t.dst_buf[..],
-                        )
+                        tun.decapsulate(Some(peer_addr), &mut t.src_buf, read_bytes, &mut t.dst_buf)
                     };
 
                     match res {
@@ -987,7 +983,7 @@ impl Device {
                         loop {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                                tun.decapsulate(None, &mut [], 0, &mut t.dst_buf[..])
                             };
                             let TunnResult::WriteToNetwork(packet) = res else {
                                 break;

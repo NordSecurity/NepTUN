@@ -238,11 +238,10 @@ impl Session {
     /// return the size of the encapsulated packet on success
     pub(super) fn receive_packet_data<'a>(
         &self,
-        packet: PacketData,
-        dst: &'a mut [u8],
+        packet: PacketData<'a>,
     ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
+        let ct_len = packet.data_len;
+        if ct_len < packet.encrypted_encapsulated_packet.len() {
             // This is a very incorrect use of the library, therefore panic and not error
             panic!("The destination buffer is too small");
         }
@@ -255,12 +254,11 @@ impl Session {
         let ret = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
             self.receiver
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut dst[..ct_len],
+                    &mut packet.encrypted_encapsulated_packet[..ct_len],
                 )
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
         };
