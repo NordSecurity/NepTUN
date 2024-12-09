@@ -156,16 +156,25 @@ impl RateLimiter {
     pub fn verify_packet<'a, 'b>(
         &self,
         src_addr: Option<IpAddr>,
-        src: &'a [u8],
+        src: &'a mut [u8],
+        message_len: usize,
         dst: &'b mut [u8],
     ) -> Result<Packet<'a>, TunnResult<'b>> {
-        let packet = Tunn::parse_incoming_packet(src)?;
+        let packet = Tunn::parse_incoming_packet(src, message_len)?;
 
         // Verify and rate limit handshake messages only
-        if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
-        | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
+        if let Packet::HandshakeInit(HandshakeInit {
+            msg_buffer,
+            sender_idx,
+            ..
+        })
+        | Packet::HandshakeResponse(HandshakeResponse {
+            msg_buffer,
+            sender_idx,
+            ..
+        }) = packet
         {
-            let (msg, macs) = src.split_at(src.len() - 32);
+            let (msg, macs) = msg_buffer.split_at(message_len - 32);
             let (mac1, mac2) = macs.split_at(16);
 
             let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
