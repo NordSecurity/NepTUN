@@ -74,7 +74,7 @@ mod tests {
         let mut receiving_buffer = vec![0u8; MAX_PACKET];
 
         // Initiate handshake from a side
-        match a.tunnel.lock().encapsulate(&[], &mut sending_buffer) {
+        match a.tunnel.lock().encapsulate(&mut sending_buffer, 0) {
             TunnResult::WriteToNetwork(msg) => {
                 a.client_socket
                     .send_to(msg, b.client_address)
@@ -95,7 +95,8 @@ mod tests {
 
         match b.tunnel.lock().decapsulate(
             None,
-            &receiving_buffer[..bytes_read],
+            &mut receiving_buffer,
+            bytes_read,
             &mut sending_buffer,
         ) {
             TunnResult::WriteToNetwork(msg) => {
@@ -118,7 +119,8 @@ mod tests {
 
         match a.tunnel.lock().decapsulate(
             None,
-            &receiving_buffer[..bytes_read],
+            &mut receiving_buffer,
+            bytes_read,
             &mut sending_buffer,
         ) {
             TunnResult::WriteToNetwork(msg) => {
@@ -142,7 +144,8 @@ mod tests {
 
         match b.tunnel.lock().decapsulate(
             None,
-            &receiving_buffer[..bytes_read],
+            &mut receiving_buffer,
+            bytes_read,
             &mut sending_buffer,
         ) {
             TunnResult::Done => (),
