@@ -35,11 +35,13 @@ use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::thread;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::DATA_OFFSET;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -774,10 +776,9 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
-                        match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
+                        match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), &mut t.src_buf, packet_len, &mut t.dst_buf) {
                             Ok(packet) => packet,
                             Err(TunnResult::WriteToNetwork(cookie)) => {
                                 if let Err(err) = udp.send_to(cookie, &addr) {
@@ -865,7 +866,7 @@ impl Device {
                         loop {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                                tun.decapsulate(None, &mut [], 0, &mut t.dst_buf[..])
                             };
 
                             let TunnResult::WriteToNetwork(packet) = res else {
@@ -925,11 +926,7 @@ impl Device {
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.decapsulate(
-                            Some(peer_addr),
-                            &t.src_buf[..read_bytes],
-                            &mut t.dst_buf[..],
-                        )
+                        tun.decapsulate(Some(peer_addr), &mut t.src_buf, read_bytes, &mut t.dst_buf)
                     };
 
                     match res {
@@ -986,7 +983,7 @@ impl Device {
                         loop {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                                tun.decapsulate(None, &mut [], 0, &mut t.dst_buf[..])
                             };
                             let TunnResult::WriteToNetwork(packet) = res else {
                                 break;
@@ -1025,8 +1022,9 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
+                    let data_buf = &mut t.src_buf[DATA_OFFSET..];
+                    let data_len = match iface.read(&mut data_buf[..mtu]) {
+                        Ok(src) => src.len(),
                         Err(Error::IfaceRead(e)) => {
                             let ek = e.kind();
                             if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
@@ -1045,7 +1043,7 @@ impl Device {
                         }
                     };
 
-                    let dst_addr = match Tunn::dst_address(src) {
+                    let dst_addr = match Tunn::dst_address(&data_buf[..data_len]) {
                         Some(addr) => addr,
                         None => continue,
                     };
@@ -1057,14 +1055,16 @@ impl Device {
 
 
                     if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                        if !callback(&peer.public_key.0, src) {
+                        if !callback(&peer.public_key.0, &data_buf[..data_len]) {
                             continue;
                         }
                     }
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
+                        // Pass complete buffer as it contains space for headers as well
+                        // Encryption is to be done in-place
+                        tun.encapsulate(&mut t.src_buf[..], data_len)
                     };
                     match res {
                         TunnResult::Done => {}
