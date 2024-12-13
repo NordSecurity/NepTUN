@@ -1,4 +1,7 @@
-use std::net::{SocketAddr, SocketAddrV4};
+use std::{
+    net::{SocketAddr, SocketAddrV4},
+    time::Duration,
+};
 
 use neptun::noise::{Tunn, TunnResult};
 use pnet::packet::{
@@ -13,6 +16,9 @@ use crate::{
     utils::{RecvType, SendType},
     XRayError, XRayResult,
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const HANDSHAKE_MAX_TRIES: usize = 5;
 
 pub struct Client {
     pub addr: SocketAddrV4,
@@ -33,6 +39,26 @@ impl Client {
 
     pub async fn do_handshake(&mut self, wg_addr: SocketAddrV4) -> XRayResult<()> {
         println!("Handshake: starting");
+        for _ in 0..HANDSHAKE_MAX_TRIES {
+            match self.try_handshake(wg_addr).await {
+                Ok(_) => {
+                    println!("Handshake: done");
+                    return Ok(());
+                }
+                Err(XRayError::HandshakeTimedOut) => {
+                    println!("Handshake timed out")
+                }
+                Err(err) => {
+                    println!("Handshake failed");
+                    return Err(err);
+                }
+            }
+        }
+        println!("Could not establish handshake");
+        Err(XRayError::HandshakeTimedOut)
+    }
+
+    async fn try_handshake(&mut self, wg_addr: SocketAddrV4) -> XRayResult<()> {
         let tunn = self
             .tunn
             .as_mut()
@@ -46,18 +72,17 @@ impl Client {
             }
         }
         let mut handshake_buf = vec![0; 512];
-        let handshake_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(3));
-        tokio::pin!(handshake_timeout);
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, self.recv_handshake(&mut handshake_buf))
+            .await
+            .map_err(|_| XRayError::HandshakeTimedOut)??;
+        Ok(())
+    }
+
+    async fn recv_handshake(&mut self, buf: &mut [u8]) -> XRayResult<()> {
         loop {
-            tokio::select! {
-                Ok(recv_type) = self.recv_encrypted(&mut handshake_buf) => {
-                    if matches!(recv_type, RecvType::HandshakeResponse) {
-                        println!("Handshake: done");
-                        return Ok(());
-                    }
-                }
-                _ = &mut handshake_timeout => {
-                    return Err(XRayError::HandshakeTimedOut);
+            if let Ok(recv_type) = self.recv_encrypted(buf).await {
+                if matches!(recv_type, RecvType::HandshakeResponse) {
+                    return Ok(());
                 }
             }
         }

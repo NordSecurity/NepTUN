@@ -22,7 +22,8 @@ class CsvData:
             reader = csv.reader(csvfile, delimiter=",", quotechar="|")
             next(reader)
             for row in reader:
-                self.indices.append(int(row[0]))
+                if len(row[0]) > 0:
+                    self.indices.append(int(row[0]))
                 send_ts = int(row[1])
                 if len(row[2]) > 0:
                     recv_ts = int(row[2])
@@ -147,7 +148,12 @@ class Analyzer:
         ax.hist(buckets, color="blue", bins=num_buckets)
 
     def dropped_packets(self, ax):
-        num_buckets = 100
+        if self.count >= 100:
+            num_buckets = 100
+        elif self.count >= 10:
+            num_buckets = 10
+        else:
+            num_buckets = self.count
         bucket_size = int(self.count / (num_buckets - 1))
         buckets = []
         for iter, index in enumerate(self.csv_data.indices):
