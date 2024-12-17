@@ -700,7 +700,8 @@ impl Device {
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.update_timers(&mut t.dst_buf[..])
+                        let timer_mask = tun.fetch_timer_mask();
+                        tun.update_timers(&mut t.dst_buf[..], timer_mask)
                     };
                     match res {
                         TunnResult::Done => {}
