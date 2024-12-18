@@ -1,13 +1,17 @@
 import csv
 import math
-import matplotlib.pyplot as plt  # type: ignore
 from functools import reduce
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt  # type: ignore
+import mpl_ascii
+from paths import PathGenerator
 from scapy.all import PcapReader  # type: ignore
 from scapy.layers.inet import UDP  # type: ignore
 
 
-def analyze(csv_path, pcap_path, count, test_type):
-    Analyzer(csv_path, pcap_path, count, test_type)
+def analyze(paths, count, test_type, ascii, save_output):
+    Analyzer(paths, count, test_type, ascii, save_output)
 
 
 class CsvData:
@@ -61,10 +65,12 @@ class PcapData:
 
 
 class Analyzer:
-    def __init__(self, csv_name, pcap_name, count, test_type):
+    def __init__(
+        self, paths: PathGenerator, count, test_type, ascii_output, save_output
+    ):
         self.count = count
-        self.csv_data = CsvData(csv_name)
-        self.pcap_data = PcapData(pcap_name, test_type)
+        self.csv_data = CsvData(paths.csv())
+        self.pcap_data = PcapData(paths.pcap(), test_type)
 
         graphs = [
             self.ordering_pie_chart,
@@ -73,17 +79,37 @@ class Analyzer:
             self.packet_latency,
             self.packet_funnel,
         ]
-        rows = math.ceil(len(graphs) / 2)
 
-        fig, ax = plt.subplots(nrows=rows, ncols=2)
-        fig.tight_layout(pad=1)
+        if ascii_output:
+            mpl_ascii.AXES_WIDTH = 70
+            mpl_ascii.AXES_HEIGHT = 25
+            mpl.use("module://mpl_ascii")
+            # remove pie chart graph because it's not supported
+            graphs.pop(0)
 
-        for i, fn in enumerate(graphs[0:rows]):
-            fn(ax[i, 0])
-        for i, fn in enumerate(graphs[rows:]):
-            fn(ax[i, 1])
+            rows, cols = len(graphs), 1
+            pad = 0
+        else:
+            rows, cols = math.ceil(len(graphs) / 2), 2
+            pad = 1
 
+        fig, ax = plt.subplots(nrows=rows, ncols=cols)
+        fig.tight_layout(pad=pad)
+
+        for i, draw_fn in enumerate(graphs):
+            draw_fn(self._get_axis(ax, i, cols))
+
+        if save_output:
+            output_file = paths.txt() if ascii_output else paths.png()
+            plt.savefig(output_file)
         plt.show()
+
+    def _get_axis(self, ax, i, cols):
+        if cols == 1:
+            return ax[i]
+        row = i // cols
+        col = i % cols
+        return ax[row, col]
 
     def ordering_pie_chart(self, ax):
         in_order = count_ordered(self.csv_data.indices, self.count)
@@ -187,7 +213,7 @@ class Analyzer:
             f"Recv ({recv})",
         ]
         values = [self.count, before_wg, after_wg, recv]
-        plt.bar(categories, values, color="blue", width=0.4)
+        ax.bar(categories, values, color="blue", width=0.4)
 
 
 # This counts in-order packets by looking at series of successive packets

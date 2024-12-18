@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 .vscode/
+/xray/results
 
 **/*.csv
 **/*.pcap

@@ -84,7 +84,7 @@ impl CliArgs {
             .map(|s| s.to_lowercase())
             .unwrap_or_else(|| {
                 format!(
-                    "results/xray_metrics_{}_{}_{}.csv",
+                    "results/xray_{}_{}_{}.csv",
                     self.wg, self.test_type, self.packet_count
                 )
             })

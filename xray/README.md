@@ -69,6 +69,12 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 - **--nobuild-xray**: whether or not to build `xray` before running. Default is to build `xray`
 
+- **--save-output**: save the analysis charts in `results` folder.
+
+- **--ascii**: output the analysis chart as text graph.
+
+- **--disable-drop-privileges**: pass the `disable-drop-privileges` flag to `neptun-cli` and `boringtun-cli`.
+
 ## Known issues
 
 - The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
