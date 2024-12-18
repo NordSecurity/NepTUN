@@ -376,7 +376,7 @@ impl Tunn {
         }
 
         if keepalive_required {
-            return self.encapsulate(&[], dst);
+            return self.encapsulate(dst, 0);
         }
 
         TunnResult::Done

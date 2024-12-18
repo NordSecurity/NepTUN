@@ -22,7 +22,7 @@ impl GitWorktree {
             .expect("Failed to create base worktree");
         GitWorktree {
             name: name.to_string(),
-            sh: sh,
+            sh,
         }
     }
 }
