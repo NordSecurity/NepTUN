@@ -26,7 +26,7 @@ jobs:
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
     - name: Install hack
-      run: cargo install --git https://github.com/taiki-e/cargo-hack.git cargo-hack --rev c0b517b9eefa27cdaf27cca5f1b186c00ef1af47 --locked
+      run: cargo +stable install --git https://github.com/taiki-e/cargo-hack.git cargo-hack --rev c0b517b9eefa27cdaf27cca5f1b186c00ef1af47 --locked
     - run: cargo hack check --each-feature ${{ matrix.packages }}
 
   clippy:
@@ -43,7 +43,7 @@ jobs:
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
     - name: Install hack
-      run: cargo install --git https://github.com/taiki-e/cargo-hack.git cargo-hack --rev c0b517b9eefa27cdaf27cca5f1b186c00ef1af47 --locked
+      run: cargo +stable install --git https://github.com/taiki-e/cargo-hack.git cargo-hack --rev c0b517b9eefa27cdaf27cca5f1b186c00ef1af47 --locked
     - run: cargo hack clippy --each-feature ${{ matrix.packages }} --color always
 
   udeps:
