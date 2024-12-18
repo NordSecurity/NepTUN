@@ -49,3 +49,27 @@ jobs:
         fetch-depth: 0
     - run: docker build -t neptun-runner:0.0.1 .
     - run: cargo xtask perf --base main
+
+  xray-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - name: Install wg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wireguard
+      - name: Setup pipenv
+        working-directory: xray
+        run: |
+          python -m pip install --upgrade pip
+          pip install pipenv
+          pipenv install
+      - name: Execute xray
+        working-directory: xray
+        run: pipenv run python run.py --wg native --ascii --save-chart
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-results
+          path: xray/results/*.png
