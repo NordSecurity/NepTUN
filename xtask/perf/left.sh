@@ -47,3 +47,15 @@ sleep 5
 echo
 echo "Current NepTUN:"
 iperf3 -u -b 1G -i 60 -t 800 -c 10.0.2.2
+
+sleep 5
+
+echo
+echo "Base NepTUN:"
+iperf3 -u -b 1G -i 60 -t 800 -c 10.0.1.2
+
+sleep 5
+
+echo
+echo "Current NepTUN:"
+iperf3 -u -b 1G -i 60 -t 800 -c 10.0.2.2
