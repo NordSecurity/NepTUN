@@ -6,8 +6,8 @@ from scapy.all import PcapReader  # type: ignore
 from scapy.layers.inet import UDP  # type: ignore
 
 
-def analyze(csv_path, pcap_path, count, test_type):
-    Analyzer(csv_path, pcap_path, count, test_type)
+def analyze(csv_path, pcap_path, count, test_type, png_path):
+    Analyzer(csv_path, pcap_path, count, test_type, png_path)
 
 
 class CsvData:
@@ -61,7 +61,7 @@ class PcapData:
 
 
 class Analyzer:
-    def __init__(self, csv_name, pcap_name, count, test_type):
+    def __init__(self, csv_name, pcap_name, count, test_type, png_path):
         self.count = count
         self.csv_data = CsvData(csv_name)
         self.pcap_data = PcapData(pcap_name, test_type)
@@ -84,6 +84,8 @@ class Analyzer:
             fn(ax[i, 1])
 
         plt.show()
+        if png_path:
+            plt.savefig(png_path)
 
     def ordering_pie_chart(self, ax):
         in_order = count_ordered(self.csv_data.indices, self.count)

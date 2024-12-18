@@ -13,7 +13,7 @@ WG_IFC_NAME = "xraywg1"
 
 def run_command(cmd, capture_output=False):
     args = shlex.split(cmd)
-    run = subprocess.run(args, capture_output=capture_output,check=True)
+    run = subprocess.run(args, capture_output=capture_output, check=True)
     return (run.stdout, run.stderr)
 
 
@@ -23,6 +23,10 @@ def get_csv_name(wg, test_type, count):
 
 def get_pcap_name(wg, test_type, count):
     return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.pcap"
+
+
+def get_png_name(wg, test_type, count):
+    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.png"
 
 
 class Wireguard(Enum):
@@ -78,10 +82,10 @@ def start_tcpdump(pcap_name):
 
 def run_xray(wg, test_type, count, build_xray):
     if build_xray:
-        run_command(
-            f"cargo build --release"
-        )
-    run_command(f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {get_csv_name(wg, test_type, count)}")
+        run_command(f"cargo build --release")
+    run_command(
+        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {get_csv_name(wg, test_type, count)}"
+    )
 
 
 def stop_tcpdump(tcpdump):
@@ -104,6 +108,7 @@ def main():
     parser.add_argument("--count")
     parser.add_argument("--nobuild-neptun", action="store_true")
     parser.add_argument("--nobuild-xray", action="store_true")
+    parser.add_argument("--save-chart", action="store_true")
     args = parser.parse_args()
 
     wg = Wireguard.from_str(args.wg)
@@ -116,11 +121,13 @@ def main():
     assert count > 0, f"Count must be at least one, but got {count}"
     build_neptun = args.nobuild_neptun is False
     build_xray = args.nobuild_xray is False
+    png_path = get_png_name(wg.name, test_type, count) if args.save_chart else None
 
     Path("results/").mkdir(parents=True, exist_ok=True)
     try:
         os.remove(get_csv_name(wg.name, test_type, count))
         os.remove(get_pcap_name(wg.name, test_type, count))
+        os.remove(get_png_name(wg.name, test_type, count))
     except:  # noqa: E722
         pass
 
@@ -143,6 +150,7 @@ def main():
             get_pcap_name(wg.name, test_type, count),
             count,
             test_type,
+            png_path,
         )
 
 
