@@ -60,7 +60,7 @@ mod tests {
 
     /// Represents a single WireGuard interface on local machine
     struct WGHandle {
-        _device: DeviceHandle,
+        device: DeviceHandle,
         name: String,
         addr_v4: IpAddr,
         addr_v6: IpAddr,
@@ -278,9 +278,9 @@ mod tests {
         fn init_with_config(addr_v4: IpAddr, addr_v6: IpAddr, config: DeviceConfig) -> WGHandle {
             // Generate a new name, utun100+ should work on macOS and Linux
             let name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
-            let _device = DeviceHandle::new(&name, config).unwrap();
+            let device = DeviceHandle::new(&name, config).unwrap();
             WGHandle {
-                _device,
+                device,
                 name,
                 addr_v4,
                 addr_v6,
@@ -398,7 +398,11 @@ mod tests {
             }
         }
 
-        fn wg_uapi_cmd(&self, cmd: &str) -> String {
+        fn wg_uapi_device_cmd(&self, cmd: &str) -> String {
+            self.device.send_uapi_cmd(cmd)
+        }
+
+        fn wg_uapi_socket_cmd(&self, cmd: &str) -> String {
             let path = format!("/var/run/wireguard/{}.sock", self.name);
             let mut socket = UnixStream::connect(path).unwrap();
             socket.write(cmd.as_bytes()).unwrap();
@@ -411,12 +415,12 @@ mod tests {
 
         /// Issue a get command on the interface
         fn wg_get(&self) -> String {
-            self.wg_uapi_cmd("get=1\n\n")
+            self.wg_uapi_socket_cmd("get=1\n\n")
         }
 
         /// Issue a set command on the interface
         fn wg_set(&self, setting: &str) -> String {
-            self.wg_uapi_cmd(&format!("set=1\n{}\n\n", setting))
+            self.wg_uapi_socket_cmd(&format!("set=1\n{}\n\n", setting))
         }
 
         /// Assign a listen_port to the interface
@@ -475,13 +479,22 @@ mod tests {
 
     #[test]
     #[ignore]
+    /// Test that send_uapi_cmd interface works corretly
+    fn test_wireguard_get_on_device() {
+        let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
+        let response = wg.wg_uapi_device_cmd("get=1\n\n");
+        assert!(response.ends_with("errno=0\n\n"));
+    }
+
+    #[test]
+    #[ignore]
     fn test_wireguard_uapi_chaining() {
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
 
-        let response = wg.wg_uapi_cmd("get=1\n\nget=1\n\n");
+        let response = wg.wg_uapi_socket_cmd("get=1\n\nget=1\n\n");
         assert_eq!(response.matches("errno=0\n\n").count(), 2);
 
-        let response = wg.wg_uapi_cmd("get=1\n\nset=1\nlisten_port=12345\n\nget=1\n\n");
+        let response = wg.wg_uapi_socket_cmd("get=1\n\nset=1\nlisten_port=12345\n\nget=1\n\n");
         assert_eq!(response.matches("errno=0\n\n").count(), 3);
     }
 
@@ -494,9 +507,9 @@ mod tests {
         // because the \n\n is missing, wireguard-go seems to accept it. That's why
         // we accept it too. This test tests that the last character is not being clipped
         // as it was done by the previous implementation.
-        let response = wg.wg_uapi_cmd("set=1\nlisten_port=12345");
+        let response = wg.wg_uapi_socket_cmd("set=1\nlisten_port=12345");
         assert_eq!(response, "errno=0\n\n");
-        let response = wg.wg_uapi_cmd("get=1\n");
+        let response = wg.wg_uapi_socket_cmd("get=1\n");
         assert_eq!(response, "listen_port=12345\nerrno=0\n\n");
     }
 

@@ -228,10 +228,13 @@ impl DeviceHandle {
     }
 
     pub fn send_uapi_cmd(&self, cmd: &str) -> String {
-        let mut reader = BufReader::new(cmd.as_bytes());
-        let mut writer = BufWriter::new(Vec::<u8>::new());
-        api::api_exec(&mut self.device.read(), &mut reader, &mut writer);
-        std::str::from_utf8(writer.buffer()).unwrap().to_owned()
+        let mut response = Vec::<u8>::new();
+        {
+            let mut reader = BufReader::new(cmd.as_bytes());
+            let mut writer = BufWriter::new(&mut response);
+            api::api_exec(&mut self.device.read(), &mut reader, &mut writer);
+        }
+        std::str::from_utf8(&response).unwrap().to_owned()
     }
 
     pub fn trigger_exit(&self) {
