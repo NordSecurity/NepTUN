@@ -109,6 +109,7 @@ def main():
     parser.add_argument("--nobuild-neptun", action="store_true")
     parser.add_argument("--nobuild-xray", action="store_true")
     parser.add_argument("--save-chart", action="store_true")
+    parser.add_argument("--ascii", action="store_true")
     args = parser.parse_args()
 
     wg = Wireguard.from_str(args.wg)
@@ -151,6 +152,7 @@ def main():
             count,
             test_type,
             png_path,
+            args.ascii
         )
 
 

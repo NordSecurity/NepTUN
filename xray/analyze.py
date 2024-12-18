@@ -1,13 +1,15 @@
 import csv
 import math
 import matplotlib.pyplot as plt  # type: ignore
+import matplotlib as mpl
 from functools import reduce
 from scapy.all import PcapReader  # type: ignore
 from scapy.layers.inet import UDP  # type: ignore
+import mpl_ascii
 
 
-def analyze(csv_path, pcap_path, count, test_type, png_path):
-    Analyzer(csv_path, pcap_path, count, test_type, png_path)
+def analyze(csv_path, pcap_path, count, test_type, png_path, ascii):
+    Analyzer(csv_path, pcap_path, count, test_type, png_path, ascii)
 
 
 class CsvData:
@@ -61,7 +63,7 @@ class PcapData:
 
 
 class Analyzer:
-    def __init__(self, csv_name, pcap_name, count, test_type, png_path):
+    def __init__(self, csv_name, pcap_name, count, test_type, png_path, ascii):
         self.count = count
         self.csv_data = CsvData(csv_name)
         self.pcap_data = PcapData(pcap_name, test_type)
@@ -86,6 +88,26 @@ class Analyzer:
         plt.show()
         if png_path:
             plt.savefig(png_path)
+
+        if ascii:
+            mpl_ascii.AXES_WIDTH=100
+            mpl_ascii.AXES_HEIGHT=40
+            mpl.use("module://mpl_ascii")
+            graphs = [
+                self.packet_ordering,
+                self.dropped_packets,
+                self.packet_latency,
+                self.packet_funnel,
+            ]
+            rows = len(graphs)
+
+            fig, ax = plt.subplots(nrows=rows)
+            # fig.tight_layout(pad=)
+
+            for i, fn in enumerate(graphs):
+                fn(ax[i])
+
+            plt.show()
 
     def ordering_pie_chart(self, ax):
         in_order = count_ordered(self.csv_data.indices, self.count)
@@ -189,7 +211,7 @@ class Analyzer:
             f"Recv ({recv})",
         ]
         values = [self.count, before_wg, after_wg, recv]
-        plt.bar(categories, values, color="blue", width=0.4)
+        ax.bar(categories, values, color="blue", width=0.4)
 
 
 # This counts in-order packets by looking at series of successive packets
