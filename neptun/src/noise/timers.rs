@@ -420,6 +420,11 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use rand::RngCore;
     use rand_core::OsRng;
 
@@ -467,5 +472,47 @@ mod tests {
         assert!(my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());
         assert!(my_tun.timers[TimerName::TimeLastDataPacketReceived].is_zero());
         assert!(my_tun.timers[TimerName::TimePersistentKeepalive].is_zero());
+    }
+
+    #[test]
+    fn test_mark_timers_during_update() {
+        let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let my_idx = OsRng.next_u32();
+
+        let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
+
+        let mut tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
+
+        let last_data_sent_time = tun.timers[TimerName::TimeLastDataPacketSent];
+
+        let n = 1;
+        let mut handles = Vec::with_capacity(n);
+        let t = Arc::new(tun);
+        let barrier = Arc::new(Barrier::new(n));
+
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            b.wait();
+            t.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
+        }));
+
+        // Trying to marking timer from one thread
+        // And updating the timers in the other
+        // This wouldn't work because tunnel needs
+        // to be mutable, and wrapping a mutex on it
+        // defeats the purpose. Atm, not sure how to test
+        // that code path.
+
+        // let t_clone = t.clone();
+        // let b = Arc::clone(&barrier);
+        // let mut dst = [0u8; 1400];
+        // b.wait();
+        // tun.update_timers(&mut dst);
+
+        // Wait for other threads to finish.
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
