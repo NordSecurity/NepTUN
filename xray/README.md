@@ -18,6 +18,29 @@ Execution consists of these steps:
 5. The wireguard interface is destroyed
 6. The `.csv` file and pcap are analyzed
 
+The structure and exeuction of the XRay binary can be represented with the following image:
+
+```mermaid
+flowchart LR
+    subgraph Encryption boundary
+        subgraph Crypto socket
+            tunn[noise::Tunn]<-->cs[UdpSocket]
+        end
+        subgraph Wireguard interface
+            wg[NepTUN/WireguardGo/LinuxNative/etc]
+        end
+    end
+    subgraph Plaintext socket
+        ps[UdpSocket]
+    end
+    cp["Packet(index: u64)"]-->tunn
+    cs<--Encrypted packet-->wg
+    wg<--Plaintext packet-->ps[Plaintext Socket]
+    ps-->pp["Packet(index: u64)"]
+```
+
+The red arrows represent crypto packets and the blue arrows represent plaintext packets.
+
 ## Running it
 
 X-Ray currently only works on linux
@@ -48,8 +71,6 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 ## Known issues
 
--  The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
+- The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
 
 - There are multiple inefficiencies that could potentially impact the test results, the main one being not reusing buffers when creating and sending packets. Each packet that gets constructed allocates a new buffer when they could all reuse the same one
-
-- Sometimes the wireguard handshake times out. When that happens, just rerun and it should be fine. Having to rerun multiple times is rare, but it happens

@@ -42,7 +42,7 @@ impl EventLoop {
             is_done: false,
             crypto_buf: vec![0; 1024],
             plaintext_buf: vec![0; 1024],
-            recv_counter: 1,
+            recv_counter: 0,
         }
     }
 
@@ -55,7 +55,7 @@ impl EventLoop {
         loop {
             tokio::select! {
                 _ = &mut finish_timeout, if self.is_done => {
-                    self.on_finished(self.packets.len()).await?;
+                    self.on_finished(self.recv_counter).await?;
                     break;
                 },
                 _ = wg_tick_interval.tick() => {
@@ -150,8 +150,9 @@ impl EventLoop {
             RecvType::Data { length: bytes_read } => {
                 if bytes_read == Packet::send_size() {
                     if self.recv_counter % (self.cli_args.packet_count / 10) == 0 {
-                        println!("[Crypto] Received {} packets", self.recv_counter);
+                        println!("[Crypto] Received {} packets", self.recv_counter + 1);
                     }
+                    self.recv_counter += 1;
                     let send_index = u64::from_le_bytes(
                         self.crypto_buf[0..8]
                             .try_into()
@@ -162,7 +163,6 @@ impl EventLoop {
                         .as_micros();
                     self.packets[send_index].recv_index = Some(self.recv_counter as u64);
                     self.packets[send_index].recv_ts = Some(recv_ts);
-                    self.recv_counter += 1;
                     self.on_maybe_recv_all(finish_timeout);
                 }
             }
@@ -178,8 +178,9 @@ impl EventLoop {
         if let RecvType::Data { length: bytes_read } = rt {
             if bytes_read == Packet::send_size() {
                 if self.recv_counter % (self.cli_args.packet_count / 10) == 0 {
-                    println!("[Plaintext] Received {} packets", self.recv_counter);
+                    println!("[Plaintext] Received {} packets", self.recv_counter + 1);
                 }
+                self.recv_counter += 1;
                 let send_index = u64::from_le_bytes(
                     self.plaintext_buf[0..8]
                         .try_into()
@@ -190,7 +191,6 @@ impl EventLoop {
                     .as_micros();
                 self.packets[send_index].recv_index = Some(self.recv_counter as u64);
                 self.packets[send_index].recv_ts = Some(recv_ts);
-                self.recv_counter += 1;
                 self.on_maybe_recv_all(finish_timeout);
             }
         }
@@ -198,11 +198,11 @@ impl EventLoop {
     }
 
     fn on_maybe_recv_all(&self, finish_timeout: &mut Pin<&mut tokio::time::Sleep>) {
-        if self.recv_counter > self.cli_args.packet_count {
-            println!("All packets were received. Waiting 3 seconds to make sure pcap is properly populated");
+        if self.recv_counter >= self.cli_args.packet_count {
+            println!("All packets were received. Finishing test...");
             finish_timeout
                 .as_mut()
-                .reset(Instant::now() + Duration::from_secs(3));
+                .reset(Instant::now() + Duration::from_secs(1));
         }
     }
 
