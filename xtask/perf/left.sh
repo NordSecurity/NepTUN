@@ -32,16 +32,18 @@ ip link set up dev wg2
 
 echo
 echo "Raw network:"
-iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
+#iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
 
 echo
 echo "Wireguard-go:"
-iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
+#iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
 
 echo
 echo "Base NepTUN:"
-iperf3 -i 60 -t 120 --bidir -c 10.0.1.2
+iperf3 -u -b 1G -i 60 -t 800 -c 10.0.1.2
+
+sleep 5
 
 echo
 echo "Current NepTUN:"
-iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
+iperf3 -u -b 1G -i 60 -t 800 -c 10.0.2.2
