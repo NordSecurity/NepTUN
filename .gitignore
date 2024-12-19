@@ -4,7 +4,6 @@
 
 **/*.csv
 **/*.pcap
-**/*.png
 **/*.sk
 **/*.pk
 **/__pycache__

@@ -67,9 +67,17 @@ jobs:
           pipenv install
       - name: Execute xray
         working-directory: xray
-        run: pipenv run python run.py --wg native --ascii --save-chart
+        run: pipenv run python run.py --wg native --ascii --save-output
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: xray-results
           path: xray/results/*.png
+      - name: Post results
+        working-directory: xray/results
+        run: |
+          for file in *.txt; do
+            echo "----- $file -----"
+            cat "$file"
+            echo ""
+          done

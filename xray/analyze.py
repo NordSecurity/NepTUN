@@ -8,8 +8,8 @@ from scapy.layers.inet import UDP  # type: ignore
 import mpl_ascii
 
 
-def analyze(csv_path, pcap_path, count, test_type, png_path, ascii):
-    Analyzer(csv_path, pcap_path, count, test_type, png_path, ascii)
+def analyze(csv_path, test_path, count, test_type, ascii, save_output):
+    Analyzer(csv_path, test_path, count, test_type, ascii, save_output)
 
 
 class CsvData:
@@ -63,10 +63,10 @@ class PcapData:
 
 
 class Analyzer:
-    def __init__(self, csv_name, pcap_name, count, test_type, png_path, ascii):
+    def __init__(self, csv_name, test_path, count, test_type, ascii, save_output):
         self.count = count
         self.csv_data = CsvData(csv_name)
-        self.pcap_data = PcapData(pcap_name, test_type)
+        self.pcap_data = PcapData(test_path + ".pcap", test_type)
 
         graphs = [
             self.ordering_pie_chart,
@@ -86,12 +86,12 @@ class Analyzer:
             fn(ax[i, 1])
 
         plt.show()
-        if png_path:
-            plt.savefig(png_path)
+        if save_output:
+            plt.savefig(test_path + ".png")
 
         if ascii:
-            mpl_ascii.AXES_WIDTH=100
-            mpl_ascii.AXES_HEIGHT=40
+            mpl_ascii.AXES_WIDTH = 70
+            mpl_ascii.AXES_HEIGHT = 25
             mpl.use("module://mpl_ascii")
             graphs = [
                 self.packet_ordering,
@@ -102,12 +102,14 @@ class Analyzer:
             rows = len(graphs)
 
             fig, ax = plt.subplots(nrows=rows)
-            # fig.tight_layout(pad=)
+            fig.tight_layout()
 
             for i, fn in enumerate(graphs):
                 fn(ax[i])
 
             plt.show()
+            if save_output:
+                plt.savefig(test_path + ".txt")
 
     def ordering_pie_chart(self, ax):
         in_order = count_ordered(self.csv_data.indices, self.count)

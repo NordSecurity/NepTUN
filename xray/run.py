@@ -21,12 +21,8 @@ def get_csv_name(wg, test_type, count):
     return f"results/xray_metrics_{wg.lower()}_{test_type}_{count}.csv"
 
 
-def get_pcap_name(wg, test_type, count):
-    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.pcap"
-
-
-def get_png_name(wg, test_type, count):
-    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.png"
+def get_test_path(wg, test_type, count):
+    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}"
 
 
 class Wireguard(Enum):
@@ -108,7 +104,7 @@ def main():
     parser.add_argument("--count")
     parser.add_argument("--nobuild-neptun", action="store_true")
     parser.add_argument("--nobuild-xray", action="store_true")
-    parser.add_argument("--save-chart", action="store_true")
+    parser.add_argument("--save-output", action="store_true")
     parser.add_argument("--ascii", action="store_true")
     args = parser.parse_args()
 
@@ -122,18 +118,18 @@ def main():
     assert count > 0, f"Count must be at least one, but got {count}"
     build_neptun = args.nobuild_neptun is False
     build_xray = args.nobuild_xray is False
-    png_path = get_png_name(wg.name, test_type, count) if args.save_chart else None
 
     Path("results/").mkdir(parents=True, exist_ok=True)
     try:
         os.remove(get_csv_name(wg.name, test_type, count))
-        os.remove(get_pcap_name(wg.name, test_type, count))
-        os.remove(get_png_name(wg.name, test_type, count))
+        os.remove(get_test_path(wg.name, test_type, count) + ".pcap")
+        os.remove(get_test_path(wg.name, test_type, count) + ".png")
+        os.remove(get_test_path(wg.name, test_type, count) + ".txt")
     except:  # noqa: E722
         pass
 
     setup_wireguard(wg, build_neptun)
-    tcpdump = start_tcpdump(get_pcap_name(wg.name, test_type, count))
+    tcpdump = start_tcpdump(get_test_path(wg.name, test_type, count) + ".pcap")
 
     succeeded = True
     try:
@@ -148,11 +144,11 @@ def main():
     if succeeded:
         analyze(
             get_csv_name(wg.name, test_type, count),
-            get_pcap_name(wg.name, test_type, count),
+            get_test_path(wg.name, test_type, count),
             count,
             test_type,
-            png_path,
-            args.ascii
+            args.ascii,
+            args.save_output
         )
 
 
