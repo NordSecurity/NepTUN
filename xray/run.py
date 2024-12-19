@@ -13,7 +13,7 @@ WG_IFC_NAME = "xraywg1"
 
 def run_command(cmd, capture_output=False):
     args = shlex.split(cmd)
-    run = subprocess.run(args, capture_output=capture_output,check=True)
+    run = subprocess.run(args, capture_output=capture_output, check=True)
     return (run.stdout, run.stderr)
 
 
@@ -21,8 +21,8 @@ def get_csv_name(wg, test_type, count):
     return f"results/xray_metrics_{wg.lower()}_{test_type}_{count}.csv"
 
 
-def get_pcap_name(wg, test_type, count):
-    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}.pcap"
+def get_test_path(wg, test_type, count):
+    return f"results/{WG_IFC_NAME}_{wg.lower()}_{test_type}_{count}"
 
 
 class Wireguard(Enum):
@@ -49,7 +49,7 @@ def setup_wireguard(wg, build_neptun):
         run_command(f"sudo ip link add dev {WG_IFC_NAME} type wireguard")
     elif wg == Wireguard.WgGo:
         wggo = (
-            run_command("which wireguard", capture_output=True)[0]
+            run_command("which wireguard-go", capture_output=True)[0]
             .strip()
             .decode("utf-8")
         )
@@ -78,10 +78,10 @@ def start_tcpdump(pcap_name):
 
 def run_xray(wg, test_type, count, build_xray):
     if build_xray:
-        run_command(
-            f"cargo build --release"
-        )
-    run_command(f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {get_csv_name(wg, test_type, count)}")
+        run_command(f"cargo build --release")
+    run_command(
+        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {get_csv_name(wg, test_type, count)}"
+    )
 
 
 def stop_tcpdump(tcpdump):
@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--count")
     parser.add_argument("--nobuild-neptun", action="store_true")
     parser.add_argument("--nobuild-xray", action="store_true")
+    parser.add_argument("--save-output", action="store_true")
+    parser.add_argument("--ascii", action="store_true")
     args = parser.parse_args()
 
     wg = Wireguard.from_str(args.wg)
@@ -120,12 +122,14 @@ def main():
     Path("results/").mkdir(parents=True, exist_ok=True)
     try:
         os.remove(get_csv_name(wg.name, test_type, count))
-        os.remove(get_pcap_name(wg.name, test_type, count))
+        os.remove(get_test_path(wg.name, test_type, count) + ".pcap")
+        os.remove(get_test_path(wg.name, test_type, count) + ".png")
+        os.remove(get_test_path(wg.name, test_type, count) + ".txt")
     except:  # noqa: E722
         pass
 
     setup_wireguard(wg, build_neptun)
-    tcpdump = start_tcpdump(get_pcap_name(wg.name, test_type, count))
+    tcpdump = start_tcpdump(get_test_path(wg.name, test_type, count) + ".pcap")
 
     succeeded = True
     try:
@@ -140,9 +144,11 @@ def main():
     if succeeded:
         analyze(
             get_csv_name(wg.name, test_type, count),
-            get_pcap_name(wg.name, test_type, count),
+            get_test_path(wg.name, test_type, count),
             count,
             test_type,
+            args.ascii,
+            args.save_output
         )
 
 

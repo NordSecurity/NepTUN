@@ -69,6 +69,8 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 - **--nobuild-xray**: whether or not to build `xray` before running. Default is to build `xray`
 
+- **--save-chart**: whether or not to save the analysis chart as `png`. Default is not to save
+
 ## Known issues
 
 - The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
