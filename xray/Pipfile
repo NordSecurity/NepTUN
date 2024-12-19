@@ -7,6 +7,7 @@ name = "pypi"
 ruff = "==0.8"
 matplotlib = "==3.9"
 scapy = "==2.6"
+mpl_ascii = "==0.10"
 
 [dev-packages]
 
