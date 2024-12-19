@@ -240,7 +240,7 @@ impl Client {
         Ok(udp_packet)
     }
 
-    fn parse_udp_packet(packet: &[u8]) -> XRayResult<(SocketAddrV4, usize, usize)> {
+    pub fn parse_udp_packet(packet: &[u8]) -> XRayResult<(SocketAddrV4, usize, usize)> {
         let ip_packet = Ipv4Packet::new(packet).ok_or(XRayError::PacketParse)?;
         let udp_packet = UdpPacket::new(ip_packet.payload()).ok_or(XRayError::PacketParse)?;
         let from = SocketAddrV4::new(ip_packet.get_source(), udp_packet.get_source());
