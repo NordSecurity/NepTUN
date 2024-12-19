@@ -310,7 +310,10 @@ impl DeviceHandle {
                             Action::Continue => {}
                             Action::Yield => break,
                             Action::Exit => {
-                                device_lock.try_writeable(|_| {}, |dev| dev.closed = true);
+                                device_lock.try_writeable(
+                                    |dev| dev.trigger_yield(),
+                                    |dev| dev.closed = true,
+                                );
                                 device_lock.trigger_exit();
                                 return;
                             }
