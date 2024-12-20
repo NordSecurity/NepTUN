@@ -30,8 +30,8 @@ pub trait NepTUNKey {
         BASE64_STANDARD.encode(self.bytes())
     }
 
-    fn write_to_file(&self, file_name: &str) -> XRayResult<()> {
-        let mut f = File::create(file_name)?;
+    fn write_to_file(&self, path: &str) -> XRayResult<()> {
+        let mut f = File::create(path)?;
         f.write_all(self.as_b64().as_bytes())?;
         Ok(())
     }

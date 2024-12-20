@@ -331,6 +331,41 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
+    #[cfg(feature = "xray")]
+    pub fn decrypt<'a>(
+        &mut self,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a [u8], WireGuardError> {
+        let packet = Tunn::parse_incoming_packet(datagram)?;
+        match packet {
+            Packet::PacketData(p) => {
+                let r_idx = p.receiver_idx as usize;
+                let idx = r_idx % N_SESSIONS;
+
+                // Get the (probably) right session
+                let decapsulated_packet = {
+                    let session = self.sessions[idx].as_ref();
+                    let session = session.ok_or_else(|| {
+                        tracing::trace!(
+                            message = "No current session available",
+                            remote_idx = r_idx
+                        );
+                        WireGuardError::NoCurrentSession
+                    })?;
+                    session.decrypt_data_packet(p, dst)?
+                };
+
+                match self.validate_decapsulated_packet(decapsulated_packet) {
+                    TunnResult::WriteToTunnelV4(p, _) => Ok(p),
+                    TunnResult::Err(err) => Err(err),
+                    _ => Err(WireGuardError::UnexpectedPacket),
+                }
+            }
+            _ => Err(WireGuardError::WrongPacketType),
+        }
+    }
+
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet,
