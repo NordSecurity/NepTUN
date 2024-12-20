@@ -58,9 +58,8 @@ jobs:
       - name: Setup
         working-directory: xray
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wireguard
-          sudo apt install -y wireguard-go
+          sudo apt update
+          sudo apt install -y wireguard wireguard-go
           python -m pip install --upgrade pip
           pip install pipenv
           pipenv install
@@ -68,8 +67,7 @@ jobs:
         working-directory: xray
         run: |
           pipenv run python run.py --wg native --ascii --save-output
-          # pipenv run python run.py --wg wggo --ascii --save-output
-          # pipenv run python run.py --wg neptun --ascii --save-output
+          pipenv run python run.py --wg neptun --ascii --save-output --disable-drop-privileges
       - name: Upload graph results
         uses: actions/upload-artifact@v4
         with:
