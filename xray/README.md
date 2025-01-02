@@ -56,24 +56,10 @@ Supported adapter types:
 
 ### Running the test
 
-The application is executed with the `run.py` script. I takes some arguments, all of which are optional:
-
-- **--wg <adapter type>**: which adapter type to use, accepts one of `neptun`, `native` and `wggo`. Default is `neptun`
-
-- **--test_type <test type>**: which kind of test to run, accepts `crypto` (to send packets from the crypto socket to the plaintext socket), `plaintext` (to send packets from the plaintext socket to the crypto socket), and `bidir` (to send packets in both directions). Default is `crypto`
-
-- **--count <number of packets>**: How many packets to send. Default is 10
-
-- **--nobuild-neptun**: whether or not to build `neptun-cli` before running. Only relevant when the adaptert type is `neptun`. Default is to build `neptun`
-
-- **--nobuild-xray**: whether or not to build `xray` before running. Default is to build `xray`
-
-- **--save-output**: save the analysis charts in `results` folder.
-
-- **--ascii**: output the analysis chart as text graph.
-
-- **--disable-drop-privileges**: pass the `disable-drop-privileges` flag to `neptun-cli`.
+The application is executed with xtask, by running `cargo xtask xray`. There are arguments you can pass, all of which are optional. For list of possible arguments, run `cargo xtask xray --help`.
 
 ## Known issues
 
-- There are multiple inefficiencies that could potentially impact the test results, the main one being not reusing buffers when creating and sending packets. Each packet that gets constructed allocates a new buffer when they could all reuse the same one
+- There are a lot more packets being dropped during a plaintext test than a crypto test, which very likely is caused by the received packets being decrypted upon arrival. Storing all packets as-is and decrypting afterwards would help.
+
+- There is a big discrepancy between how many packets leave the wireguard interface and how many packets arrive at the receiving socket, pointing to some inefficiency within xray itself that affects the results.

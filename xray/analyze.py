@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+
+import argparse
 import csv
 import math
 from functools import reduce
@@ -6,10 +9,6 @@ import matplotlib as mpl  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import mpl_ascii  # type: ignore
 from paths import PathGenerator
-
-
-def analyze(paths, count, ascii, save_output):
-    Analyzer(paths, count, ascii, save_output)
 
 
 def parse_int(val):
@@ -54,10 +53,8 @@ class CsvData:
 
 
 class Analyzer:
-    def __init__(
-        self, paths: PathGenerator, count, ascii_output, save_output
-    ):
-        self.count = count
+    def __init__(self, paths: PathGenerator, packet_count, ascii_output, save_output):
+        self.packet_count = packet_count
         self.csv_data = CsvData(paths.csv())
 
         graphs = [
@@ -100,24 +97,26 @@ class Analyzer:
         return ax[row, col]
 
     def ordering_pie_chart(self, ax):
-        in_order = count_ordered(self.csv_data.packets, self.count)
+        in_order = count_ordered(self.csv_data.packets, self.packet_count)
         dropped = reduce(
             lambda count, packet: count + (1 if packet.recv_index is None else 0),
             self.csv_data.packets,
             0,
         )
-        reordered = self.count - in_order - dropped
+        reordered = self.packet_count - in_order - dropped
         data = []
         labels = []
         if in_order > 0:
             data.append(in_order)
-            labels.append(f"In order ({round((in_order/self.count) * 100, 2)}%)")
+            labels.append(f"In order ({round((in_order/self.packet_count) * 100, 2)}%)")
         if reordered > 0:
             data.append(reordered)
-            labels.append(f"Reordered ({round((reordered/self.count) * 100, 2)}%)")
+            labels.append(
+                f"Reordered ({round((reordered/self.packet_count) * 100, 2)}%)"
+            )
         if dropped > 0:
             data.append(dropped)
-            labels.append(f"Dropped ({round((dropped/self.count) * 100, 2)}%)")
+            labels.append(f"Dropped ({round((dropped/self.packet_count) * 100, 2)}%)")
         ax.set_title("In order/reordered/dropped")
         ax.pie(data, labels=labels)
 
@@ -154,12 +153,12 @@ class Analyzer:
         ax.legend()
 
     def dropped_packets(self, ax):
-        if self.count >= 100:
+        if self.packet_count >= 100:
             num_buckets = 100
-        elif self.count >= 10:
+        elif self.packet_count >= 10:
             num_buckets = 10
         else:
-            num_buckets = self.count
+            num_buckets = self.packet_count
 
         pre_wg = []
         post_wg = []
@@ -185,7 +184,7 @@ class Analyzer:
         ax.legend()
 
     def packet_funnel(self, ax):
-        count = self.count
+        packet_count = self.packet_count
         before_wg = 0
         after_wg = 0
         recv = 0
@@ -194,12 +193,12 @@ class Analyzer:
             after_wg += 1 if p.post_wg_ts is not None else 0
             recv += 1 if p.recv_ts is not None else 0
         categories = [
-            f"Count ({count})",
+            f"Count ({packet_count})",
             f"Before wg ({before_wg})",
             f"After_wg ({after_wg})",
             f"Recv ({recv})",
         ]
-        values = [self.count, before_wg, after_wg, recv]
+        values = [self.packet_count, before_wg, after_wg, recv]
         ax.bar(categories, values, color="blue", width=0.4)
 
 
@@ -227,3 +226,21 @@ def count_ordered(data, count):
         prev = indices[i]
     ordered += range_len - (0 if range_good_start else 1)
     return ordered
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--packet-count")
+    parser.add_argument("--base-path")
+    parser.add_argument("--save-output", action="store_true")
+    parser.add_argument("--ascii", action="store_true")
+    args = parser.parse_args()
+
+    packet_count = int(args.packet_count)
+    assert (
+        packet_count > 0
+    ), f"Packet count must be at least one, but got {packet_count}"
+
+    paths = PathGenerator(args.base_path)
+
+    Analyzer(paths, packet_count, args.ascii, args.save_output)

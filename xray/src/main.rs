@@ -1,97 +1,42 @@
-mod client;
-mod event_loop;
-mod key_pair;
-mod pcap;
-mod types;
-mod utils;
-
 use std::net::{Ipv4Addr, SocketAddrV4};
 
+use clap::Parser;
 use neptun::noise::Tunn;
 
-use clap::{builder::TypedValueParser as _, Parser};
 use color_eyre::eyre::Result as EyreResult;
 
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{self},
 };
-use types::{TestType, Wg};
 
-use crate::{
+use xray::{
     client::Client,
     event_loop::EventLoop,
     key_pair::KeyPair,
+    path_generator::PathGenerator,
     pcap::process_pcap,
-    types::{TestCmd, XRayError},
+    types::{TestCmd, TestType, XRayError},
     utils::{configure_wg, run_command, write_to_csv},
+    CliArgs, CRYPTO_PORT, PLAINTEXT_PORT, WG_NAME, WG_PORT,
 };
-
-const WG_NAME: &str = "xraywg1";
-
-const WG_PORT: u16 = 41414;
-const PLAINTEXT_PORT: u16 = 52525;
-const CRYPTO_PORT: u16 = 63636;
 
 const WG_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 66, 0, 1), WG_PORT);
 const PLAINTEXT_ADDR: SocketAddrV4 = SocketAddrV4::new(*WG_ADDR.ip(), PLAINTEXT_PORT);
 const CRYPTO_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 66, 0, 2), CRYPTO_PORT);
 const CRYPTO_SOCK_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), CRYPTO_PORT);
 
-#[derive(Debug, Parser)]
-struct CliArgs {
-    #[arg(
-        long,
-        default_value_t = Wg::NepTUN,
-        value_parser = clap::builder::PossibleValuesParser::new(["neptun", "native", "wggo"])
-            .map(|s| s.parse::<Wg>().unwrap()),
-    )]
-    wg: Wg,
-    #[arg(
-        long,
-        default_value_t = TestType::Crypto,
-        value_parser = clap::builder::PossibleValuesParser::new(["crypto", "plaintext", "bidir"])
-            .map(|s| s.parse::<TestType>().unwrap()),
-    )]
-    test_type: TestType,
-    #[arg(long, default_value_t = 10)]
-    packet_count: usize,
-    #[arg(long)]
-    csv_path: Option<String>,
-    #[arg(long)]
-    pcap_path: Option<String>,
-}
-
-impl CliArgs {
-    fn csv_path(&self) -> String {
-        self.csv_path.as_ref().cloned().unwrap_or_else(|| {
-            format!(
-                "results/xray_{}_{}_{}.csv",
-                self.wg, self.test_type, self.packet_count
-            )
-        })
-    }
-
-    fn pcap_path(&self) -> String {
-        self.pcap_path.as_ref().cloned().unwrap_or_else(|| {
-            format!(
-                "results/xray_{}_{}_{}.pcap",
-                self.wg, self.test_type, self.packet_count
-            )
-        })
-    }
-}
-
 #[tokio::main]
 async fn main() -> EyreResult<()> {
     color_eyre::install()?;
 
     let cli_args = CliArgs::parse();
+    let paths = PathGenerator::new(cli_args.wg, cli_args.test_type, cli_args.packet_count);
 
     let test_type = cli_args.test_type;
     let packet_count = cli_args.packet_count;
-    let csv_path = cli_args.csv_path();
-    let pcap_path = cli_args.pcap_path();
+    let csv_path = paths.csv();
+    let pcap_path = paths.pcap();
 
     let wg_keys = KeyPair::new();
     let peer_keys = KeyPair::new();
@@ -155,7 +100,7 @@ async fn main() -> EyreResult<()> {
 
     run_command("killall -w tcpdump".to_owned())
         .map_err(|s| XRayError::ShellCommand(s.to_owned()))?;
-    let pcap_packets = process_pcap(&pcap_path, event_loop.tunn())?;
+    let pcap_packets = process_pcap(pcap_path, event_loop.tunn())?;
 
     let allowed_ports = [WG_PORT, PLAINTEXT_PORT, CRYPTO_PORT];
     let mut packets = event_loop.packets;
@@ -180,7 +125,7 @@ async fn main() -> EyreResult<()> {
         }
     }
 
-    write_to_csv(&csv_path, &packets)?;
+    write_to_csv(csv_path, &packets)?;
 
     Ok(())
 }

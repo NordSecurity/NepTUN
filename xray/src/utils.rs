@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, process::Command};
+use std::{net::Ipv4Addr, path::Path, process::Command};
 
 use tokio::net::UnixStream;
 
@@ -29,7 +29,7 @@ pub fn run_command(cmd: String) -> Result<String, String> {
     }
 }
 
-pub fn write_to_csv(name: &str, packets: &[Packet]) -> XRayResult<()> {
+pub fn write_to_csv<P: AsRef<Path>>(name: P, packets: &[Packet]) -> XRayResult<()> {
     let file = std::fs::File::create(name)?;
     let mut writer = csv::Writer::from_writer(file);
 
