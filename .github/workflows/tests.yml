@@ -49,3 +49,32 @@ jobs:
         fetch-depth: 0
     - run: docker build -t neptun-runner:0.0.1 .
     - run: cargo xtask perf --base main
+
+  xray-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - name: Setup
+        working-directory: xray
+        run: |
+          sudo apt update
+          sudo apt install -y wireguard wireguard-go
+          python -m pip install --upgrade pip
+          pip install pipenv
+          pipenv install
+      - name: Execute xray
+        working-directory: xray
+        run: |
+          pipenv run python run.py --wg native --ascii --save-output --test-type crypto --count 10000
+          pipenv run python run.py --wg native --ascii --save-output --test-type plaintext --count 10000
+          pipenv run python run.py --wg neptun --ascii --save-output --test-type crypto --count 10000 --disable-drop-privileges
+          pipenv run python run.py --wg neptun --ascii --save-output --test-type plaintext --count 10000 --disable-drop-privileges
+      - name: Results
+        working-directory: xray/results
+        run: |
+          for file in *.txt; do
+            echo "----- $file -----"
+            cat "$file"
+            echo ""
+          done
