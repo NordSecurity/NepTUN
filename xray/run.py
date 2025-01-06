@@ -43,6 +43,7 @@ class Wireguard(Enum):
 class TestType(Enum):
     Crypto = 1
     Plaintext = 2
+    Bidir = 3
 
     def __str__(self):
         return self.name.lower()
@@ -52,6 +53,8 @@ class TestType(Enum):
             return TestType.Crypto
         if s.lower() == "plaintext":
             return TestType.Plaintext
+        if s.lower() == "bidir":
+            return TestType.Bidir
         raise Exception(f"'{s}' is not a valid test type")
 
 

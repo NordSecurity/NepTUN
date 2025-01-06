@@ -61,7 +61,7 @@ The application is executed with the `run.py` script. I takes some arguments, al
 
 - **--wg <adapter type>**: which adapter type to use, accepts one of `neptun`, `native`, `wggo` and `boringtun`. Default is `neptun`
 
-- **--test_type <test type>**: which kind of test to run, accepts `crypto` (to send packets from the crypto socket to the plaintext socket) and `plaintext` (to send packets from the plaintext socket to the crypto socket). Default is `crypto`
+- **--test_type <test type>**: which kind of test to run, accepts `crypto` (to send packets from the crypto socket to the plaintext socket), `plaintext` (to send packets from the plaintext socket to the crypto socket), and `bidir` (to send packets in both directions). Default is `crypto`
 
 - **--count <number of packets>**: How many packets to send. Default is 10
 
@@ -76,7 +76,5 @@ The application is executed with the `run.py` script. I takes some arguments, al
 - **--disable-drop-privileges**: pass the `disable-drop-privileges` flag to `neptun-cli` and `boringtun-cli`.
 
 ## Known issues
-
-- The analysis of pcaps is quite limited right now because it doesn't decrypt the packets (this is being worked on)
 
 - There are multiple inefficiencies that could potentially impact the test results, the main one being not reusing buffers when creating and sending packets. Each packet that gets constructed allocates a new buffer when they could all reuse the same one

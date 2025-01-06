@@ -77,6 +77,7 @@ impl std::str::FromStr for Wg {
 pub enum TestType {
     Crypto,
     Plaintext,
+    Bidir,
 }
 
 impl std::fmt::Display for TestType {
@@ -84,6 +85,7 @@ impl std::fmt::Display for TestType {
         let s = match self {
             Self::Crypto => "crypto",
             Self::Plaintext => "plaintext",
+            Self::Bidir => "bidir",
         };
         s.fmt(f)
     }
@@ -96,6 +98,7 @@ impl std::str::FromStr for TestType {
         match s {
             "crypto" => Ok(Self::Crypto),
             "plaintext" => Ok(Self::Plaintext),
+            "bidir" => Ok(Self::Bidir),
             _ => Err(format!("Unsupported test type '{s}'")),
         }
     }

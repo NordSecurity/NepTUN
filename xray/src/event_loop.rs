@@ -114,9 +114,6 @@ impl EventLoop {
                 packet_dst,
                 send_index,
             } => {
-                if send_index > 0 && send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
-                    println!("[Crypto] Sending packet with index {send_index}");
-                }
                 let (packet, payload) = prepare_packet(send_index)?;
                 self.packets.push(packet);
 
@@ -125,17 +122,24 @@ impl EventLoop {
                     .send_packet(sock_dst, packet_dst, &payload)
                     .await?;
                 self.can_send = !matches!(sr, SendType::HandshakeInitiation);
+
+                let send_count = send_index + 1;
+                if send_count % (self.cli_args.packet_count / 10) as u64 == 0 {
+                    println!("{} packets sent", send_count);
+                }
             }
             TestCmd::SendPlaintext { dst, send_index } => {
-                if send_index > 0 && send_index % (self.cli_args.packet_count / 10) as u64 == 0 {
-                    println!("[Plaintext] Sending packet with index {send_index}");
-                }
                 let (packet, payload) = prepare_packet(send_index)?;
                 self.packets.push(packet);
 
                 self.plaintext_client
                     .send_packet(dst, dst, &payload)
                     .await?;
+
+                let send_count = send_index + 1;
+                if send_count % (self.cli_args.packet_count / 10) as u64 == 0 {
+                    println!("{} packets sent", send_count);
+                }
             }
         }
         Ok(())
@@ -153,12 +157,10 @@ impl EventLoop {
             }
             RecvType::Data { length: bytes_read } => {
                 if bytes_read == Packet::send_size() {
-                    if self.recv_counter > 0
-                        && self.recv_counter % (self.cli_args.packet_count / 10) == 0
-                    {
-                        println!("[Crypto] Received {} packets", self.recv_counter);
-                    }
                     self.recv_counter += 1;
+                    if (self.recv_counter) % (self.cli_args.packet_count / 10) == 0 {
+                        println!("{} packets recevied", self.recv_counter);
+                    }
                     let send_index = u64::from_le_bytes(
                         self.crypto_buf[0..8]
                             .try_into()
@@ -183,12 +185,10 @@ impl EventLoop {
     ) -> XRayResult<()> {
         if let RecvType::Data { length: bytes_read } = rt {
             if bytes_read == Packet::send_size() {
-                if self.recv_counter > 0
-                    && self.recv_counter % (self.cli_args.packet_count / 10) == 0
-                {
-                    println!("[Plaintext] Received {} packets", self.recv_counter);
-                }
                 self.recv_counter += 1;
+                if (self.recv_counter) % (self.cli_args.packet_count / 10) == 0 {
+                    println!("{} packets received", self.recv_counter);
+                }
                 let send_index = u64::from_le_bytes(
                     self.plaintext_buf[0..8]
                         .try_into()

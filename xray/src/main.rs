@@ -50,7 +50,7 @@ struct CliArgs {
     #[arg(
         long,
         default_value_t = TestType::Crypto,
-        value_parser = clap::builder::PossibleValuesParser::new(["crypto", "plaintext"])
+        value_parser = clap::builder::PossibleValuesParser::new(["crypto", "plaintext", "bidir"])
             .map(|s| s.parse::<TestType>().unwrap()),
     )]
     test_type: TestType,
@@ -123,25 +123,32 @@ async fn main() -> EyreResult<()> {
 
     println!("Starting {test_type} test with {packet_count} packets");
     for i in 0..packet_count {
-        match test_type {
-            TestType::Crypto => {
-                cmd_tx
-                    .send(TestCmd::SendEncrypted {
+        let cmd = match test_type {
+            TestType::Crypto => TestCmd::SendEncrypted {
+                sock_dst: WG_ADDR,
+                packet_dst: PLAINTEXT_ADDR,
+                send_index: i as u64,
+            },
+            TestType::Plaintext => TestCmd::SendPlaintext {
+                dst: CRYPTO_ADDR,
+                send_index: i as u64,
+            },
+            TestType::Bidir => {
+                if i % 2 == 0 {
+                    TestCmd::SendEncrypted {
                         sock_dst: WG_ADDR,
                         packet_dst: PLAINTEXT_ADDR,
                         send_index: i as u64,
-                    })
-                    .await?
-            }
-            TestType::Plaintext => {
-                cmd_tx
-                    .send(TestCmd::SendPlaintext {
+                    }
+                } else {
+                    TestCmd::SendPlaintext {
                         dst: CRYPTO_ADDR,
                         send_index: i as u64,
-                    })
-                    .await?
+                    }
+                }
             }
-        }
+        };
+        cmd_tx.send(cmd).await?;
     }
     cmd_tx.send(TestCmd::Done).await?;
     let mut event_loop = task.await.expect("Awaiting task should be successful")?;
@@ -157,16 +164,16 @@ async fn main() -> EyreResult<()> {
             continue;
         }
         match (test_type, p.src.port(), p.dst.port()) {
-            (TestType::Crypto, CRYPTO_PORT, WG_PORT) => {
+            (tt, CRYPTO_PORT, WG_PORT) if !matches!(tt, TestType::Plaintext) => {
                 packets[p.send_index as usize].pre_wg_ts = Some(p.ts)
             }
-            (TestType::Crypto, CRYPTO_PORT, PLAINTEXT_PORT) => {
+            (tt, CRYPTO_PORT, PLAINTEXT_PORT) if !matches!(tt, TestType::Plaintext) => {
                 packets[p.send_index as usize].post_wg_ts = Some(p.ts)
             }
-            (TestType::Plaintext, PLAINTEXT_PORT, CRYPTO_PORT) => {
+            (tt, PLAINTEXT_PORT, CRYPTO_PORT) if !matches!(tt, TestType::Crypto) => {
                 packets[p.send_index as usize].pre_wg_ts = Some(p.ts)
             }
-            (TestType::Plaintext, WG_PORT, CRYPTO_PORT) => {
+            (tt, WG_PORT, CRYPTO_PORT) if !matches!(tt, TestType::Crypto) => {
                 packets[p.send_index as usize].post_wg_ts = Some(p.ts)
             }
             params => println!("Unexpected pcap packet found: {params:?}"),
