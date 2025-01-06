@@ -2,30 +2,29 @@ mod client;
 mod event_loop;
 mod key_pair;
 mod pcap;
+mod types;
 mod utils;
 
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    time::SystemTimeError,
-};
+use std::net::{Ipv4Addr, SocketAddrV4};
 
-use neptun::noise::{Tunn, TunnResult};
+use neptun::noise::Tunn;
 
-use ::pcap::Error as PcapError;
-use clap::Parser;
+use clap::{builder::TypedValueParser as _, Parser};
 use color_eyre::eyre::Result as EyreResult;
 
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::{self, error::SendError},
+    sync::mpsc::{self},
 };
+use types::{TestType, Wg};
 
 use crate::{
     client::Client,
     event_loop::EventLoop,
     key_pair::KeyPair,
     pcap::process_pcap,
-    utils::{configure_wg, run_command, write_to_csv, TestCmd},
+    types::{TestCmd, XRayError},
+    utils::{configure_wg, run_command, write_to_csv},
 };
 
 const WG_NAME: &str = "xraywg1";
@@ -39,48 +38,22 @@ const PLAINTEXT_ADDR: SocketAddrV4 = SocketAddrV4::new(*WG_ADDR.ip(), PLAINTEXT_
 const CRYPTO_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(100, 66, 0, 2), CRYPTO_PORT);
 const CRYPTO_SOCK_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), CRYPTO_PORT);
 
-type XRayResult<T> = Result<T, XRayError>;
-
-#[derive(thiserror::Error, Debug)]
-enum XRayError {
-    #[error("IO error: {0:?}")]
-    Io(#[from] std::io::Error),
-    #[error("CSV error: {0:?}")]
-    Csv(#[from] csv::Error),
-    #[error("Command error: {0}")]
-    ShellCommand(String),
-    #[error("Handshake timed out")]
-    HandshakeTimedOut,
-    #[error("Unexpected TunnResult: {0:?}")]
-    UnexpectedTunnResult(String),
-    #[error("Unexpected packet type: {0}")]
-    UnexpectedPacketType(u8),
-    #[error("IPv6 is currently not supported")]
-    Ipv6,
-    #[error("Could not parse packet")]
-    PacketParse,
-    #[error("Unknown adapter type: {0}")]
-    UnknownAdapter(String),
-    #[error("SystemTimeError: {0:?}")]
-    Time(#[from] SystemTimeError),
-    #[error("Failed to send command over channel: {0:?}")]
-    ChannelSend(#[from] SendError<TestCmd>),
-    #[error("Pcap error: {0:?}")]
-    Pcap(#[from] PcapError),
-}
-
-impl From<TunnResult<'_>> for XRayError {
-    fn from(tunn_res: TunnResult<'_>) -> Self {
-        Self::UnexpectedTunnResult(format!("{tunn_res:?}"))
-    }
-}
-
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 struct CliArgs {
-    #[arg(long, default_value = "neptun")]
-    wg: String,
-    #[arg(long, default_value = "crypto")]
-    test_type: String,
+    #[arg(
+        long,
+        default_value_t = Wg::NepTUN,
+        value_parser = clap::builder::PossibleValuesParser::new(["neptun", "native", "wggo", "boringtun"])
+            .map(|s| s.parse::<Wg>().unwrap()),
+    )]
+    wg: Wg,
+    #[arg(
+        long,
+        default_value_t = TestType::Crypto,
+        value_parser = clap::builder::PossibleValuesParser::new(["crypto", "plaintext"])
+            .map(|s| s.parse::<TestType>().unwrap()),
+    )]
+    test_type: TestType,
     #[arg(long, default_value_t = 10)]
     packet_count: usize,
     #[arg(long)]
@@ -115,7 +88,7 @@ async fn main() -> EyreResult<()> {
 
     let cli_args = CliArgs::parse();
 
-    let test_type = cli_args.test_type.clone();
+    let test_type = cli_args.test_type;
     let packet_count = cli_args.packet_count;
     let csv_path = cli_args.csv_path();
     let pcap_path = cli_args.pcap_path();
@@ -125,7 +98,7 @@ async fn main() -> EyreResult<()> {
 
     println!("Configuring wireguard with adapter type {}", cli_args.wg);
     configure_wg(
-        cli_args.wg.as_str(),
+        cli_args.wg,
         WG_NAME,
         &wg_keys,
         &peer_keys,
@@ -150,21 +123,24 @@ async fn main() -> EyreResult<()> {
 
     println!("Starting {test_type} test with {packet_count} packets");
     for i in 0..packet_count {
-        if test_type == "crypto" {
-            cmd_tx
-                .send(TestCmd::SendEncrypted {
-                    sock_dst: WG_ADDR,
-                    packet_dst: PLAINTEXT_ADDR,
-                    send_index: i as u64,
-                })
-                .await?;
-        } else {
-            cmd_tx
-                .send(TestCmd::SendPlaintext {
-                    dst: CRYPTO_ADDR,
-                    send_index: i as u64,
-                })
-                .await?;
+        match test_type {
+            TestType::Crypto => {
+                cmd_tx
+                    .send(TestCmd::SendEncrypted {
+                        sock_dst: WG_ADDR,
+                        packet_dst: PLAINTEXT_ADDR,
+                        send_index: i as u64,
+                    })
+                    .await?
+            }
+            TestType::Plaintext => {
+                cmd_tx
+                    .send(TestCmd::SendPlaintext {
+                        dst: CRYPTO_ADDR,
+                        send_index: i as u64,
+                    })
+                    .await?
+            }
         }
     }
     cmd_tx.send(TestCmd::Done).await?;
@@ -180,17 +156,17 @@ async fn main() -> EyreResult<()> {
         if !allowed_ports.contains(&p.src.port()) || !allowed_ports.contains(&p.dst.port()) {
             continue;
         }
-        match (test_type.as_str(), p.src.port(), p.dst.port()) {
-            ("crypto", CRYPTO_PORT, WG_PORT) => {
+        match (test_type, p.src.port(), p.dst.port()) {
+            (TestType::Crypto, CRYPTO_PORT, WG_PORT) => {
                 packets[p.send_index as usize].pre_wg_ts = Some(p.ts)
             }
-            ("crypto", CRYPTO_PORT, PLAINTEXT_PORT) => {
+            (TestType::Crypto, CRYPTO_PORT, PLAINTEXT_PORT) => {
                 packets[p.send_index as usize].post_wg_ts = Some(p.ts)
             }
-            ("plaintext", PLAINTEXT_PORT, CRYPTO_PORT) => {
+            (TestType::Plaintext, PLAINTEXT_PORT, CRYPTO_PORT) => {
                 packets[p.send_index as usize].pre_wg_ts = Some(p.ts)
             }
-            ("plaintext", WG_PORT, CRYPTO_PORT) => {
+            (TestType::Plaintext, WG_PORT, CRYPTO_PORT) => {
                 packets[p.send_index as usize].post_wg_ts = Some(p.ts)
             }
             params => println!("Unexpected pcap packet found: {params:?}"),

@@ -4,7 +4,7 @@ use base64::prelude::*;
 use neptun::x25519::{PublicKey, StaticSecret};
 use rand::rngs::OsRng;
 
-use crate::XRayResult;
+use crate::types::XRayResult;
 
 pub struct KeyPair {
     pub private: StaticSecret,

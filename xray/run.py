@@ -25,17 +25,34 @@ class Wireguard(Enum):
     Native = 3
     BoringTun = 4
 
+    def __str__(self):
+        return self.name.lower()
+
     def from_str(s):
         if s is None or s.lower() == "neptun":
             return Wireguard.NepTUN
-        elif s is not None and s.lower() == "wggo":
+        if s.lower() == "wggo":
             return Wireguard.WgGo
-        elif s is not None and s.lower() == "native":
+        if s.lower() == "native":
             return Wireguard.Native
-        elif s is not None and s.lower() == "boringtun":
+        if s.lower() == "boringtun":
             return Wireguard.BoringTun
-        else:
-            raise Exception(f"{s} is not a valid wireguard type")
+        raise Exception(f"'{s}' is not a valid wireguard type")
+
+
+class TestType(Enum):
+    Crypto = 1
+    Plaintext = 2
+
+    def __str__(self):
+        return self.name.lower()
+
+    def from_str(s):
+        if s is None or s.lower() == "crypto":
+            return TestType.Crypto
+        if s.lower() == "plaintext":
+            return TestType.Plaintext
+        raise Exception(f"'{s}' is not a valid test type")
 
 
 def setup_wireguard(wg, build_neptun, disable_drop_privileges):
@@ -88,7 +105,7 @@ def run_xray(wg, test_type, count, build_xray, csv_path, pcap_path):
     if build_xray:
         run_command(f"cargo build --release -p xray")
     run_command(
-        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-path {csv_path} --pcap-path {pcap_path}"
+        f"sudo ../target/release/xray --wg {wg} --test-type {test_type} --packet-count {count} --csv-path {csv_path} --pcap-path {pcap_path}"
     )
 
 
@@ -118,11 +135,7 @@ def main():
     args = parser.parse_args()
 
     wg = Wireguard.from_str(args.wg)
-    test_type = args.test_type.lower() if args.test_type is not None else "crypto"
-    assert test_type in [
-        "crypto",
-        "plaintext",
-    ], f"Invalid test type '{test_type}'. Valid options are 'crypto' and 'plaintext'"
+    test_type = TestType.from_str(args.test_type)
     count = int(args.count) if args.count is not None else 10
     assert count > 0, f"Count must be at least one, but got {count}"
     build_neptun = args.nobuild_neptun is False
@@ -144,7 +157,7 @@ def main():
 
     succeeded = True
     try:
-        run_xray(wg.name, test_type, count, build_xray, file_paths.csv(), file_paths.pcap())
+        run_xray(wg, test_type, count, build_xray, file_paths.csv(), file_paths.pcap())
     except:  # noqa: E722
         print("xray failed. Exiting...")
         succeeded = False

@@ -5,8 +5,8 @@ use tokio::{sync::mpsc, time::Instant};
 
 use crate::{
     client::Client,
-    utils::{Packet, RecvType, SendType, TestCmd},
-    CliArgs, XRayResult,
+    types::{Packet, RecvType, SendType, TestCmd, XRayResult},
+    CliArgs,
 };
 
 pub struct EventLoop {

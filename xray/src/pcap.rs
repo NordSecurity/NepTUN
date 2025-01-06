@@ -7,7 +7,7 @@ use pnet::packet::{
     udp::UdpPacket, Packet,
 };
 
-use crate::{client::Client, utils::Packet as XrayPacket, XRayResult};
+use crate::{client::Client, types::Packet as XrayPacket, types::XRayResult};
 
 #[derive(Debug)]
 pub struct PcapPacket {
