@@ -67,20 +67,28 @@ def setup_wireguard(wg, build_neptun, disable_drop_privileges):
     )  # Not strictly necessary but keeps the pcaps a bit cleaner
 
 
-def start_tcpdump(pcap_name):
+def start_tcpdump(pcap_path):
     return subprocess.Popen(
-        ["sudo", "tcpdump", "-ni", "any", "-w", pcap_name],
+        [
+            "sudo",
+            "tcpdump",
+            "-ni",
+            "any",
+            "-w",
+            pcap_path,
+            "udp and (port 41414 or port 52525 or port 63636)",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
 
 
-def run_xray(wg, test_type, count, build_xray, csv_path):
+def run_xray(wg, test_type, count, build_xray, csv_path, pcap_path):
     if build_xray:
-        run_command(f"cargo build --release")
+        run_command(f"cargo build --release -p xray")
     run_command(
-        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-name {csv_path}"
+        f"sudo ../target/release/xray --wg {wg.lower()} --test-type {test_type} --packet-count {count} --csv-path {csv_path} --pcap-path {pcap_path}"
     )
 
 
@@ -136,7 +144,7 @@ def main():
 
     succeeded = True
     try:
-        run_xray(wg.name, test_type, count, build_xray, file_paths.csv())
+        run_xray(wg.name, test_type, count, build_xray, file_paths.csv(), file_paths.pcap())
     except:  # noqa: E722
         print("xray failed. Exiting...")
         succeeded = False
@@ -148,7 +156,6 @@ def main():
         analyze(
             file_paths,
             count,
-            test_type,
             args.ascii,
             args.save_output,
         )

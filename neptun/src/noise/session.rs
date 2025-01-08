@@ -273,6 +273,46 @@ impl Session {
         let counter_validator = self.receiving_key_counter.lock();
         (counter_validator.next, counter_validator.receive_cnt)
     }
+
+    #[cfg(feature = "xray")]
+    pub fn is_right_session(&self, packet_recv_index: u32) -> bool {
+        self.receiving_index == packet_recv_index || self.sending_index == packet_recv_index
+    }
+
+    #[cfg(feature = "xray")]
+    pub fn decrypt_data_packet<'a>(
+        &self,
+        packet: PacketData,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        let ct_len = packet.encrypted_encapsulated_packet.len();
+        if dst.len() < ct_len {
+            // This is a very incorrect use of the library, therefore panic and not error
+            panic!("The destination buffer is too small");
+        }
+        let decrypt_key = if packet.receiver_idx == self.receiving_index {
+            &self.receiver
+        } else if packet.receiver_idx == self.sending_index {
+            &self.sender
+        } else {
+            return Err(WireGuardError::WrongIndex);
+        };
+
+        let ret = {
+            let mut nonce = [0u8; 12];
+            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
+            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            decrypt_key
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    &mut dst[..ct_len],
+                )
+                .map_err(|_| WireGuardError::InvalidAeadTag)?
+        };
+
+        Ok(ret)
+    }
 }
 
 #[inline(always)]

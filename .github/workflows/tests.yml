@@ -17,6 +17,8 @@ jobs:
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
     - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - if: matrix.os == 'ubuntu-24.04'
+      run: sudo apt-get install -y libpcap-dev
     - name: Install hack
       run: cargo +stable install --git https://github.com/taiki-e/cargo-hack.git cargo-hack --rev c0b517b9eefa27cdaf27cca5f1b186c00ef1af47 --locked
     - run: cargo hack test --each-feature ${{ matrix.packages }}
@@ -29,6 +31,8 @@ jobs:
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
     - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - if: matrix.os == 'ubuntu-24.04'
+      run: sudo apt-get install -y libpcap-dev
     - run: CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='sudo -E' cargo test -- --ignored
 
   crypto-bench:
@@ -59,7 +63,7 @@ jobs:
         working-directory: xray
         run: |
           sudo apt update
-          sudo apt install -y wireguard wireguard-go
+          sudo apt install -y wireguard wireguard-go libpcap-dev
           python -m pip install --upgrade pip
           pip install pipenv
           pipenv install
