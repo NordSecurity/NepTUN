@@ -27,7 +27,7 @@ pub struct Peer {
     pub(crate) public_key: ([u8; 32], String),
     /// The index the tunnel uses
     index: u32,
-    endpoint: RwLock<Endpoint>,
+    endpoint: Arc<RwLock<Endpoint>>,
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
@@ -77,10 +77,10 @@ impl Peer {
             tunnel: Mutex::new(tunnel),
             public_key: (pub_key.to_bytes(), public_key_hex),
             index,
-            endpoint: RwLock::new(Endpoint {
+            endpoint: Arc::new(RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
-            }),
+            })),
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
@@ -89,6 +89,10 @@ impl Peer {
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
         self.endpoint.read()
+    }
+
+    pub(crate) fn endpoint_ref(&self) -> Arc<parking_lot::RwLock<Endpoint>> {
+        self.endpoint.clone()
     }
 
     pub fn shutdown_endpoint(&self) {
@@ -205,7 +209,18 @@ mod tests {
         let b_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
         let b_public_key = PublicKey::from(&b_secret_key);
 
-        let tunnel = Tunn::new(a_secret_key, b_public_key, None, None, 0, None).unwrap();
+        let tunnel = Tunn::new(
+            a_secret_key,
+            b_public_key,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let peer = Peer::new(
             tunnel,
             0,

@@ -5,6 +5,7 @@
 pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
+pub mod ring_buffers;
 pub mod safe_duration;
 
 #[cfg(test)]
@@ -12,6 +13,11 @@ mod integration_tests;
 mod session;
 mod timers;
 
+use crossbeam::channel::{Receiver, Sender};
+use ring_buffers::{EncryptionTaskData, TX_RING_BUFFER};
+use session::Session;
+
+use crate::device::peer::Endpoint;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -22,6 +28,7 @@ use crate::x25519;
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +68,21 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
     }
 }
 
+#[derive(Debug)]
+pub enum NeptunResult {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(usize),
+    WriteToTunnelV4(usize, Ipv4Addr),
+    WriteToTunnelV6(usize, Ipv6Addr),
+}
+
+impl From<WireGuardError> for NeptunResult {
+    fn from(err: WireGuardError) -> NeptunResult {
+        NeptunResult::Err(err)
+    }
+}
+
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     /// The handshake currently in progress
@@ -78,6 +100,9 @@ pub struct Tunn {
     rate_limiter: Arc<RateLimiter>,
 
     pub peer_static_public: x25519_dalek::PublicKey,
+
+    encrypt_tx_chan: Sender<usize>,
+    network_tx_chan: Sender<&'static EncryptionTaskData>,
 }
 
 type MessageType = u32;
@@ -209,9 +234,18 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
+        encrypt_tx_chan: Option<Sender<usize>>,
+        encrypt_rx_chan: Option<Receiver<usize>>,
+        network_tx_chan: Option<Sender<&'static EncryptionTaskData>>,
     ) -> Result<Self, &'static str> {
         let static_public = x25519::PublicKey::from(&static_private);
 
+        let net_tx_clone = network_tx_chan.as_ref().unwrap().clone();
+        std::thread::spawn(move || {
+            Session::encrypt_data_worker(encrypt_rx_chan.unwrap(), net_tx_clone)
+        });
+
+        let net_tx_clone = network_tx_chan.unwrap();
         let tunn = Tunn {
             peer_static_public,
             handshake: Handshake::new(
@@ -233,6 +267,8 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            encrypt_tx_chan: encrypt_tx_chan.unwrap(),
+            network_tx_chan: net_tx_clone,
         };
 
         Ok(tunn)
@@ -271,29 +307,72 @@ impl Tunn {
     /// # Panics
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
-    pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn encapsulate<'a>(
+        &mut self,
+        len: usize,
+        element: &'static mut EncryptionTaskData,
+        iter: usize,
+        endpoint: Arc<parking_lot::RwLock<Endpoint>>,
+    ) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            element.is_element_free.store(false, Ordering::Relaxed);
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            element.buf_len = len;
+            element.sending_index = session.get_sending_index();
+            element.sender = Some(session.get_sender_key());
+            element.sending_key_counter = session.get_sending_key_counter();
+            element.endpoint = endpoint;
+
+            // Send the notification on the channel to encrypt the packet
             self.mark_timer_to_update(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if len != 0 {
                 self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += packet.len();
-            return TunnResult::WriteToNetwork(packet);
+            // TODO! - Can't set the len here, as 1) wrong length. 2) don't know
+            // whether error would come or not.
+            // self.tx_bytes += packet.len();
+
+            // TODO! - This has to change
+            let _ = self.encrypt_tx_chan.send(iter);
+            return TunnResult::Done;
         }
 
-        if !src.is_empty() {
+        if len != 0 {
             // If there is no session, queue the packet for future retry,
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
-            self.queue_packet(src);
+            self.queue_packet(&element.data[..len]);
         }
 
         // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        self.initiate_handshake(endpoint, false);
+        TunnResult::Done
+    }
+
+    pub fn initiate_handshake<'a>(
+        &mut self,
+        endpoint: Arc<parking_lot::RwLock<Endpoint>>,
+        force_resend: bool,
+    ) {
+        // TODO: Have to fix this. This can't be a hardcoded 0th iter
+        let (dst, _) = unsafe { TX_RING_BUFFER.get_next() };
+        {
+            dst.endpoint = endpoint;
+            let res = self.format_handshake_initiation(dst.data.as_mut_slice(), force_resend);
+            match res {
+                NeptunResult::Done => return,
+                NeptunResult::Err(e) => {
+                    tracing::error!(message = "Handshake initiation error", error = ?e);
+                    return;
+                }
+                NeptunResult::WriteToNetwork(n) => dst.res = NeptunResult::WriteToNetwork(n),
+                _ => panic!("Unexpected result from handshake initiation"),
+            }
+        };
+        dst.is_element_free.store(false, Ordering::Relaxed);
+        let _ = self.network_tx_chan.send(dst);
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -393,7 +472,15 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let (keepalive_packet, _) = {
+            Session::format_packet_data(
+                session.get_sending_key_counter(),
+                session.get_sending_index(),
+                session.get_sender_key(),
+                0,
+                dst,
+            )
+        };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -480,9 +567,9 @@ impl Tunn {
         &mut self,
         dst: &'a mut [u8],
         force_resend: bool,
-    ) -> TunnResult<'a> {
+    ) -> NeptunResult {
         if self.handshake.is_in_progress() && !force_resend {
-            return TunnResult::Done;
+            return NeptunResult::Done;
         }
 
         if self.handshake.is_expired() {
@@ -501,9 +588,9 @@ impl Tunn {
                 self.mark_timer_to_update(TimerName::TimeLastPacketSent);
                 self.tx_bytes += packet.len();
 
-                TunnResult::WriteToNetwork(packet)
+                NeptunResult::WriteToNetwork(packet.len())
             }
-            Err(e) => TunnResult::Err(e),
+            Err(e) => NeptunResult::Err(e),
         }
     }
 
@@ -559,15 +646,23 @@ impl Tunn {
 
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        if let Some(packet) = self.dequeue_packet() {
-            match self.encapsulate(&packet, dst) {
-                TunnResult::Err(_) => {
-                    // On error, return packet to the queue
-                    self.requeue_packet(packet);
-                }
-                r => return r,
-            }
-        }
+        // TODO: Fix this with encapsulate without peer ???
+        // if let Some(packet) = self.dequeue_packet() {
+        //     loop {
+        //         let (element, iter) = unsafe { TX_RING_BUFFER.get_next() };
+        //         if element.is_element_free.load(Ordering::Relaxed) {
+        //             element.data[16..packet.len()].copy_from_slice(&packet);
+        //             match self.encapsulate(packet.len(), element, iter) {
+        //                 TunnResult::Err(_) => {
+        //                     // On error, return packet to the queue
+        //                     self.requeue_packet(packet);
+        //                 }
+        //                 r => return r,
+        //             }
+        //             break;
+        //         }
+        //     }
+        // }
         TunnResult::Done
     }
 
@@ -638,6 +733,8 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     #[cfg(feature = "mock-instant")]
     use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
@@ -653,10 +750,31 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let their_idx = OsRng.next_u32();
 
-        let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
+        let my_tun = Tunn::new(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            my_idx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
-        let their_tun =
-            Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None).unwrap();
+        let their_tun = Tunn::new(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            their_idx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         (my_tun, their_tun)
     }
@@ -664,14 +782,14 @@ mod tests {
     fn create_handshake_init(tun: &mut Tunn) -> Vec<u8> {
         let mut dst = vec![0u8; 2048];
         let handshake_init = tun.format_handshake_initiation(&mut dst, false);
-        assert!(matches!(handshake_init, TunnResult::WriteToNetwork(_)));
-        let handshake_init = if let TunnResult::WriteToNetwork(sent) = handshake_init {
+        assert!(matches!(handshake_init, NeptunResult::WriteToNetwork(_)));
+        let handshake_init = if let NeptunResult::WriteToNetwork(sent) = handshake_init {
             sent
         } else {
             unreachable!();
         };
 
-        handshake_init.into()
+        dst[..handshake_init].to_vec()
     }
 
     fn create_handshake_response(tun: &mut Tunn, handshake_init: &[u8]) -> Vec<u8> {
@@ -777,8 +895,14 @@ mod tests {
     fn full_handshake_plus_timers() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         // Time has not yet advanced so their is nothing to do
-        assert!(matches!(my_tun.update_timers(&mut []), TunnResult::Done));
-        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+        assert!(matches!(
+            my_tun.update_timers(&mut [], Arc::default()),
+            TunnResult::Done
+        ));
+        assert!(matches!(
+            their_tun.update_timers(&mut [], Arc::default()),
+            TunnResult::Done
+        ));
     }
 
     #[test]

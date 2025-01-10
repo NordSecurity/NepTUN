@@ -27,7 +27,7 @@ pub mod tun;
 pub mod tun;
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
@@ -40,13 +40,15 @@ use std::thread;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::ring_buffers::{EncryptionTaskData, RB_SIZE, TX_RING_BUFFER};
+use crate::noise::{NeptunResult, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+use crossbeam::channel::{Receiver, Sender};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -166,6 +168,12 @@ pub struct Device {
     mtu: AtomicUsize,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    encrypt_tx: Sender<usize>,
+    encrypt_rx: Receiver<usize>,
+
+    network_rx: Receiver<&'static EncryptionTaskData>,
+    network_tx: Sender<&'static EncryptionTaskData>,
 }
 
 struct ThreadData {
@@ -467,6 +475,9 @@ impl Device {
             keepalive,
             next_index,
             None,
+            Some(self.encrypt_tx.clone()),
+            Some(self.encrypt_rx.clone()),
+            Some(self.network_tx.clone()),
         )
         .unwrap();
 
@@ -503,6 +514,9 @@ impl Device {
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
 
+        let (encrypt_tx, encrypt_rx) = crossbeam::channel::bounded(RB_SIZE);
+        let (network_tx, network_rx) = crossbeam::channel::bounded(RB_SIZE);
+
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
@@ -522,6 +536,10 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            encrypt_tx,
+            encrypt_rx,
+            network_tx: network_tx.clone(),
+            network_rx,
             #[cfg(not(target_os = "linux"))]
             update_seq: 0,
         };
@@ -583,8 +601,14 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
+        self.udp4 = Some(udp_sock4.try_clone().unwrap());
+        self.udp6 = Some(udp_sock6.try_clone().unwrap());
+
+        // Send to network in a seperate thread
+        let rx_clone = self.network_rx.clone();
+        let udp4 = Arc::new(udp_sock4).clone();
+        let udp6 = Arc::new(udp_sock6).clone();
+        std::thread::spawn(move || send_to_network(rx_clone, udp4, udp6));
 
         self.listen_port = port;
 
@@ -692,21 +716,16 @@ impl Device {
             Box::new(|d, t| {
                 let peer_map = &d.peers;
 
-                let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                    (Some(udp4), Some(udp6)) => (udp4, udp6),
+                match (d.udp4.as_ref(), d.udp6.as_ref()) {
+                    (Some(_), Some(_)) => (),
                     _ => return Action::Continue,
                 };
 
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
-                    let endpoint_addr = match peer.endpoint().addr {
-                        Some(addr) => addr,
-                        None => continue,
-                    };
-
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.update_timers(&mut t.dst_buf[..])
+                        tun.update_timers(&mut t.dst_buf[..], peer.endpoint_ref())
                     };
                     match res {
                         TunnResult::Done => {}
@@ -714,20 +733,6 @@ impl Device {
                             peer.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
-                        TunnResult::WriteToNetwork(packet) => {
-                            let res = match endpoint_addr {
-                                SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into())
-                                }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into())
-                                }
-                            };
-
-                            if let Err(err) = res {
-                                tracing::warn!(message = "Failed to send timers request", error = ?err, dst = ?endpoint_addr);
-                            }
-                        }
                         _ => panic!("Unexpected result from update_timers"),
                     };
                 }
@@ -1026,105 +1031,59 @@ impl Device {
                 // * Send encapsulated packet to the peer's endpoint
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
-                let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
-
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
-                        Err(Error::IfaceRead(e)) => {
-                            let ek = e.kind();
-                            if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
-                                break;
+                    let (element, iter) = unsafe { TX_RING_BUFFER.get_next() };
+                    if element.is_element_free.load(Ordering::Relaxed) {
+                        const DATA_OFFSET: usize = 16;
+                        let len = match iface.read(&mut element.data[DATA_OFFSET..mtu]) {
+                            Ok(src) => src.len(),
+                            Err(Error::IfaceRead(e)) => {
+                                let ek = e.kind();
+                                if ek == io::ErrorKind::Interrupted
+                                    || ek == io::ErrorKind::WouldBlock
+                                {
+                                    break;
+                                }
+                                tracing::error!(
+                                    message="Fatal read error on tun interface: errno", error=?e
+                                );
+                                return Action::Exit;
                             }
-                            tracing::error!(
-                                message="Fatal read error on tun interface: errno", error=?e
-                            );
-                            return Action::Exit;
+                            Err(e) => {
+                                tracing::error!(
+                                    message="Unexpected error on tun interface", error=?e
+                                );
+                                return Action::Exit;
+                            }
+                        };
+
+                        let dst_addr = match Tunn::dst_address(
+                            &element.data[DATA_OFFSET..len + DATA_OFFSET],
+                        ) {
+                            Some(addr) => addr,
+                            None => continue,
+                        };
+
+                        let peer = match peers.find(dst_addr) {
+                            Some(peer) => peer,
+                            None => continue,
+                        };
+
+                        if let Some(callback) = &d.config.firewall_process_outbound_callback {
+                            if !callback(
+                                &peer.public_key.0,
+                                &element.data[DATA_OFFSET..len + DATA_OFFSET],
+                            ) {
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                message="Unexpected error on tun interface", error=?e
-                            );
-                            return Action::Exit;
-                        }
-                    };
 
-                    let dst_addr = match Tunn::dst_address(src) {
-                        Some(addr) => addr,
-                        None => continue,
-                    };
-
-                    let peer = match peers.find(dst_addr) {
-                        Some(peer) => peer,
-                        None => continue,
-                    };
-
-
-                    if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                        if !callback(&peer.public_key.0, src) {
-                            continue;
-                        }
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.encapsulate(len, element, iter, peer.endpoint_ref())
+                        };
                     }
-
-                    let res = {
-                        let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
-                    };
-                    match res {
-                        TunnResult::Done => {}
-                        TunnResult::Err(e) => {
-                            tracing::error!(message = "Encapsulate error",
-                                error = ?e,
-                                public_key = peer.public_key.1)
-                        }
-                        TunnResult::WriteToNetwork(packet) => {
-                            let endpoint = peer.endpoint();
-                            if let Some(conn) = endpoint.conn.as_ref() {
-                                // Prefer to send using the connected socket
-                                if let Err(err) = conn.send(packet) {
-                                    tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                                    drop(endpoint);
-                                    peer.shutdown_endpoint();
-                                } else {
-                                    tracing::trace!(
-                                        "Pkt -> ConnSock ({:?}), len: {}, dst_addr: {}",
-                                        endpoint.addr,
-                                        packet.len(),
-                                        dst_addr
-                                    );
-                                }
-                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                                } else {
-                                    tracing::trace!(
-                                        message = "Writing packet to network v4",
-                                        interface = ?t.iface.name(),
-                                        packet_length = packet.len(),
-                                        src_addr = ?addr,
-                                        public_key = peer.public_key.1
-                                    );
-                                }
-                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                                } else {
-                                    tracing::trace!(
-                                        message = "Writing packet to network v6",
-                                        interface = ?t.iface.name(),
-                                        packet_length = packet.len(),
-                                        src_addr = ?addr,
-                                        public_key = peer.public_key.1
-                                    );
-                                }
-                            } else {
-                                tracing::error!("No endpoint");
-                            }
-                        }
-                        _ => panic!("Unexpected result from encapsulate"),
-                    };
                 }
                 Action::Continue
             }),
@@ -1134,6 +1093,41 @@ impl Device {
 
     pub fn iface(&self) -> &TunSocket {
         &self.iface
+    }
+}
+
+fn send_to_network(
+    network_rx: Receiver<&EncryptionTaskData>,
+    udp4: Arc<Socket>,
+    udp6: Arc<Socket>,
+) {
+    // Check whether udp4/6 are there
+    // let udp4 = udp4.as_ref().expect("Not connected");
+    // let udp6 = udp6.as_ref().expect("Not connected");
+
+    while let Ok(msg) = network_rx.recv() {
+        match &msg.res {
+            NeptunResult::Done => {}
+            NeptunResult::Err(e) => {
+                tracing::error!(message = "Encapsulate error", error = ?e)
+            }
+            NeptunResult::WriteToNetwork(len) => {
+                let mut endpoint = msg.endpoint.write();
+                let packet = &msg.data.as_slice()[..*len];
+                if let Some(conn) = endpoint.conn.as_mut() {
+                    // Prefer to send using the connected socket
+                    let _: Result<_, _> = conn.write(packet);
+                } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                    let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                } else {
+                    tracing::error!("No endpoint");
+                }
+            }
+            _ => panic!("Unexpected result from encapsulate"),
+        };
+        msg.is_element_free.store(true, Ordering::Relaxed);
     }
 }
 
