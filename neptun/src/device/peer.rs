@@ -10,15 +10,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
-use crate::noise::Tunn;
+use crate::noise::{Endpoint, Tunn};
 
 use std::os::fd::AsRawFd;
-
-#[derive(Default, Debug)]
-pub struct Endpoint {
-    pub addr: Option<SocketAddr>,
-    pub conn: Option<socket2::Socket>,
-}
 
 pub struct Peer {
     /// The associated tunnel struct

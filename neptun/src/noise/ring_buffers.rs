@@ -1,5 +1,4 @@
-use super::NeptunResult;
-use crate::device::peer::Endpoint;
+use super::{NeptunResult, Endpoint};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use ring::aead::LessSafeKey;

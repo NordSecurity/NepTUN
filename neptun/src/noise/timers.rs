@@ -4,8 +4,7 @@
 
 use super::errors::WireGuardError;
 use super::ring_buffers::TX_RING_BUFFER;
-use crate::device::peer::Endpoint;
-use crate::noise::{safe_duration::SafeDuration as Duration, Tunn, TunnResult};
+use crate::noise::{safe_duration::SafeDuration as Duration, Endpoint, Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::sync::atomic::{AtomicU16, Ordering};

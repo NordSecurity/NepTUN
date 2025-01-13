@@ -17,7 +17,6 @@ use crossbeam::channel::{Receiver, Sender};
 use ring_buffers::{EncryptionTaskData, TX_RING_BUFFER};
 use session::Session;
 
-use crate::device::peer::Endpoint;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -27,7 +26,7 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,6 +51,12 @@ const IP_LEN_SZ: usize = 2;
 const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
+
+#[derive(Default, Debug)]
+pub struct Endpoint {
+    pub addr: Option<SocketAddr>,
+    pub conn: Option<socket2::Socket>,
+}
 
 #[derive(Debug)]
 pub enum TunnResult<'a> {
