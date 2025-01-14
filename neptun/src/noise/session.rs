@@ -35,9 +35,9 @@ impl std::fmt::Debug for Session {
 }
 
 /// Where encrypted data resides in a data packet
-const DATA_OFFSET: usize = 16;
+pub const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
-const AEAD_SIZE: usize = 16;
+pub const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;

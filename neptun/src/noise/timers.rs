@@ -3,17 +3,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use super::ring_buffers::TX_RING_BUFFER;
-use crate::noise::{safe_duration::SafeDuration as Duration, Endpoint, Tunn, TunnResult};
+use crate::noise::{safe_duration::SafeDuration as Duration, Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU16;
 use std::time::SystemTime;
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
-use parking_lot::RwLock;
 
 #[cfg(not(any(
     feature = "mock-instant",
@@ -225,11 +222,7 @@ impl Tunn {
         }
     }
 
-    pub fn update_timers<'a>(
-        &mut self,
-        dst: &'a mut [u8],
-        endpoint: Arc<RwLock<Endpoint>>,
-    ) -> TunnResult<'a> {
+    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
@@ -377,15 +370,11 @@ impl Tunn {
         }
 
         if handshake_initiation_required {
-            self.initiate_handshake(endpoint, true);
-            return TunnResult::Done;
+            return self.format_handshake_initiation(dst, true);
         }
 
         if keepalive_required {
-            let (element, iter) = unsafe { TX_RING_BUFFER.get_next() };
-            if element.is_element_free.load(Ordering::Relaxed) {
-                self.encapsulate(0, element, iter, endpoint);
-            }
+            return self.encapsulate(&[], dst);
         }
 
         TunnResult::Done
