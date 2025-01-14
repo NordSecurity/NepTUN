@@ -454,7 +454,7 @@ mod tests {
         my_tun.mark_timer_to_update(super::TimerName::TimePersistentKeepalive);
 
         // Update timers
-        // my_tun.update_timers(&mut [0]);
+        my_tun.update_timers(&mut [0]);
 
         // Only those timers marked should be udpated
         assert!(!my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());
@@ -471,7 +471,7 @@ mod tests {
         my_tun.timers[TimerName::TimeLastDataPacketReceived] = SafeDuration::from_millis(0);
         my_tun.timers[TimerName::TimePersistentKeepalive] = SafeDuration::from_millis(0);
 
-        // my_tun.update_timers(&mut [0]);
+        my_tun.update_timers(&mut [0]);
 
         // Now the timers should not update
         assert!(my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());
@@ -520,7 +520,7 @@ mod tests {
         my_tun.timers[TimerName::TimeLastDataPacketSent] = SafeDuration::from_millis(0);
 
         // TODO: Fix it later!!
-        // my_tun.update_timers(&mut [0]);
+        my_tun.update_timers(&mut [0]);
 
         // Now the timers should not update
         assert!(my_tun.timers[TimerName::TimeLastDataPacketSent].is_zero());

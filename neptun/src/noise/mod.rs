@@ -106,8 +106,8 @@ pub struct Tunn {
 
     pub peer_static_public: x25519_dalek::PublicKey,
 
-    encrypt_tx_chan: Sender<usize>,
-    network_tx_chan: Sender<&'static EncryptionTaskData>,
+    encrypt_tx_chan: Option<Sender<usize>>,
+    network_tx_chan: Option<Sender<&'static EncryptionTaskData>>,
 }
 
 type MessageType = u32;
@@ -245,12 +245,13 @@ impl Tunn {
     ) -> Result<Self, &'static str> {
         let static_public = x25519::PublicKey::from(&static_private);
 
-        let net_tx_clone = network_tx_chan.as_ref().unwrap().clone();
-        std::thread::spawn(move || {
-            Session::encrypt_data_worker(encrypt_rx_chan.unwrap(), net_tx_clone)
-        });
+        if let Some(tx_chan) = network_tx_chan.as_ref() {
+            let net_tx_clone = tx_chan.clone();
+            std::thread::spawn(move || {
+                Session::encrypt_data_worker(encrypt_rx_chan.unwrap(), net_tx_clone)
+            });
+        }
 
-        let net_tx_clone = network_tx_chan.unwrap();
         let tunn = Tunn {
             peer_static_public,
             handshake: Handshake::new(
@@ -272,8 +273,8 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
-            encrypt_tx_chan: encrypt_tx_chan.unwrap(),
-            network_tx_chan: net_tx_clone,
+            encrypt_tx_chan: encrypt_tx_chan,
+            network_tx_chan: network_tx_chan,
         };
 
         Ok(tunn)
@@ -309,6 +310,7 @@ impl Tunn {
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            dst[DATA_OFFSET..src.len() + DATA_OFFSET].copy_from_slice(src);
             // Send the packet using an established session
             let (packet, _) = Session::format_packet_data(
                 session.get_sending_key_counter(),
@@ -370,8 +372,7 @@ impl Tunn {
             }
             self.tx_bytes += len + DATA_OFFSET + AEAD_SIZE;
 
-            // TODO! - This has to change
-            let _ = self.encrypt_tx_chan.send(iter);
+            let _ = self.encrypt_tx_chan.as_ref().unwrap().send(iter);
             return TunnResult::Done;
         }
 
@@ -410,7 +411,7 @@ impl Tunn {
             }
         };
         dst.is_element_free.store(false, Ordering::Relaxed);
-        let _ = self.network_tx_chan.send(dst);
+        let _ = self.network_tx_chan.as_ref().unwrap().send(dst);
     }
 
     /// Receives a UDP datagram from the network and parses it.
