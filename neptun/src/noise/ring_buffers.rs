@@ -1,4 +1,4 @@
-use super::{NeptunResult, Endpoint};
+use super::{Endpoint, NeptunResult};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use ring::aead::LessSafeKey;

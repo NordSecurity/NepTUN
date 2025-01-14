@@ -152,8 +152,8 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
-    udp4: Option<socket2::Socket>,
-    udp6: Option<socket2::Socket>,
+    udp4: Option<Arc<socket2::Socket>>,
+    udp6: Option<Arc<socket2::Socket>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -691,13 +691,14 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4.try_clone().unwrap());
-        self.udp6 = Some(udp_sock6.try_clone().unwrap());
+
+        let udp4 = Arc::new(udp_sock4);
+        let udp6 = Arc::new(udp_sock6);
+        self.udp4 = Some(udp4.clone());
+        self.udp6 = Some(udp6.clone());
 
         // Send to network in a seperate thread
         let rx_clone = self.network_rx.clone();
-        let udp4 = Arc::new(udp_sock4).clone();
-        let udp6 = Arc::new(udp_sock6).clone();
         std::thread::spawn(move || send_to_network(rx_clone, udp4, udp6));
 
         self.listen_port = port;
@@ -806,16 +807,21 @@ impl Device {
             Box::new(|d, t| {
                 let peer_map = &d.peers;
 
-                match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                    (Some(_), Some(_)) => (),
+                let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
+                    (Some(udp4), Some(udp6)) => (udp4, udp6),
                     _ => return Action::Continue,
                 };
 
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
+                    let endpoint_addr = match peer.endpoint().addr {
+                        Some(addr) => addr,
+                        None => continue,
+                    };
+
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.update_timers(&mut t.dst_buf[..], peer.endpoint_ref())
+                        tun.update_timers(&mut t.dst_buf[..])
                     };
                     match res {
                         TunnResult::Done => {}
@@ -823,6 +829,20 @@ impl Device {
                             peer.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
+                        TunnResult::WriteToNetwork(packet) => {
+                            let res = match endpoint_addr {
+                                SocketAddr::V4(_) => {
+                                    udp4.send_to(packet, &endpoint_addr.into())
+                                }
+                                SocketAddr::V6(_) => {
+                                    udp6.send_to(packet, &endpoint_addr.into())
+                                }
+                            };
+
+                            if let Err(err) = res {
+                                tracing::warn!(message = "Failed to send timers request", error = ?err, dst = ?endpoint_addr);
+                            }
+                        }
                         _ => panic!("Unexpected result from update_timers"),
                     };
                 }
@@ -1179,7 +1199,7 @@ impl Device {
 
                         let res = {
                             let mut tun = peer.tunnel.lock();
-                            tun.encapsulate(len, element, iter, peer.endpoint_ref())
+                            tun.queue_encapsulate(len, element, iter, peer.endpoint_ref())
                         };
                     }
                 }
