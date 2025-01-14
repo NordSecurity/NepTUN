@@ -351,7 +351,7 @@ impl Tunn {
         &mut self,
         len: usize,
         element: &'static mut EncryptionTaskData,
-        iter: usize,
+        idx: usize,
         endpoint: Arc<parking_lot::RwLock<Endpoint>>,
     ) -> TunnResult<'a> {
         let current = self.current;
@@ -372,7 +372,7 @@ impl Tunn {
             }
             self.tx_bytes += len + DATA_OFFSET + AEAD_SIZE;
 
-            let _ = self.encrypt_tx_chan.as_ref().unwrap().send(iter);
+            let _ = self.encrypt_tx_chan.as_ref().unwrap().send(idx);
             return TunnResult::Done;
         }
 
@@ -686,22 +686,15 @@ impl Tunn {
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         // TODO: Fix this with encapsulate without peer ???
-        // if let Some(packet) = self.dequeue_packet() {
-        //     loop {
-        //         let (element, iter) = unsafe { TX_RING_BUFFER.get_next() };
-        //         if element.is_element_free.load(Ordering::Relaxed) {
-        //             element.data[16..packet.len()].copy_from_slice(&packet);
-        //             match self.encapsulate(packet.len(), element, iter) {
-        //                 TunnResult::Err(_) => {
-        //                     // On error, return packet to the queue
-        //                     self.requeue_packet(packet);
-        //                 }
-        //                 r => return r,
-        //             }
-        //             break;
-        //         }
-        //     }
-        // }
+        if let Some(packet) = self.dequeue_packet() {
+            match self.encapsulate(&packet, dst) {
+                TunnResult::Err(_) => {
+                    // On error, return packet to the queue
+                    self.requeue_packet(packet);
+                }
+                r => return r,
+            }
+        }
         TunnResult::Done
     }
 
