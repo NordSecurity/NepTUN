@@ -150,8 +150,8 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
-    udp4: Option<socket2::Socket>,
-    udp6: Option<socket2::Socket>,
+    udp4: Option<Arc<socket2::Socket>>,
+    udp6: Option<Arc<socket2::Socket>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -601,13 +601,14 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4.try_clone().unwrap());
-        self.udp6 = Some(udp_sock6.try_clone().unwrap());
+
+        let udp4 = Arc::new(udp_sock4);
+        let udp6 = Arc::new(udp_sock6);
+        self.udp4 = Some(udp4.clone());
+        self.udp6 = Some(udp6.clone());
 
         // Send to network in a seperate thread
         let rx_clone = self.network_rx.clone();
-        let udp4 = Arc::new(udp_sock4).clone();
-        let udp6 = Arc::new(udp_sock6).clone();
         std::thread::spawn(move || send_to_network(rx_clone, udp4, udp6));
 
         self.listen_port = port;
