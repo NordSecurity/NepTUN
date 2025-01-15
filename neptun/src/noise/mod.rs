@@ -14,7 +14,7 @@ mod session;
 mod timers;
 
 use crossbeam::channel::{Receiver, Sender};
-use ring_buffers::{EncryptionTaskData, TX_RING_BUFFER};
+use ring_buffers::EncryptionTaskData;
 use session::{Session, AEAD_SIZE, DATA_OFFSET};
 
 use crate::noise::errors::WireGuardError;
@@ -107,7 +107,6 @@ pub struct Tunn {
     pub peer_static_public: x25519_dalek::PublicKey,
 
     encrypt_tx_chan: Option<Sender<usize>>,
-    network_tx_chan: Option<Sender<&'static EncryptionTaskData>>,
 }
 
 type MessageType = u32;
@@ -274,7 +273,6 @@ impl Tunn {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
             encrypt_tx_chan: encrypt_tx_chan,
-            network_tx_chan: network_tx_chan,
         };
 
         Ok(tunn)
@@ -353,6 +351,7 @@ impl Tunn {
         element: &'static mut EncryptionTaskData,
         idx: usize,
         endpoint: Arc<parking_lot::RwLock<Endpoint>>,
+        dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
@@ -384,34 +383,7 @@ impl Tunn {
         }
 
         // Initiate a new handshake if none is in progress
-        self.initiate_handshake(endpoint, false);
-        TunnResult::Done
-    }
-
-    pub fn initiate_handshake<'a>(
-        &mut self,
-        endpoint: Arc<parking_lot::RwLock<Endpoint>>,
-        force_resend: bool,
-    ) {
-        // TODO: Have to fix this. This can't be a hardcoded 0th iter
-        let (dst, _) = unsafe { TX_RING_BUFFER.get_next() };
-        {
-            dst.endpoint = endpoint;
-            let res = self.format_handshake_initiation(dst.data.as_mut_slice(), force_resend);
-            match res {
-                TunnResult::Done => return,
-                TunnResult::Err(e) => {
-                    tracing::error!(message = "Handshake initiation error", error = ?e);
-                    return;
-                }
-                TunnResult::WriteToNetwork(buf) => {
-                    dst.res = NeptunResult::WriteToNetwork(buf.len())
-                }
-                _ => panic!("Unexpected result from handshake initiation"),
-            }
-        };
-        dst.is_element_free.store(false, Ordering::Relaxed);
-        let _ = self.network_tx_chan.as_ref().unwrap().send(dst);
+        self.format_handshake_initiation(dst, false)
     }
 
     /// Receives a UDP datagram from the network and parses it.

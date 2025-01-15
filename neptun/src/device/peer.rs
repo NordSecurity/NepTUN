@@ -89,8 +89,8 @@ impl Peer {
         self.endpoint.clone()
     }
 
-    pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
+    pub fn shutdown_endpoint(endpoint: Arc<parking_lot::RwLock<Endpoint>>) {
+        if let Some(conn) = endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
             conn.shutdown(Shutdown::Both).unwrap();
         }
