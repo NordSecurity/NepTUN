@@ -56,9 +56,7 @@ pub async fn configure_wg(
     }
 
     match adapter_type {
-        Wg::LinuxNative | Wg::BoringTun => {
-            configure_native_wg(wg_name, wg_keys, peer_keys, wg_port)
-        }
+        Wg::LinuxNative => configure_native_wg(wg_name, wg_keys, peer_keys, wg_port),
         Wg::WireguardGo | Wg::NepTUN => {
             configure_userspace_wg(wg_name, wg_keys, peer_keys, wg_port).await
         }

@@ -43,7 +43,7 @@ struct CliArgs {
     #[arg(
         long,
         default_value_t = Wg::NepTUN,
-        value_parser = clap::builder::PossibleValuesParser::new(["neptun", "native", "wggo", "boringtun"])
+        value_parser = clap::builder::PossibleValuesParser::new(["neptun", "native", "wggo"])
             .map(|s| s.parse::<Wg>().unwrap()),
     )]
     wg: Wg,

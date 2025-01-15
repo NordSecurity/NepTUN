@@ -44,7 +44,6 @@ pub enum Wg {
     NepTUN,
     LinuxNative,
     WireguardGo,
-    BoringTun,
 }
 
 impl std::fmt::Display for Wg {
@@ -53,7 +52,6 @@ impl std::fmt::Display for Wg {
             Self::NepTUN => "neptun",
             Self::LinuxNative => "native",
             Self::WireguardGo => "wggo",
-            Self::BoringTun => "boringtun",
         };
         s.fmt(f)
     }
@@ -67,7 +65,6 @@ impl std::str::FromStr for Wg {
             "neptun" => Ok(Self::NepTUN),
             "native" => Ok(Self::LinuxNative),
             "wggo" => Ok(Self::WireguardGo),
-            "boringtun" => Ok(Self::BoringTun),
             _ => Err(format!("Unsupported adapter type '{s}'")),
         }
     }
