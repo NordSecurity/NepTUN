@@ -12,10 +12,7 @@ use pnet::packet::{
 };
 use tokio::net::UdpSocket;
 
-use crate::{
-    utils::{RecvType, SendType},
-    XRayError, XRayResult,
-};
+use crate::types::{RecvType, SendType, XRayError, XRayResult};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_MAX_TRIES: usize = 5;

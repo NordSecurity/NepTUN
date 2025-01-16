@@ -1,76 +1,12 @@
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    process::Command,
-};
+use std::{net::Ipv4Addr, process::Command};
 
-use serde::Serialize;
 use tokio::net::UnixStream;
 
 use crate::{
     key_pair::{KeyPair, NepTUNKey},
-    XRayError, XRayResult,
+    types::{Packet, XRayError, XRayResult},
+    Wg,
 };
-
-#[derive(Debug)]
-pub enum SendType {
-    Plaintext,
-    HandshakeInitiation,
-    HandshakeResponse,
-    Data,
-    None,
-}
-
-#[derive(Debug)]
-pub enum RecvType {
-    HandshakeInitiation,
-    HandshakeResponse,
-    Data { length: usize },
-}
-
-/// A `send_index` is not stored in the packet since they are added, in order, to a vector when they're sent
-/// so their index in that vector accurately represents the send index
-#[derive(Copy, Clone, Default, Serialize)]
-pub struct Packet {
-    pub recv_index: Option<u64>,
-    pub send_ts: u128,
-    pub pre_wg_ts: Option<u128>,
-    pub post_wg_ts: Option<u128>,
-    pub recv_ts: Option<u128>,
-}
-
-impl Packet {
-    pub fn new(send_ts: u128) -> Self {
-        Self {
-            send_ts,
-            ..Default::default()
-        }
-    }
-
-    pub const fn send_size() -> usize {
-        std::mem::size_of::<u64>() + std::mem::size_of::<u128>()
-    }
-
-    pub const fn index_size() -> usize {
-        std::mem::size_of::<u64>()
-    }
-
-    pub const fn ts_size() -> usize {
-        std::mem::size_of::<u128>()
-    }
-}
-
-pub enum TestCmd {
-    SendEncrypted {
-        sock_dst: SocketAddrV4,
-        packet_dst: SocketAddrV4,
-        send_index: u64,
-    },
-    SendPlaintext {
-        dst: SocketAddrV4,
-        send_index: u64,
-    },
-    Done,
-}
 
 pub fn run_command(cmd: String) -> Result<String, String> {
     let mut args = cmd.split_ascii_whitespace().collect::<Vec<_>>();
@@ -106,7 +42,7 @@ pub fn write_to_csv(name: &str, packets: &[Packet]) -> XRayResult<()> {
 }
 
 pub async fn configure_wg(
-    adapter_type: &str,
+    adapter_type: Wg,
     wg_name: &str,
     wg_keys: &KeyPair,
     peer_keys: &KeyPair,
@@ -120,9 +56,10 @@ pub async fn configure_wg(
     }
 
     match adapter_type {
-        "native" | "boringtun" => configure_native_wg(wg_name, wg_keys, peer_keys, wg_port),
-        "wggo" | "neptun" => configure_userspace_wg(wg_name, wg_keys, peer_keys, wg_port).await,
-        _ => Err(XRayError::UnknownAdapter(adapter_type.to_owned())),
+        Wg::LinuxNative => configure_native_wg(wg_name, wg_keys, peer_keys, wg_port),
+        Wg::WireguardGo | Wg::NepTUN => {
+            configure_userspace_wg(wg_name, wg_keys, peer_keys, wg_port).await
+        }
     }
 }
 
