@@ -29,7 +29,7 @@ pub mod tun;
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter};
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
@@ -389,7 +389,7 @@ impl Device {
         if let Some(peer) = self.peers.remove(pub_key) {
             // Found a peer to remove, now purge all references to it:
             {
-                peer.shutdown_endpoint(); // close open udp socket and free the closure
+                Peer::shutdown_endpoint(peer.endpoint_ref()); // close open udp socket and free the closure
                 self.peers_by_idx.remove(&peer.index());
             }
             self.peers_by_ip
@@ -578,7 +578,7 @@ impl Device {
         }
 
         for peer in self.peers.values() {
-            peer.shutdown_endpoint();
+            Peer::shutdown_endpoint(peer.endpoint_ref());
         }
 
         // Then open new sockets and bind to the port
@@ -736,7 +736,7 @@ impl Device {
                     match res {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            peer.shutdown_endpoint(); // close open udp socket
+                            Peer::shutdown_endpoint(peer.endpoint_ref()); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -778,7 +778,7 @@ impl Device {
             let endpoint = peer.endpoint();
             if endpoint.conn.is_some() {
                 drop(endpoint);
-                peer.shutdown_endpoint();
+                Peer::shutdown_endpoint(peer.endpoint_ref());
             }
         }
     }
@@ -1121,7 +1121,7 @@ impl Device {
                                     if let Err(err) = conn.send(packet) {
                                         tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
                                         drop(endpoint);
-                                        peer.shutdown_endpoint();
+                                        Peer::shutdown_endpoint(peer.endpoint_ref());
                                     } else {
                                         tracing::trace!(
                                             "Pkt -> ConnSock ({:?}), len: {}, dst_addr: {}",
@@ -1192,8 +1192,7 @@ fn send_to_network(
                     if let Err(err) = conn.send(packet) {
                         tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
                         drop(endpoint);
-                        // TODO: shutting endpoint here
-                        // peer.shutdown_endpoint();
+                        Peer::shutdown_endpoint(msg.endpoint.clone());
                     } else {
                         tracing::trace!(
                             "Pkt -> ConnSock ({:?}), len: {}",
