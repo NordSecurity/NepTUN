@@ -5,12 +5,17 @@
 pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
+pub mod ring_buffers;
 pub mod safe_duration;
 
 #[cfg(test)]
 mod integration_tests;
 mod session;
 mod timers;
+
+use crossbeam::channel::{Receiver, Sender};
+use ring_buffers::EncryptionTaskData;
+use session::{Session, AEAD_SIZE, DATA_OFFSET};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
@@ -21,7 +26,8 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +52,12 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+#[derive(Default, Debug)]
+pub struct Endpoint {
+    pub addr: Option<SocketAddr>,
+    pub conn: Option<socket2::Socket>,
+}
+
 #[derive(Debug)]
 pub enum TunnResult<'a> {
     Done,
@@ -58,6 +70,21 @@ pub enum TunnResult<'a> {
 impl<'a> From<WireGuardError> for TunnResult<'a> {
     fn from(err: WireGuardError) -> TunnResult<'a> {
         TunnResult::Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum NeptunResult {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(usize),
+    WriteToTunnelV4(usize, Ipv4Addr),
+    WriteToTunnelV6(usize, Ipv6Addr),
+}
+
+impl From<WireGuardError> for NeptunResult {
+    fn from(err: WireGuardError) -> NeptunResult {
+        NeptunResult::Err(err)
     }
 }
 
@@ -78,6 +105,8 @@ pub struct Tunn {
     rate_limiter: Arc<RateLimiter>,
 
     pub peer_static_public: x25519_dalek::PublicKey,
+
+    encrypt_tx_chan: Option<Sender<usize>>,
 }
 
 type MessageType = u32;
@@ -209,8 +238,18 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
+        encrypt_tx_chan: Option<Sender<usize>>,
+        encrypt_rx_chan: Option<Receiver<usize>>,
+        network_tx_chan: Option<Sender<&'static EncryptionTaskData>>,
     ) -> Result<Self, &'static str> {
         let static_public = x25519::PublicKey::from(&static_private);
+
+        if let Some(tx_chan) = network_tx_chan.as_ref() {
+            let net_tx_clone = tx_chan.clone();
+            std::thread::spawn(move || {
+                Session::encrypt_data_worker(encrypt_rx_chan.unwrap(), net_tx_clone)
+            });
+        }
 
         let tunn = Tunn {
             peer_static_public,
@@ -233,6 +272,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            encrypt_tx_chan: encrypt_tx_chan,
         };
 
         Ok(tunn)
@@ -265,21 +305,24 @@ impl Tunn {
         }
     }
 
-    /// Encapsulate a single packet from the tunnel interface.
-    /// Returns TunnResult.
-    ///
-    /// # Panics
-    /// Panics if dst buffer is too small.
-    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            dst[DATA_OFFSET..src.len() + DATA_OFFSET].copy_from_slice(src);
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
-            self.timer_tick(TimerName::TimeLastPacketSent);
+            let (packet, _) = Session::format_packet_data(
+                session.get_sending_key_counter(),
+                session.get_sending_index(),
+                session.get_sender_key(),
+                src.len(),
+                dst,
+            );
+
+            // Send the notification on the channel to encrypt the packet
+            self.mark_timer_to_update(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
+                self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.len();
             return TunnResult::WriteToNetwork(packet);
@@ -290,6 +333,53 @@ impl Tunn {
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
             self.queue_packet(src);
+        }
+
+        // Initiate a new handshake if none is in progress
+        self.format_handshake_initiation(dst, false)
+    }
+
+    /// Encapsulate a single packet from the tunnel interface.
+    /// Returns TunnResult.
+    ///
+    /// # Panics
+    /// Panics if dst buffer is too small.
+    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
+    pub fn queue_encapsulate<'a>(
+        &mut self,
+        len: usize,
+        element: &'static mut EncryptionTaskData,
+        idx: usize,
+        endpoint: Arc<parking_lot::RwLock<Endpoint>>,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        let current = self.current;
+        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+            element.is_element_free.store(false, Ordering::Relaxed);
+            // Send the packet using an established session
+            element.buf_len = len;
+            element.sending_index = session.get_sending_index();
+            element.sender = Some(session.get_sender_key());
+            element.sending_key_counter = session.get_sending_key_counter();
+            element.endpoint = endpoint;
+
+            // Send the notification on the channel to encrypt the packet
+            self.mark_timer_to_update(TimerName::TimeLastPacketSent);
+            // Exclude Keepalive packets from timer update.
+            if len != 0 {
+                self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
+            }
+            self.tx_bytes += len + DATA_OFFSET + AEAD_SIZE;
+
+            let _ = self.encrypt_tx_chan.as_ref().unwrap().send(idx);
+            return TunnResult::Done;
+        }
+
+        if len != 0 {
+            // If there is no session, queue the packet for future retry,
+            // except if it's keepalive packet, new keepalive packets will be sent when session is created.
+            // This prevents double keepalive packets on initiation
+            self.queue_packet(&element.data[..len]);
         }
 
         // Initiate a new handshake if none is in progress
@@ -402,8 +492,8 @@ impl Tunn {
         let index = session.local_index();
         self.sessions[index % N_SESSIONS] = Some(session);
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.timer_tick(TimerName::TimeLastPacketSent);
+        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
+        self.mark_timer_to_update(TimerName::TimeLastPacketSent);
         self.timer_tick_session_established(false, index); // New session established, we are not the initiator
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
@@ -430,13 +520,21 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let (keepalive_packet, _) = {
+            Session::format_packet_data(
+                session.get_sending_key_counter(),
+                session.get_sending_index(),
+                session.get_sender_key(),
+                0,
+                dst,
+            )
+        };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
         self.sessions[index] = Some(session);
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
         self.set_current_session(l_idx);
 
@@ -461,8 +559,8 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += COOKIE_REPLY_SZ;
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.timer_tick(TimerName::TimeCookieReceived);
+        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
+        self.mark_timer_to_update(TimerName::TimeCookieReceived);
 
         tracing::debug!("Did set cookie");
 
@@ -506,7 +604,7 @@ impl Tunn {
 
         self.set_current_session(r_idx);
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
@@ -533,9 +631,9 @@ impl Tunn {
                 tracing::debug!("Sending handshake_initiation");
 
                 if starting_new_handshake {
-                    self.timer_tick(TimerName::TimeLastHandshakeStarted);
+                    self.mark_timer_to_update(TimerName::TimeLastHandshakeStarted);
                 }
-                self.timer_tick(TimerName::TimeLastPacketSent);
+                self.mark_timer_to_update(TimerName::TimeLastPacketSent);
                 self.tx_bytes += packet.len();
 
                 TunnResult::WriteToNetwork(packet)
@@ -585,7 +683,7 @@ impl Tunn {
             return TunnResult::Err(WireGuardError::InvalidPacket);
         }
 
-        self.timer_tick(TimerName::TimeLastDataPacketReceived);
+        self.mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes += message_data_len(computed_len);
 
         match src_ip_address {
@@ -596,6 +694,7 @@ impl Tunn {
 
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        // TODO: Fix this with encapsulate without peer ???
         if let Some(packet) = self.dequeue_packet() {
             match self.encapsulate(&packet, dst) {
                 TunnResult::Err(_) => {
@@ -675,6 +774,7 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
+
     #[cfg(feature = "mock-instant")]
     use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
@@ -690,10 +790,31 @@ mod tests {
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
         let their_idx = OsRng.next_u32();
 
-        let my_tun = Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
+        let my_tun = Tunn::new(
+            my_secret_key,
+            their_public_key,
+            None,
+            None,
+            my_idx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
-        let their_tun =
-            Tunn::new(their_secret_key, my_public_key, None, None, their_idx, None).unwrap();
+        let their_tun = Tunn::new(
+            their_secret_key,
+            my_public_key,
+            None,
+            None,
+            their_idx,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         (my_tun, their_tun)
     }
