@@ -1096,29 +1096,31 @@ impl Device {
                                     );
                                 }
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                                if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                                } else {
-                                    tracing::trace!(
-                                        message = "Writing packet to network v4",
-                                        interface = ?t.iface.name(),
-                                        packet_length = packet.len(),
-                                        src_addr = ?addr,
-                                        public_key = peer.public_key.1
-                                    );
-                                }
+                                let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                                // if let Err(err) = udp4.send_to(packet, &addr.into()) {
+                                //     tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+                                // } else {
+                                //     tracing::trace!(
+                                //         message = "Writing packet to network v4",
+                                //         interface = ?t.iface.name(),
+                                //         packet_length = packet.len(),
+                                //         src_addr = ?addr,
+                                //         public_key = peer.public_key.1
+                                //     );
+                                // }
                             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                                } else {
-                                    tracing::trace!(
-                                        message = "Writing packet to network v6",
-                                        interface = ?t.iface.name(),
-                                        packet_length = packet.len(),
-                                        src_addr = ?addr,
-                                        public_key = peer.public_key.1
-                                    );
-                                }
+                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                                // if let Err(err) = udp6.send_to(packet, &addr.into()) {
+                                //     tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
+                                // } else {
+                                //     tracing::trace!(
+                                //         message = "Writing packet to network v6",
+                                //         interface = ?t.iface.name(),
+                                //         packet_length = packet.len(),
+                                //         src_addr = ?addr,
+                                //         public_key = peer.public_key.1
+                                //     );
+                                // }
                             } else {
                                 tracing::error!("No endpoint");
                             }
