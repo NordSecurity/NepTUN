@@ -2,25 +2,18 @@
 // Copyright (c) 2019-2024 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{
-    ring_buffers::{EncryptionTaskData, TX_RING_BUFFER},
-    NeptunResult, PacketData,
-};
+use super::PacketData;
 use crate::noise::errors::WireGuardError;
-use crossbeam::channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    receiver: Arc<LessSafeKey>,
-    sender: Arc<LessSafeKey>,
-    sending_key_counter: Arc<AtomicUsize>,
+    receiver: LessSafeKey,
+    sender: LessSafeKey,
+    sending_key_counter: AtomicUsize,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
 }
 
@@ -35,7 +28,7 @@ impl std::fmt::Debug for Session {
 }
 
 /// Where encrypted data resides in a data packet
-pub const DATA_OFFSET: usize = 16;
+const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
 pub const AEAD_SIZE: usize = 16;
 
@@ -169,31 +162,17 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: Arc::new(LessSafeKey::new(
+            receiver: LessSafeKey::new(
                 UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            )),
-            sender: Arc::new(LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap(),
-            )),
-            sending_key_counter: Arc::new(AtomicUsize::new(0)),
+            ),
+            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            sending_key_counter: AtomicUsize::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
         }
     }
 
     pub(super) fn local_index(&self) -> usize {
         self.receiving_index as usize
-    }
-
-    pub fn get_sending_index(&self) -> u32 {
-        self.sending_index
-    }
-
-    pub fn get_sender_key(&self) -> Arc<LessSafeKey> {
-        self.sender.clone()
-    }
-
-    pub fn get_sending_key_counter(&self) -> Arc<AtomicUsize> {
-        self.sending_key_counter.clone()
     }
 
     /// Returns true if receiving counter is good to use
@@ -212,71 +191,43 @@ impl Session {
         ret
     }
 
-    pub fn encrypt_data_worker(
-        encrypt_rx: Receiver<usize>,
-        network_tx: Sender<&EncryptionTaskData>,
-    ) {
-        while let Ok(iter) = encrypt_rx.recv() {
-            let encryption_data = unsafe { &mut TX_RING_BUFFER.ring_buffer[iter] };
-            let data_len = encryption_data.buf_len;
-            let (_, data_len) = Session::format_packet_data(
-                encryption_data.sending_key_counter.clone(),
-                encryption_data.sending_index,
-                encryption_data.sender.as_ref().unwrap().clone(),
-                data_len,
-                encryption_data.data.as_mut_slice(),
-            );
-
-            encryption_data.buf_len = data_len;
-            encryption_data.res = NeptunResult::WriteToNetwork(data_len);
-
-            let _ = network_tx.send(encryption_data);
-        }
-    }
-
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(
-        sending_key_counter: Arc<AtomicUsize>,
-        sending_index: u32,
-        sender: Arc<LessSafeKey>,
-        data_len: usize,
-        dst: &'a mut [u8],
-    ) -> (&'a mut [u8], usize) {
-        if dst.len() < data_len + super::DATA_OVERHEAD_SZ {
+    pub(super) fn format_packet_data<'a>(&self, src_len: usize, dst: &'a mut [u8]) -> &'a mut [u8] {
+        if dst.len() < src_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
-        let sending_key_counter = sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
+        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
         let (counter, data) = rest.split_at_mut(8);
 
         message_type.copy_from_slice(&super::DATA.to_le_bytes());
-        receiver_index.copy_from_slice(&sending_index.to_le_bytes());
+        receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
         // TODO: spec requires padding to 16 bytes, but actually works fine without it
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            // data[..data_len].copy_from_slice(src);
-            sender
+            // data[..src.len()].copy_from_slice(src);
+            self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..data_len],
+                    &mut data[..src_len],
                 )
                 .map(|tag| {
-                    data[data_len..data_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    data_len + AEAD_SIZE
+                    data[src_len..src_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    src_len + AEAD_SIZE
                 })
                 .unwrap()
         };
 
-        (&mut dst[..DATA_OFFSET + n], DATA_OFFSET + n)
+        &mut dst[..DATA_OFFSET + n]
     }
 
     /// packet - a data packet we received from the network
