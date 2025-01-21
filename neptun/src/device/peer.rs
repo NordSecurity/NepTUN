@@ -203,18 +203,7 @@ mod tests {
         let b_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
         let b_public_key = PublicKey::from(&b_secret_key);
 
-        let tunnel = Tunn::new(
-            a_secret_key,
-            b_public_key,
-            None,
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let tunnel = Tunn::new(a_secret_key, b_public_key, None, None, 0, None).unwrap();
         let peer = Peer::new(
             tunnel,
             0,

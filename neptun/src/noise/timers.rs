@@ -435,18 +435,8 @@ mod tests {
         let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
-        let mut my_tun = Tunn::new(
-            my_secret_key,
-            their_public_key,
-            None,
-            None,
-            my_idx,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut my_tun =
+            Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
 
         // Mark timers to update
         my_tun.mark_timer_to_update(super::TimerName::TimeLastDataPacketSent);
@@ -487,18 +477,8 @@ mod tests {
         let their_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
         let their_public_key = x25519_dalek::PublicKey::from(&their_secret_key);
 
-        let mut my_tun = Tunn::new(
-            my_secret_key,
-            their_public_key,
-            None,
-            None,
-            my_idx,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut my_tun =
+            Tunn::new(my_secret_key, their_public_key, None, None, my_idx, None).unwrap();
 
         // Mark timers to update
         my_tun.mark_timer_to_update(super::TimerName::TimeLastDataPacketSent);

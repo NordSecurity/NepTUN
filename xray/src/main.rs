@@ -119,18 +119,8 @@ async fn main() -> EyreResult<()> {
     let plaintext_client = Client::new(PLAINTEXT_ADDR, None, plaintext_sock);
 
     let crypto_sock = UdpSocket::bind(CRYPTO_SOCK_ADDR).await?;
-    let tunn = Tunn::new(
-        peer_keys.private,
-        wg_keys.public,
-        None,
-        None,
-        123,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|s| XRayError::UnexpectedTunnResult(s.to_owned()))?;
+    let tunn = Tunn::new(peer_keys.private, wg_keys.public, None, None, 123, None)
+        .map_err(|s| XRayError::UnexpectedTunnResult(s.to_owned()))?;
     let mut crypto_client = Client::new(CRYPTO_ADDR, Some(tunn), crypto_sock);
     crypto_client.do_handshake(WG_ADDR).await?;
 
