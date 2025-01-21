@@ -300,10 +300,10 @@ impl Tunn {
             let packet = session.format_packet_data(src, dst);
 
             // Send the notification on the channel to encrypt the packet
-            self.mark_timer_to_update(TimerName::TimeLastPacketSent);
+            self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
-                self.mark_timer_to_update(TimerName::TimeLastDataPacketSent);
+                self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.len();
             return TunnResult::WriteToNetwork(packet);
@@ -389,8 +389,8 @@ impl Tunn {
         let index = session.local_index();
         self.sessions[index % N_SESSIONS] = Some(session);
 
-        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
-        self.mark_timer_to_update(TimerName::TimeLastPacketSent);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeLastPacketSent);
         self.timer_tick_session_established(false, index); // New session established, we are not the initiator
 
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
@@ -423,7 +423,7 @@ impl Tunn {
         let index = l_idx % N_SESSIONS;
         self.sessions[index] = Some(session);
 
-        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
         self.set_current_session(l_idx);
 
@@ -448,8 +448,8 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += COOKIE_REPLY_SZ;
 
-        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
-        self.mark_timer_to_update(TimerName::TimeCookieReceived);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeCookieReceived);
 
         tracing::debug!("Did set cookie");
 
@@ -493,7 +493,7 @@ impl Tunn {
 
         self.set_current_session(r_idx);
 
-        self.mark_timer_to_update(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
 
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
@@ -520,9 +520,9 @@ impl Tunn {
                 tracing::debug!("Sending handshake_initiation");
 
                 if starting_new_handshake {
-                    self.mark_timer_to_update(TimerName::TimeLastHandshakeStarted);
+                    self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
-                self.mark_timer_to_update(TimerName::TimeLastPacketSent);
+                self.timer_tick(TimerName::TimeLastPacketSent);
                 self.tx_bytes += packet.len();
 
                 TunnResult::WriteToNetwork(packet)
@@ -572,7 +572,7 @@ impl Tunn {
             return TunnResult::Err(WireGuardError::InvalidPacket);
         }
 
-        self.mark_timer_to_update(TimerName::TimeLastDataPacketReceived);
+        self.timer_tick(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes += message_data_len(computed_len);
 
         match src_ip_address {

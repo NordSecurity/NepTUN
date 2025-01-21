@@ -36,7 +36,6 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -46,7 +45,6 @@ use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use crossbeam::channel::{Receiver, Sender};
-use once_cell::sync::Lazy;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -60,16 +58,6 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
-
-pub static mut IFACE_DURATION: Lazy<Duration> = Lazy::new(|| Duration::new(0, 0));
-pub static mut IFACE_CALLS: Lazy<u32> = Lazy::new(|| 0);
-
-pub static mut NET_DURATION: Lazy<Duration> = Lazy::new(|| Duration::new(0, 0));
-pub static mut NET_CALLS: Lazy<u32> = Lazy::new(|| 0);
-
-pub static mut TOTAL_DURATION: Lazy<Duration> = Lazy::new(|| Duration::new(0, 0));
-pub static mut TOTAL_CALLS: Lazy<u32> = Lazy::new(|| 0);
-pub static mut TOTAL_INSTANT: Lazy<Instant> = Lazy::new(|| Instant::now());
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
