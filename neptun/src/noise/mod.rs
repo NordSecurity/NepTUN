@@ -294,26 +294,35 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        dst[16..src.len() + 16].copy_from_slice(src);
+        self.encapsulate_in_place(src.len(), dst)
+    }
+
+    pub fn encapsulate_in_place<'a>(
+        &mut self,
+        src_len: usize,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.format_packet_data(src_len, dst);
 
             // Send the notification on the channel to encrypt the packet
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if src_len.ne(&0) {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.len();
             return TunnResult::WriteToNetwork(packet);
         }
 
-        if !src.is_empty() {
+        if src_len.ne(&0) {
             // If there is no session, queue the packet for future retry,
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
-            self.queue_packet(src);
+            self.queue_packet(&dst[16..src_len + 16]);
         }
 
         // Initiate a new handshake if none is in progress
@@ -417,7 +426,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = { session.format_packet_data(&[], dst) };
+        let keepalive_packet = { session.format_packet_data(0, dst) };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;

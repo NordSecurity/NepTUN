@@ -66,19 +66,6 @@ pub enum TimerName {
     Top,
 }
 
-impl TimerName {
-    pub const VALUES: [Self; TimerName::Top as usize - 1] = [
-        Self::TimeSessionEstablished,
-        Self::TimeLastHandshakeStarted,
-        Self::TimeLastPacketReceived,
-        Self::TimeLastPacketSent,
-        Self::TimeLastDataPacketReceived,
-        Self::TimeLastDataPacketSent,
-        Self::TimeCookieReceived,
-        Self::TimePersistentKeepalive,
-    ];
-}
-
 use self::TimerName::*;
 
 #[derive(Debug)]
@@ -96,7 +83,6 @@ pub struct Timers {
     persistent_keepalive: usize,
     /// Should this timer call reset rr function (if not a shared rr instance)
     pub(super) should_reset_rr: bool,
-    timers_to_update_mask: AtomicU16,
 }
 
 impl Timers {
@@ -110,7 +96,6 @@ impl Timers {
             want_handshake_since: Default::default(),
             persistent_keepalive: usize::from(persistent_keepalive.unwrap_or(0)),
             should_reset_rr: reset_rr,
-            timers_to_update_mask: Default::default(),
         }
     }
 

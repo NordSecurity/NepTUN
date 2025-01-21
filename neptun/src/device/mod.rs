@@ -1055,8 +1055,8 @@ impl Device {
                 for _ in 0..MAX_ITR {
                     let element = unsafe { TX_RING_BUFFER.get_next() };
                     if element.is_element_free.load(Ordering::Relaxed) {
-                        let src = match iface.read(&mut t.src_buf[..mtu]) {
-                            Ok(src) => src,
+                        let len = match iface.read(&mut element.data[16..mtu + 16]) {
+                            Ok(src) => src.len(),
                             Err(Error::IfaceRead(e)) => {
                                 let ek = e.kind();
                                 if ek == io::ErrorKind::Interrupted
@@ -1077,7 +1077,7 @@ impl Device {
                             }
                         };
 
-                        let dst_addr = match Tunn::dst_address(src) {
+                        let dst_addr = match Tunn::dst_address(&element.data[16..len + 16]) {
                             Some(addr) => addr,
                             None => continue,
                         };
@@ -1088,14 +1088,14 @@ impl Device {
                         };
 
                         if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                            if !callback(&peer.public_key.0, src) {
+                            if !callback(&peer.public_key.0, &element.data[16..len + 16]) {
                                 continue;
                             }
                         }
 
                         let res = {
                             let mut tun = peer.tunnel.lock();
-                            tun.encapsulate(src, &mut element.data[..])
+                            tun.encapsulate_in_place(len, &mut element.data[..])
                         };
 
                         match res {
