@@ -36,6 +36,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -1182,6 +1183,7 @@ fn send_to_network(
             recv(close_chan) -> _n => {
                 break;
             }
+            default(Duration::from_millis(10)) => (),
         }
     }
 }

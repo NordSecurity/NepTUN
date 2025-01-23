@@ -6,7 +6,6 @@ use super::errors::WireGuardError;
 use crate::noise::{safe_duration::SafeDuration as Duration, Tunn, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::AtomicU16;
 use std::time::SystemTime;
 
 #[cfg(feature = "mock-instant")]
