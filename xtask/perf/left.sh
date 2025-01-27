@@ -75,4 +75,5 @@ do
     echo "Connection       | Total Datagrams | Lost (%) | Bitrate"
     echo "Base NepTUN      | $base_total_datagrams | $base_lost_percentage | $base_bitrate "
     echo "Current NepTUN   | $current_total_datagrams | $current_lost_percentage | $current_bitrate "
+    sleep 1
 done
