@@ -59,7 +59,7 @@ do
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
     base_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.1.2 | awk '/sender/')
-    base_output="$cmd"
+    base_output="$base_cmd"
     base_total_datagrams=$(echo "$base_output" | awk '/sender/ {print $11}' | awk -F '/' '{print $2}')
     base_lost_percentage=$(echo "$base_output" | awk '/sender/ {print $12}')
     base_bitrate=$(echo "$base_output" | awk '/sender/ {print $7 " " $8}')
