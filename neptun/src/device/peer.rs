@@ -10,15 +10,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
-use crate::noise::Tunn;
+use crate::noise::{Endpoint, Tunn};
 
 use std::os::fd::AsRawFd;
-
-#[derive(Default, Debug)]
-pub struct Endpoint {
-    pub addr: Option<SocketAddr>,
-    pub conn: Option<socket2::Socket>,
-}
 
 pub struct Peer {
     /// The associated tunnel struct
@@ -27,7 +21,7 @@ pub struct Peer {
     pub(crate) public_key: ([u8; 32], String),
     /// The index the tunnel uses
     index: u32,
-    endpoint: RwLock<Endpoint>,
+    endpoint: Arc<RwLock<Endpoint>>,
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
@@ -77,10 +71,10 @@ impl Peer {
             tunnel: Mutex::new(tunnel),
             public_key: (pub_key.to_bytes(), public_key_hex),
             index,
-            endpoint: RwLock::new(Endpoint {
+            endpoint: Arc::new(RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
-            }),
+            })),
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
@@ -91,8 +85,12 @@ impl Peer {
         self.endpoint.read()
     }
 
-    pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
+    pub(crate) fn endpoint_ref(&self) -> Arc<parking_lot::RwLock<Endpoint>> {
+        self.endpoint.clone()
+    }
+
+    pub fn shutdown_endpoint(endpoint: Arc<parking_lot::RwLock<Endpoint>>) {
+        if let Some(conn) = endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
             conn.shutdown(Shutdown::Both).unwrap();
         }
