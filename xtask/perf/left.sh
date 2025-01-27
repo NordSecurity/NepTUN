@@ -52,98 +52,27 @@ iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
 echo
 echo "UDP unidirectional tests"
 
-echo
-echo "Base NepTUN: 40M"
-iperf3 -i 60 -t 120 -u -b 40M -c 10.0.1.2
-echo "Current NepTUN: 40M"
-iperf3 -i 60 -t 120 -u -b 40M -c 10.0.2.2
+bitrates=(40M 100M 200M 500M 600M 700M 800M 1000M 1200M 1500M 1800M 2000M 2200M 2300M 2400M 2500M 2700M 3000M 3500M 4000M 4500M 5000M)
 
-echo
-echo "Base NepTUN: 100M"
-iperf3 -i 60 -t 120 -u -b 100M -c 10.0.1.2
-echo "Current NepTUN: 100M"
-iperf3 -i 60 -t 120 -u -b 100M -c 10.0.2.2
+for bitrate in "${bitrates[@]}"
+do
+    echo "Running test for bitrate: $bitrate"
+    # Base NepTUN
+    base_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.1.2 | awk '/sender/')
+    base_output="$cmd"
+    base_total_datagrams=$(echo "$base_output" | awk '/sender/ {print $11}' | awk -F '/' '{print $2}')
+    base_lost_percentage=$(echo "$base_output" | awk '/sender/ {print $12}')
+    base_bitrate=$(echo "$base_output" | awk '/sender/ {print $7 " " $8}')
 
-echo
-echo "Base NepTUN: 200M"
-iperf3 -i 60 -t 120 -u -b 200M -c 10.0.1.2
-echo "Current NepTUN: 200M"
-iperf3 -i 60 -t 120 -u -b 200M -c 10.0.2.2
+    # Current NepTUN
+    current_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.2.2 | awk '/sender/')
+    current_output="$current_cmd"
+    current_total_datagrams=$(echo "$current_output" |  awk '/sender/ {print $11}' | awk -F '/' '{print $2}')
+    current_lost_percentage=$(echo "$current_output" | awk '/sender/ {print $12}')
+    current_bitrate=$(echo "$current_output" | awk '/sender/ {print $7 " " $8}')
 
-echo
-echo "Base NepTUN: 500M"
-iperf3 -i 60 -t 120 -u -b 500M -c 10.0.1.2
-echo "Current NepTUN: 500M"
-iperf3 -i 60 -t 120 -u -b 500M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 600M"
-iperf3 -i 60 -t 120 -u -b 600M -c 10.0.1.2
-echo "Current NepTUN: 600M"
-iperf3 -i 60 -t 120 -u -b 600M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 700M"
-iperf3 -i 60 -t 120 -u -b 700M -c 10.0.1.2
-echo "Current NepTUN: 700M"
-iperf3 -i 60 -t 120 -u -b 700M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 800M"
-iperf3 -i 60 -t 120 -u -b 800M -c 10.0.1.2
-echo "Current NepTUN: 800M"
-iperf3 -i 60 -t 120 -u -b 800M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 900M"
-iperf3 -i 60 -t 120 -u -b 900M -c 10.0.1.2
-echo "Current NepTUN: 900M"
-iperf3 -i 60 -t 120 -u -b 900M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 1000M"
-iperf3 -i 60 -t 120 -u -b 1000M -c 10.0.1.2
-echo "Current NepTUN: 1000M"
-iperf3 -i 60 -t 120 -u -b 1000M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 1200M"
-iperf3 -i 60 -t 120 -u -b 1200M -c 10.0.1.2
-echo "Current NepTUN: 1200M"
-iperf3 -i 60 -t 120 -u -b 1200M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 1500M"
-iperf3 -i 60 -t 120 -u -b 1500M -c 10.0.1.2
-echo "Current NepTUN: 1500M"
-iperf3 -i 60 -t 120 -u -b 1500M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 1800M"
-iperf3 -i 60 -t 120 -u -b 1800M -c 10.0.1.2
-echo "Current NepTUN: 1800M"
-iperf3 -i 60 -t 120 -u -b 1800M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 2000M"
-iperf3 -i 60 -t 120 -u -b 2000M -c 10.0.1.2
-echo "Current NepTUN: 2000M"
-iperf3 -i 60 -t 120 -u -b 2000M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 2200M"
-iperf3 -i 60 -t 120 -u -b 2200M -c 10.0.1.2
-echo "Current NepTUN: 2200M"
-iperf3 -i 60 -t 120 -u -b 2200M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 2500M"
-iperf3 -i 60 -t 120 -u -b 2500M -c 10.0.1.2
-echo "Current NepTUN: 2500M"
-iperf3 -i 60 -t 120 -u -b 2500M -c 10.0.2.2
-
-echo
-echo "Base NepTUN: 3000M"
-iperf3 -i 60 -t 120 -u -b 3000M -c 10.0.1.2
-echo "Current NepTUN: 3000M"
-iperf3 -i 60 -t 120 -u -b 3000M -c 10.0.2.2
+    # Print results
+    echo "Connection       | Total Datagrams | Lost (%) | Bitrate"
+    echo "Base NepTUN      | $base_total_datagrams | $base_lost_percentage | $base_bitrate "
+    echo "Current NepTUN   | $current_total_datagrams | $current_lost_percentage | $current_bitrate "
+done
