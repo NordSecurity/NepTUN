@@ -1,4 +1,4 @@
-use std::net::SocketAddrV4;
+use std::{net::SocketAddrV4, path::Path};
 
 use neptun::noise::Tunn;
 use pcap::Capture;
@@ -18,7 +18,7 @@ pub struct PcapPacket {
     pub send_index: u64,
 }
 
-pub fn process_pcap(pcap_path: &str, mut tunn: Tunn) -> XRayResult<Vec<PcapPacket>> {
+pub fn process_pcap<P: AsRef<Path>>(pcap_path: P, mut tunn: Tunn) -> XRayResult<Vec<PcapPacket>> {
     let mut packets = Vec::new();
 
     let mut capture = Capture::from_file(pcap_path)?;
