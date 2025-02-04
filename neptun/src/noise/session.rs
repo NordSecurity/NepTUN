@@ -30,7 +30,7 @@ impl std::fmt::Debug for Session {
 /// Where encrypted data resides in a data packet
 const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
-const AEAD_SIZE: usize = 16;
+pub const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
@@ -194,8 +194,8 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+    pub(super) fn format_packet_data<'a>(&self, src_len: usize, dst: &'a mut [u8]) -> &'a mut [u8] {
+        if dst.len() < src_len + super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
@@ -213,16 +213,16 @@ impl Session {
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            data[..src.len()].copy_from_slice(src);
+            // data[..src.len()].copy_from_slice(src);
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..src_len],
                 )
                 .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
+                    data[src_len..src_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    src_len + AEAD_SIZE
                 })
                 .unwrap()
         };
