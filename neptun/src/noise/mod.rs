@@ -676,10 +676,11 @@ impl Tunn {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "mock-instant")]
-    use crate::noise::timers::{REKEY_AFTER_TIME, REKEY_TIMEOUT};
+    use crate::noise::timers::{REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_TIMEOUT};
 
     use super::*;
     use rand_core::{OsRng, RngCore};
+    use test_case::test_case;
 
     fn create_two_tuns() -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(OsRng);
@@ -816,6 +817,54 @@ mod tests {
         // Time has not yet advanced so their is nothing to do
         assert!(matches!(my_tun.update_timers(&mut []), TunnResult::Done));
         assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+    }
+
+    #[cfg(feature = "mock-instant")]
+    #[test_case(false; "Persistent-Keepalive not set, should not result in handshakes after expiration")]
+    #[test_case(true; "Persistent-Keepalive is set, should result in handshakes after expiration")]
+    fn after_3x_REJECT_AFTER_TIME(nonzero_ka: bool) {
+        // WireGuard#6.3:
+        // <...>
+        // If no new secure session is created after (Reject-After-Time × 3) seconds,
+        // the current secure session, the previous secure session, and potentially
+        // the next secure session are discarded and zeroed out, in addition to any
+        // possible partially-completed handshake states and ephemeral keys.
+        // <...>
+        //
+        // Though it doesn't mention explicitly but observing Linux kernel implementation
+        // shows that non-zero Persistent-Keepalive must trigger the handshake.
+
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+
+        // Persistent-Keepalive value doesn't matter, while it's non zero
+        if nonzero_ka {
+            my_tun.set_persistent_keepalive(123);
+        }
+
+        let mut my_dst = [0u8; 1024];
+
+        // Establish the session
+        mock_instant::MockClock::advance(Duration::from_secs(1));
+        assert!(matches!(their_tun.update_timers(&mut []), TunnResult::Done));
+        assert!(matches!(
+            my_tun.update_timers(&mut my_dst),
+            TunnResult::Done
+        ));
+        let sent_packet_buf = create_ipv4_udp_packet();
+        let data = my_tun.encapsulate(&sent_packet_buf, &mut my_dst);
+        assert!(matches!(data, TunnResult::WriteToNetwork(_)));
+
+        // Expire the session
+        mock_instant::MockClock::advance((REJECT_AFTER_TIME * 3).into());
+
+        if nonzero_ka {
+            update_timer_results_in_handshake(&mut my_tun);
+        } else {
+            assert!(matches!(
+                my_tun.update_timers(&mut []),
+                TunnResult::Err(WireGuardError::ConnectionExpired)
+            ));
+        }
     }
 
     #[test]
