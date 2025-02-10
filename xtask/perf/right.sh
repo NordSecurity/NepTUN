@@ -1,5 +1,12 @@
 #!/bin/bash
 
+######################################################
+# This script is used to setup testing environment   #
+# for performance measurements. The keys here are    #
+# for testing purposes only and must never be used   #
+# in any real deployments                            #
+######################################################
+
 wireguard-go wg0
 wg set wg0 \
     listen-port 51820 \
