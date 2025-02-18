@@ -10,15 +10,15 @@
 # ip address add dev wg0 10.0.0.2/24
 # ip link set up dev wg0
 
-# /neptun/base/neptun-cli --disable-drop-privileges wg1
-# wg set wg1 \
-#     listen-port 51821 \
-#     private-key <(echo WAoFbPJ6QaXXltwLqBADFkMG6qLZuivSlkIUv2Sc3lY=) \
-#     peer HcDZRTIcI3Yok4XTwhAScKoNkb9MIZ2wyjS1oQvZnic= \
-#     allowed-ips 10.0.1.1/32 \
-#     endpoint 176.0.0.2:51821
-# ip address add dev wg1 10.0.1.2/24
-# ip link set up dev wg1
+/neptun/base/neptun-cli --disable-drop-privileges wg1
+wg set wg1 \
+    listen-port 51821 \
+    private-key <(echo WAoFbPJ6QaXXltwLqBADFkMG6qLZuivSlkIUv2Sc3lY=) \
+    peer HcDZRTIcI3Yok4XTwhAScKoNkb9MIZ2wyjS1oQvZnic= \
+    allowed-ips 10.0.1.1/32 \
+    endpoint 176.0.0.2:51821
+ip address add dev wg1 10.0.1.2/24
+ip link set up dev wg1
 
 /neptun/current/neptun-cli --disable-drop-privileges wg2
 wg set wg2 \
