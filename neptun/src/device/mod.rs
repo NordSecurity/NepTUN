@@ -36,7 +36,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -50,6 +50,7 @@ use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Socket, Type};
+use tracing::info;
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -58,7 +59,8 @@ use thiserror::Error;
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
-const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+const MAX_ITR: usize = 100_000; // Number of packets to handle per handler call
+const DELAY: Option<Duration> = Duration::from_secs(121).checked_sub(Duration::from_millis(10));
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1133,6 +1135,9 @@ fn send_to_network(
     udp4: Arc<Socket>,
     udp6: Arc<Socket>,
 ) {
+    let mut success_pkts = 0;
+    let mut dropped_pkts = 0;
+    let mut now = Instant::now();
     loop {
         crossbeam::channel::select! {
                 recv(network_rx) -> m => {
@@ -1141,28 +1146,35 @@ fn send_to_network(
                     let packet = &msg.data.as_slice()[..msg.buf_len];
                     if let Some(conn) = endpoint.conn.as_mut() {
                         // Prefer to send using the connected socket
-                        if let Err(err) = conn.send(packet) {
-                            tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                        if conn.send(packet).is_ok() {
+                            success_pkts += 1;
+                            // tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                            // drop(endpoint);
+                            // Peer::shutdown_endpoint(msg.endpoint.clone());
+                        } else {
+                            dropped_pkts += 1;
+                           tracing::info!(message = "Failed to send packet with the connected socket");
                             drop(endpoint);
                             Peer::shutdown_endpoint(msg.endpoint.clone());
-                        } else {
-                            tracing::trace!(
-                                "Pkt -> ConnSock ({:?}), len: {}",
-                                endpoint.addr,
-                                packet.len(),
-                            );
+                            // tracing::trace!(
+                            //     "Pkt -> ConnSock ({:?}), len: {}",
+                            //     endpoint.addr,
+                            //     packet.len(),
+                            // );
                         }
                     } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                        let _: Result<_, _> = udp4.send_to(packet, &addr.into());
-                        // if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                        //     tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                        // } else {
-                        //     tracing::trace!(
-                        //         message = "Writing packet to network v4",
-                        //         packet_length = packet.len(),
-                        //         src_addr = ?addr,
-                        //     );
-                        // }
+                        // let _: Result<_, _> = udp4.send_to(packet, &addr.into());
+                        if let Err(_) = udp4.send_to(packet, &addr.into()) {
+                            dropped_pkts += 1;
+                            // tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+                        } else {
+                            success_pkts += 1;
+                            // tracing::trace!(
+                            //     message = "Writing packet to network v4",
+                            //     packet_length = packet.len(),
+                            //     src_addr = ?addr,
+                            // );
+                        }
                     } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
                         let _: Result<_, _> = udp6.send_to(packet, &addr.into());
                         // if let Err(err) = udp6.send_to(packet, &addr.into()) {
@@ -1176,6 +1188,12 @@ fn send_to_network(
                         // }
                     } else {
                         tracing::error!("No endpoint");
+                    }
+                    if now.elapsed() > DELAY.unwrap() {
+                        info!("Success:{} - Drop:{}", success_pkts, dropped_pkts);
+                        now = Instant::now();
+                        success_pkts = 0;
+                        dropped_pkts = 0;
                     }
             msg.is_element_free.store(true, Ordering::Relaxed);
         }
