@@ -42,13 +42,13 @@ ip link set up dev wg2
 # echo
 # echo "TCP bidirectional tests"
 
-# echo
-# echo "Base NepTUN:"
-# iperf3 -i 60 -t 120 --bidir -c 10.0.1.2
+echo
+echo "Base NepTUN:"
+iperf3 -i 60 -t 120 --bidir -c 10.0.1.2
 
-# echo
-# echo "Current NepTUN:"
-# iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
+echo
+echo "Current NepTUN:"
+iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
 
 echo
 echo "UDP unidirectional tests"
@@ -60,11 +60,12 @@ do
     echo
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
-    # base_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
-    # base_output="$base_cmd"
-    # base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
-    # base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
-    # base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
+    base_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    base_output="$base_cmd"
+    base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
+    base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
+    base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
+    base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
 
     # Current NepTUN
     current_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
@@ -77,7 +78,7 @@ do
 
     # Print results
     echo "Connection       | Total Datagrams | Lost   |  (%) | Received Bitrate"
-    # echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
+    echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
     echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
     sleep 1
 done
