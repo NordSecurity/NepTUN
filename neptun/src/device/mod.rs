@@ -46,6 +46,7 @@ use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use crossbeam::channel::{Receiver, Sender};
+use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -175,8 +176,8 @@ pub struct Device {
     close_network_chan_tx: Sender<()>,
     close_network_chan_rx: Receiver<()>,
 
-    network_rx: Receiver<&'static EncryptionTaskData>,
-    network_tx: Sender<&'static EncryptionTaskData>,
+    network_rx: Receiver<&'static Mutex<EncryptionTaskData>>,
+    network_tx: Sender<&'static Mutex<EncryptionTaskData>>,
 }
 
 struct ThreadData {
@@ -1056,7 +1057,8 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
-                    let element = unsafe { TX_RING_BUFFER.get_next() };
+                    let block = unsafe { TX_RING_BUFFER.get_next() };
+                    let mut element = block.lock();
                     if *(element.is_element_free.read()) {
                         let len = match iface.read(&mut element.data[16..mtu + 16]) {
                             Ok(src) => src.len(),
@@ -1120,9 +1122,10 @@ impl Device {
                                     public_key = peer.public_key.1)
                             }
                             TunnResult::WriteToNetwork(packet) => {
-                                element.endpoint = peer.endpoint_ref();
                                 element.buf_len = packet.len();
-                                let _ = d.network_tx.send(element);
+                                element.endpoint = peer.endpoint_ref();
+                                drop(element);
+                                let _ = d.network_tx.send(block);
                             }
                             _ => panic!("Unexpected result from encapsulate"),
                         };
@@ -1140,7 +1143,7 @@ impl Device {
 }
 
 fn send_to_network(
-    network_rx: Receiver<&EncryptionTaskData>,
+    network_rx: Receiver<&Mutex<EncryptionTaskData>>,
     close_chan: Receiver<()>,
     udp4: Arc<Socket>,
     udp6: Arc<Socket>,
@@ -1151,26 +1154,24 @@ fn send_to_network(
     loop {
         crossbeam::channel::select! {
                 recv(network_rx) -> m => {
-                    if let Ok(msg) = m {
+                    if let Ok(d) = m {
+                    let msg = d.lock();
                     let mut endpoint = msg.endpoint.write();
                     let packet = &msg.data.as_slice()[..msg.buf_len];
                     if let Some(conn) = endpoint.conn.as_mut() {
                         // Prefer to send using the connected socket
                         if conn.send(packet).is_ok() {
                             success_pkts += 1;
-                            // tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                            // drop(endpoint);
-                            // Peer::shutdown_endpoint(msg.endpoint.clone());
-                        } else {
-                            dropped_pkts += 1;
-                           tracing::info!(message = "Failed to send packet with the connected socket");
-                            drop(endpoint);
-                            Peer::shutdown_endpoint(msg.endpoint.clone());
                             // tracing::trace!(
                             //     "Pkt -> ConnSock ({:?}), len: {}",
                             //     endpoint.addr,
                             //     packet.len(),
                             // );
+                        } else {
+                            dropped_pkts += 1;
+                           tracing::info!(message = "Failed to send packet with the connected socket");
+                            drop(endpoint);
+                            Peer::shutdown_endpoint(msg.endpoint.clone());
                         }
                     } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
                         // let _: Result<_, _> = udp4.send_to(packet, &addr.into());

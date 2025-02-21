@@ -33,15 +33,15 @@ pub struct EncryptionTaskData {
     pub is_element_free: RwLock<bool>,
 }
 
-pub static mut TX_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Lazy::new(|| {
+pub static mut TX_RING_BUFFER: Lazy<RingBuffer<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
     let mut deque = Vec::with_capacity(RB_SIZE);
     for _ in 0..RB_SIZE {
-        deque.push(EncryptionTaskData {
+        deque.push(Mutex::new(EncryptionTaskData {
             data: [0; UDP_SIZE],
             buf_len: 0,
             endpoint: Arc::default(),
             is_element_free: RwLock::new(true),
-        });
+        }));
     }
     RingBuffer {
         ring_buffer: deque,
