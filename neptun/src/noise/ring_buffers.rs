@@ -1,10 +1,10 @@
 use super::Endpoint;
 use once_cell::sync::Lazy;
-use parking_lot::Mutex;
-use std::sync::{atomic::AtomicBool, Arc};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 const UDP_SIZE: usize = (1 << 12) - 1;
 
-pub const RB_SIZE: usize = 20;
+pub const RB_SIZE: usize = 50;
 
 pub struct RingBuffer<T> {
     pub ring_buffer: Vec<T>,
@@ -29,8 +29,8 @@ impl<T> RingBuffer<T> {
 pub struct EncryptionTaskData {
     pub data: [u8; UDP_SIZE],
     pub buf_len: usize,
-    pub endpoint: Arc<parking_lot::RwLock<Endpoint>>,
-    pub is_element_free: AtomicBool,
+    pub endpoint: Arc<RwLock<Endpoint>>,
+    pub is_element_free: RwLock<bool>,
 }
 
 pub static mut TX_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Lazy::new(|| {
@@ -40,7 +40,7 @@ pub static mut TX_RING_BUFFER: Lazy<RingBuffer<EncryptionTaskData>> = Lazy::new(
             data: [0; UDP_SIZE],
             buf_len: 0,
             endpoint: Arc::default(),
-            is_element_free: AtomicBool::new(true),
+            is_element_free: RwLock::new(true),
         });
     }
     RingBuffer {

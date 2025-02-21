@@ -1057,7 +1057,7 @@ impl Device {
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
                     let element = unsafe { TX_RING_BUFFER.get_next() };
-                    if element.is_element_free.load(Ordering::Relaxed) {
+                    if *(element.is_element_free.read()) {
                         let len = match iface.read(&mut element.data[16..mtu + 16]) {
                             Ok(src) => src.len(),
                             Err(Error::IfaceRead(e)) => {
@@ -1097,13 +1097,24 @@ impl Device {
                         }
 
                         let res = {
+                            {
+                                let mut b = element.is_element_free.write();
+                                *b = false;
+                            }
                             let mut tun = peer.tunnel.lock();
                             tun.encapsulate_in_place(len, &mut element.data[..])
                         };
 
                         match res {
-                            TunnResult::Done => {}
+                            TunnResult::Done => {
+                                let mut b = element.is_element_free.write();
+                                *b = true;
+                            }
                             TunnResult::Err(e) => {
+                                {
+                                    let mut b = element.is_element_free.write();
+                                    *b = true;
+                                }
                                 tracing::error!(message = "Encapsulate error",
                                     error = ?e,
                                     public_key = peer.public_key.1)
@@ -1111,7 +1122,6 @@ impl Device {
                             TunnResult::WriteToNetwork(packet) => {
                                 element.endpoint = peer.endpoint_ref();
                                 element.buf_len = packet.len();
-                                element.is_element_free.store(false, Ordering::Relaxed);
                                 let _ = d.network_tx.send(element);
                             }
                             _ => panic!("Unexpected result from encapsulate"),
@@ -1195,7 +1205,10 @@ fn send_to_network(
                         success_pkts = 0;
                         dropped_pkts = 0;
                     }
-            msg.is_element_free.store(true, Ordering::Relaxed);
+                    {
+                        let mut b = msg.is_element_free.write();
+                        *b = true;
+                    }
         }
         }
             recv(close_chan) -> _n => {

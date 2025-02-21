@@ -42,7 +42,7 @@ pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum TimerName {
     /// Current time, updated each call to `update_timers`
     TimeCurrent,
