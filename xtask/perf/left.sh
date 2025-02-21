@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# wireguard-go wg0
-# wg set wg0 \
-#     listen-port 51820 \
-#     private-key <(echo AH7jKt6M0RS21MkRG+URrfgmwvJqdhVvqtKeF4WR+E8=) \
-#     peer mqrc8+LD+6zvMeCtyCcIBPEYuXT74lq1Hros0Np8ZgA= \
-#     allowed-ips 10.0.0.2/32 \
-#     endpoint 176.0.0.3:51820
-# ip address add dev wg0 10.0.0.1/24
-# ip link set up dev wg0
+wireguard-go wg0
+wg set wg0 \
+    listen-port 51820 \
+    private-key <(echo AH7jKt6M0RS21MkRG+URrfgmwvJqdhVvqtKeF4WR+E8=) \
+    peer mqrc8+LD+6zvMeCtyCcIBPEYuXT74lq1Hros0Np8ZgA= \
+    allowed-ips 10.0.0.2/32 \
+    endpoint 176.0.0.3:51820
+ip address add dev wg0 10.0.0.1/24
+ip link set up dev wg0
 
 /neptun/base/neptun-cli --disable-drop-privileges wg1
 wg set wg1 \
@@ -38,8 +38,8 @@ ip link set up dev wg2
 # echo "Wireguard-go:"
 # iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
 
-# echo
-# echo "TCP bidirectional tests"
+echo
+echo "TCP bidirectional tests"
 
 echo
 echo "Base NepTUN:"
@@ -49,6 +49,7 @@ echo
 echo "Current NepTUN:"
 iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
 
+sleep 1
 echo
 echo "UDP unidirectional tests"
 
