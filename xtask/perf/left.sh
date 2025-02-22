@@ -20,7 +20,8 @@ wg set wg1 \
 ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
-/neptun/current/neptun-cli --disable-drop-privileges wg2
+/neptun/current/neptun-cli --disable-drop-privileges -f -v info wg2 &
+sleep 0.01
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -80,5 +81,5 @@ do
     echo "Connection       | Total Datagrams | Lost   |  (%) | Received Bitrate"
     echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
     echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
-    sleep 1
+    sleep 4
 done
