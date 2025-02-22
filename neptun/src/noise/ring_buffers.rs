@@ -30,7 +30,7 @@ pub struct EncryptionTaskData {
     pub data: [u8; UDP_SIZE],
     pub buf_len: usize,
     pub endpoint: Arc<RwLock<Endpoint>>,
-    pub is_element_free: RwLock<bool>,
+    pub is_element_free: bool,
 }
 
 pub static mut TX_RING_BUFFER: Lazy<RingBuffer<Mutex<EncryptionTaskData>>> = Lazy::new(|| {
@@ -40,7 +40,7 @@ pub static mut TX_RING_BUFFER: Lazy<RingBuffer<Mutex<EncryptionTaskData>>> = Laz
             data: [0; UDP_SIZE],
             buf_len: 0,
             endpoint: Arc::default(),
-            is_element_free: RwLock::new(true),
+            is_element_free: true,
         }));
     }
     RingBuffer {

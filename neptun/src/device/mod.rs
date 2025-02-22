@@ -1059,7 +1059,7 @@ impl Device {
                 for _ in 0..MAX_ITR {
                     let block = unsafe { TX_RING_BUFFER.get_next() };
                     let mut element = block.lock();
-                    if *(element.is_element_free.read()) {
+                    if element.is_element_free {
                         let len = match iface.read(&mut element.data[16..mtu + 16]) {
                             Ok(src) => src.len(),
                             Err(Error::IfaceRead(e)) => {
@@ -1099,24 +1099,17 @@ impl Device {
                         }
 
                         let res = {
-                            {
-                                let mut b = element.is_element_free.write();
-                                *b = false;
-                            }
+                            element.is_element_free = false;
                             let mut tun = peer.tunnel.lock();
                             tun.encapsulate_in_place(len, &mut element.data[..])
                         };
 
                         match res {
                             TunnResult::Done => {
-                                let mut b = element.is_element_free.write();
-                                *b = true;
+                                element.is_element_free = true;
                             }
                             TunnResult::Err(e) => {
-                                {
-                                    let mut b = element.is_element_free.write();
-                                    *b = true;
-                                }
+                                element.is_element_free = true;
                                 tracing::error!(message = "Encapsulate error",
                                     error = ?e,
                                     public_key = peer.public_key.1)
@@ -1124,7 +1117,6 @@ impl Device {
                             TunnResult::WriteToNetwork(packet) => {
                                 element.buf_len = packet.len();
                                 element.endpoint = peer.endpoint_ref();
-                                drop(element);
                                 let _ = d.network_tx.send(block);
                             }
                             _ => panic!("Unexpected result from encapsulate"),
@@ -1155,7 +1147,8 @@ fn send_to_network(
         crossbeam::channel::select! {
                 recv(network_rx) -> m => {
                     if let Ok(d) = m {
-                    let msg = d.lock();
+                    let mut msg = d.lock();
+                    {
                     let mut endpoint = msg.endpoint.write();
                     let packet = &msg.data.as_slice()[..msg.buf_len];
                     if let Some(conn) = endpoint.conn.as_mut() {
@@ -1206,10 +1199,8 @@ fn send_to_network(
                         success_pkts = 0;
                         dropped_pkts = 0;
                     }
-                    {
-                        let mut b = msg.is_element_free.write();
-                        *b = true;
-                    }
+                }
+                    msg.is_element_free = true;
         }
         }
             recv(close_chan) -> _n => {
