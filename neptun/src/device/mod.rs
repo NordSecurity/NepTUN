@@ -1058,11 +1058,7 @@ impl Device {
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
                     let block = unsafe { TX_RING_BUFFER.get_next() };
-                    let mut element = if let Some(e) = block.try_lock() {
-                        e
-                    } else {
-                        continue;
-                    };
+                    let mut element = block.lock();
                     if element.is_element_free {
                         let len = match iface.read(&mut element.data[16..mtu + 16]) {
                             Ok(src) => src.len(),
