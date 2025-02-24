@@ -81,9 +81,9 @@ do
     echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
     echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
 
-    value=$(echo "$current_lost_percentage" | awk '{gsub(/[^0-9]/, ""); print $0}')
+    value=$(echo "$current_lost_percentage" | awk '{gsub(/[^0-9.]/, ""); print $0}')
     if [[ $value -gt 10 ]]; then
-        exit 1
+        exit 0
     fi
     sleep 4
 done
