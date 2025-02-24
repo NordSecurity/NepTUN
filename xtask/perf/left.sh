@@ -20,7 +20,7 @@ wg set wg1 \
 ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
-/neptun/current/neptun-cli --disable-drop-privileges -f -v info wg2 &
+/neptun/current/neptun-cli --disable-drop-privileges wg2
 sleep 0.01
 wg set wg2 \
     listen-port 51822 \
