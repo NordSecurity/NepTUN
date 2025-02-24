@@ -2,9 +2,9 @@ use super::Endpoint;
 use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
-const UDP_SIZE: usize = (1 << 12) - 1;
+const UDP_SIZE: usize = 2048;
 
-pub const RB_SIZE: usize = 50;
+pub const RB_SIZE: usize = 500;
 
 pub struct RingBuffer<T> {
     pub ring_buffer: Vec<T>,
