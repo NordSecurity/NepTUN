@@ -32,6 +32,16 @@ wg set wg2 \
 ip address add dev wg2 10.0.2.2/24
 ip link set up dev wg2
 
+ip link add dev wg3 type wireguard
+wg set wg3 \
+    listen-port 51823 \
+    private-key <(echo 4EMoCFW8H29xwDxAh1raNOQXOrppkYPJwlOmTd91un4=) \
+    peer YisiciWrK2P7F8wG15A66v26+tmqEREsKfaSKfn4JHo= \
+    allowed-ips 10.0.3.1/32 \
+    endpoint 176.0.0.2:51823
+ip address add dev wg3 10.0.3.2/24
+ip link set up dev wg3
+
 iperf3 -s > /dev/null &
 touch /.iperf_ready
 sleep infinity

@@ -21,7 +21,6 @@ ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
 /neptun/current/neptun-cli --disable-drop-privileges wg2
-sleep 0.01
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -31,16 +30,30 @@ wg set wg2 \
 ip address add dev wg2 10.0.2.1/24
 ip link set up dev wg2
 
-# echo
-# echo "Raw network:"
-# iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
+ip link add dev wg3 type wireguard
+wg set wg3 \
+    listen-port 51823 \
+    private-key <(echo iKC3cC+98xwIm992/173jwZgCOVeItd7ywgofHkBQ3s=) \
+    peer 6L7AgQi+NMZmqdSHwnCAYmTGeznC5FPjMMG1C+U+wSY= \
+    allowed-ips 10.0.3.2/32 \
+    endpoint 176.0.0.3:51823
+ip address add dev wg3 10.0.3.1/24
+ip link set up dev wg3
 
-# echo
-# echo "Wireguard-go:"
-# iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
+echo
+echo "Raw network:"
+iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
+
+echo
+echo "Wireguard-go:"
+iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
 
 echo
 echo "TCP bidirectional tests"
+
+echo
+echo "Linux Native:"
+iperf3 -i 60 -t 120 --bidir -c 10.0.3.2
 
 echo
 echo "Base NepTUN:"
@@ -81,5 +94,11 @@ do
     echo "Connection       | Total Datagrams | Lost   |  (%) | Received Bitrate"
     echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
     echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
+
+    value=$(echo "$current_lost_percentage" | awk '{print int($0)}')
+
+    if [[ $value -gt 10 ]]; then
+        exit 1
+    fi
     sleep 4
 done

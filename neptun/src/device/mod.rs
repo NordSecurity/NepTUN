@@ -61,7 +61,8 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100_000; // Number of packets to handle per handler call
-                                // const DELAY: Option<Duration> = Duration::from_secs(121).checked_sub(Duration::from_millis(10));
+
+// const DELAY: Option<Duration> = Duration::from_secs(61).checked_sub(Duration::from_millis(10));
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1160,12 +1161,12 @@ fn send_to_network(
                             // dropped_pkts += 1;
                         }
                         // else {
-                            // success_pkts += 1;
-                            // tracing::trace!(
-                            //     "Pkt -> ConnSock ({:?}), len: {}",
-                            //     endpoint.addr,
-                            //     packet.len(),
-                            // );
+                        //     success_pkts += 1;
+                        //     tracing::trace!(
+                        //         "Pkt -> ConnSock ({:?}), len: {}",
+                        //         endpoint.addr,
+                        //         packet.len(),
+                        //     );
                         // }
                     } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
                         if let Err(err) = udp4.send_to(packet, &addr.into()) {
@@ -1173,7 +1174,7 @@ fn send_to_network(
                             tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
                         }
                         // else {
-                            // success_pkts += 1;
+                        //     success_pkts += 1;
                         // }
                     } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
                         if let Err(err) = udp6.send_to(packet, &addr.into()) {
