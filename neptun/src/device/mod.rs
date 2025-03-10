@@ -322,7 +322,15 @@ impl DeviceHandle {
                     WaitResult::EoF(handler) => {
                         handler.cancel();
                     }
-                    WaitResult::Error(e) => tracing::error!(message = "Poll error", error = ?e),
+                    WaitResult::Error(e) => {
+                        if e.contains("Interrupted system call") {
+                            // Interrupts happening while we are waiting in a syscall (epoll_wait, kevent)
+                            // are a normal situation, and not an error condition.
+                            tracing::trace!(message = "Poll interrupt", error = ?e)
+                        } else {
+                            tracing::error!(message = "Poll error", error = ?e)
+                        }
+                    }
                 }
             }
         }
