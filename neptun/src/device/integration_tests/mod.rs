@@ -6,6 +6,7 @@
 // Those tests require docker and sudo privileges to run
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
+    use crate::device::tun::TunSocket;
     use crate::device::{DeviceConfig, DeviceHandle};
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::encode as base64encode;
@@ -21,6 +22,7 @@ mod tests {
     use std::sync::Arc;
     use std::thread::{self, sleep};
     use std::time::Duration;
+    use tracing::debug;
 
     static NEXT_IFACE_IDX: AtomicUsize = AtomicUsize::new(100); // utun 100+ should be vacant during testing on CI
     static NEXT_PORT: AtomicUsize = AtomicUsize::new(61111); // Use ports starting with 61111, hoping we don't run into a taken port 🤷
@@ -278,6 +280,7 @@ mod tests {
         fn init_with_config(addr_v4: IpAddr, addr_v6: IpAddr, config: DeviceConfig) -> WGHandle {
             // Generate a new name, utun100+ should work on macOS and Linux
             let name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
+            debug!("Init with config, tun name: {name}");
             let device = DeviceHandle::new(&name, config).unwrap();
             WGHandle {
                 device,
@@ -351,51 +354,8 @@ mod tests {
         #[cfg(target_os = "linux")]
         /// Starts the tunnel
         fn start(&mut self) {
-            Command::new("ip")
-                .args([
-                    "address",
-                    "add",
-                    &self.addr_v4.to_string(),
-                    "dev",
-                    &self.name,
-                ])
-                .status()
-                .expect("failed to assign ip to tunnel");
-
-            Command::new("ip")
-                .args([
-                    "address",
-                    "add",
-                    &self.addr_v6.to_string(),
-                    "dev",
-                    &self.name,
-                ])
-                .status()
-                .expect("failed to assign ipv6 to tunnel");
-
-            // Start the tunnel
-            Command::new("ip")
-                .args(["link", "set", "mtu", "1400", "up", "dev", &self.name])
-                .status()
-                .expect("failed to start the tunnel");
-
+            configure_utun(&self.name, self.addr_v4, self.addr_v6, &self.peers);
             self.started = true;
-
-            // Add each peer to the routing table
-            for p in &self.peers {
-                for r in &p.allowed_ips {
-                    Command::new("ip")
-                        .args([
-                            "route",
-                            "add",
-                            &format!("{}/{}", r.ip, r.cidr),
-                            "dev",
-                            &self.name,
-                        ])
-                        .status()
-                        .expect("failed to add route");
-                }
-            }
         }
 
         fn wg_uapi_device_cmd(&self, cmd: &str) -> String {
@@ -660,6 +620,92 @@ mod tests {
         wg.start();
 
         let response = peer.get_request();
+
+        assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+    }
+
+    /// Test if wireguard can handle simple ipv4 connections
+    #[test_log::test]
+    #[ignore]
+    fn test_wg_start_ipv4_and_switch_tun_interfaces() {
+        let port = next_port();
+        let private_key = StaticSecret::random_from_rng(OsRng);
+        let public_key = PublicKey::from(&private_key);
+        let addr_v4 = next_ip();
+        let addr_v6 = next_ip_v6();
+
+        let mut wg = WGHandle::init(addr_v4, addr_v6);
+
+        assert_eq!(wg.wg_set_port(port), "errno=0\n\n");
+        assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
+
+        // Create a new peer whose endpoint is on this machine
+        let mut peer = Peer::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+            vec![AllowedIp {
+                ip: next_ip(),
+                cidr: 32,
+            }],
+        );
+
+        peer.start_in_container(&public_key, &addr_v4, port);
+
+        let peer = Arc::new(peer);
+
+        wg.add_peer(Arc::clone(&peer));
+        wg.start();
+
+        let response = dbg!(peer.get_request());
+
+        assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+
+        // 1st switch to different utun
+
+        let new_name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
+        let new_iface = TunSocket::new(&new_name).unwrap();
+
+        remove_routing(&wg.name, &wg.peers);
+        configure_utun(&new_name, wg.addr_v4, wg.addr_v6, &wg.peers);
+
+        let old_name = wg.name;
+        wg.name = new_name;
+        wg.device.set_iface(new_iface).unwrap();
+
+        Command::new("ip")
+            .args(["link", "delete", &old_name])
+            .status()
+            .expect("failed to delete old interface");
+
+        let response = dbg!(peer.get_request());
+
+        assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+
+        let response = dbg!(peer.get_request());
+
+        assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+
+        // 2nd switch to different utun
+
+        let new_name = format!("utun{}", NEXT_IFACE_IDX.fetch_add(1, Ordering::Relaxed));
+        let new_iface = TunSocket::new(&new_name).unwrap();
+
+        remove_routing(&wg.name, &wg.peers);
+        configure_utun(&new_name, wg.addr_v4, wg.addr_v6, &wg.peers);
+
+        let old_name = wg.name;
+        wg.name = new_name;
+        wg.device.set_iface(new_iface).unwrap();
+
+        Command::new("ip")
+            .args(["link", "delete", &old_name])
+            .status()
+            .expect("failed to delete old interface");
+
+        let response = dbg!(peer.get_request());
+
+        assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+
+        let response = dbg!(peer.get_request());
 
         assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
     }
@@ -931,6 +977,57 @@ mod tests {
 
         for t in threads {
             t.join().unwrap();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn remove_routing(name: &str, peers: &[Arc<Peer>]) {
+        for p in peers {
+            for r in &p.allowed_ips {
+                Command::new("ip")
+                    .args([
+                        "route",
+                        "del",
+                        &format!("{}/{}", r.ip, r.cidr),
+                        "dev",
+                        &name,
+                    ])
+                    .status()
+                    .expect("failed to add route");
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn configure_utun(name: &str, addr_v4: IpAddr, addr_v6: IpAddr, peers: &[Arc<Peer>]) {
+        Command::new("ip")
+            .args(["address", "add", &addr_v4.to_string(), "dev", &name])
+            .status()
+            .expect("failed to assign ip to tunnel");
+
+        Command::new("ip")
+            .args(["address", "add", &addr_v6.to_string(), "dev", &name])
+            .status()
+            .expect("failed to assign ipv6 to tunnel");
+
+        // Start the tunnel
+        Command::new("ip")
+            .args(["link", "set", "mtu", "1400", "up", "dev", &name])
+            .status()
+            .expect("failed to start the tunnel");
+
+        for p in peers {
+            for r in &p.allowed_ips {
+                Command::new("ip")
+                    .args([
+                        "route",
+                        "add",
+                        &format!("{}/{}", r.ip, r.cidr),
+                        "dev",
+                        &name,
+                    ])
+                    .status()
+                    .expect("failed to add route");
+            }
         }
     }
 }

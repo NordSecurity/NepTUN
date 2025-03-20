@@ -292,7 +292,7 @@ impl<H: Send + Sync> EventPoll<H> {
 
 impl<H> EventPoll<H> {
     // This function is only safe to call when the event loop is not running
-    pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
+    pub unsafe fn clear_event_by_fd(&self, index: RawFd) -> bool {
         let (mut events, index) = if index >= 0 {
             (self.events.lock(), index as usize)
         } else {
@@ -302,8 +302,11 @@ impl<H> EventPoll<H> {
         if let Some(mut event) = events[index].take() {
             // Properly remove any previous event first
             event.event.flags = EV_DELETE;
-            kevent(self.kqueue, &event.event, 1, null_mut(), 0, null());
+            if kevent(self.kqueue, &event.event, 1, null_mut(), 0, null()) == -1 {
+                return false;
+            }
         }
+        true
     }
 }
 
