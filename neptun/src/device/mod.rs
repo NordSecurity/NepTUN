@@ -948,11 +948,19 @@ impl Device {
 
                     match res {
                         TunnResult::Done => {}
-                        TunnResult::Err(e) => {
-                            tracing::error!(message="Decapsulate error",
-                            error=?e,
-                            public_key = peer.public_key.1)
-                        }
+                        TunnResult::Err(e) => match e {
+                            WireGuardError::DuplicateCounter => {
+                                // TODO(LLT-6071): revert back to having error level for all error types
+                                tracing::debug!(message="Decapsulate error",
+                                    error=?e,
+                                    public_key=peer.public_key.1)
+                            }
+                            _ => {
+                                tracing::error!(message="Decapsulate error",
+                                    error=?e,
+                                    public_key = peer.public_key.1)
+                            }
+                        },
                         TunnResult::WriteToNetwork(packet) => {
                             flush = true;
                             if let Err(err) = udp.send(packet) {
