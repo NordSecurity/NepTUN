@@ -3,45 +3,32 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::Error;
-use libc::*;
+use libc::{
+    self, __c_anonymous_ifr_ifru, c_char, c_short, close, fcntl, ifreq, open, read, socket, write,
+    AF_INET, F_GETFL, F_SETFL, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, IFNAMSIZ, IF_NAMESIZE,
+    IPPROTO_IP, O_NONBLOCK, O_RDWR, SIOCGIFMTU, SOCK_STREAM,
+};
+use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::error;
 
-const TUNGETIFF: u64 = 0x8004_54D2;
 #[cfg(target_os = "linux")]
-const TUNSETIFF: u64 = 0x4004_54ca;
-
-#[cfg(target_os = "linux")]
-pub const IFF_MULTI_QUEUE: c_int = 0x100;
-
-#[repr(C)]
-union IfrIfru {
-    ifru_addr: sockaddr,
-    ifru_addr_v4: sockaddr_in,
-    ifru_addr_v6: sockaddr_in,
-    ifru_dstaddr: sockaddr,
-    ifru_broadaddr: sockaddr,
-    ifru_flags: c_short,
-    ifru_metric: c_int,
-    ifru_mtu: c_int,
-    ifru_phys: c_int,
-    ifru_media: c_int,
-    ifru_intval: c_int,
-    //ifru_data: caddr_t,
-    //ifru_devmtu: ifdevmtu,
-    //ifru_kpi: ifkpi,
-    ifru_wake_flags: u32,
-    ifru_route_refcnt: u32,
-    ifru_cap: [c_int; 2],
-    ifru_functional_type: u32,
+mod tun_interface_flags {
+    use super::*;
+    use libc::{TUNGETIFF, TUNSETIFF};
+    ioctl_read_bad!(get, TUNGETIFF, ifreq);
+    ioctl_write_ptr_bad!(set, TUNSETIFF, ifreq);
 }
 
-#[repr(C)]
-pub struct ifreq {
-    ifr_name: [c_uchar; IFNAMSIZ],
-    ifr_ifru: IfrIfru,
+#[cfg(target_os = "android")]
+mod tun_interface_flags {
+    use super::*;
+    const TUNGETIFF: u64 = 0x8004_54D2;
+    ioctl_read_bad!(get, TUNGETIFF, ifreq);
 }
+
+ioctl_read_bad!(get_interface_mtu, SIOCGIFMTU, ifreq);
 
 #[derive(Default, Debug)]
 pub struct TunSocket {
@@ -86,21 +73,27 @@ impl TunSocket {
 
         #[cfg(target_os = "linux")]
         {
-            let iface_name = name.as_bytes();
+            if !name.is_ascii() {
+                return Err(Error::InvalidTunnelName);
+            }
+
             let mut ifr = ifreq {
                 ifr_name: [0; IFNAMSIZ],
-                ifr_ifru: IfrIfru {
+                ifr_ifru: __c_anonymous_ifr_ifru {
                     ifru_flags: (IFF_TUN | IFF_MULTI_QUEUE | IFF_NO_PI) as _,
                 },
             };
 
-            if iface_name.len() >= ifr.ifr_name.len() {
+            if name.len() >= ifr.ifr_name.len() {
                 return Err(Error::InvalidTunnelName);
             }
 
-            ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+            ifr.ifr_name
+                .iter_mut()
+                .zip(name.as_bytes().iter())
+                .for_each(|(slot, char)| *slot = *char as c_char);
 
-            if unsafe { ioctl(fd, TUNSETIFF as _, &ifr) } < 0 {
+            if unsafe { tun_interface_flags::set(fd, &ifr) }.is_err() {
                 let error = Error::IOCtl(io::Error::last_os_error());
                 let flags = unsafe { format!("{:x}", ifr.ifr_ifru.ifru_flags) };
                 error!(
@@ -119,19 +112,12 @@ impl TunSocket {
     }
 
     pub fn new_from_fd(fd: RawFd) -> Result<TunSocket, Error> {
-        #[cfg(target_os = "linux")]
-        let ifr = ifreq {
+        let mut ifr = ifreq {
             ifr_name: [0; IFNAMSIZ],
-            ifr_ifru: IfrIfru { ifru_intval: 0 },
+            ifr_ifru: __c_anonymous_ifr_ifru { ifru_ifindex: 0 },
         };
 
-        #[cfg(target_os = "android")]
-        let ifr = ifreq {
-            ifr_name: [0; IFNAMSIZ],
-            ifr_ifru: IfrIfru { ifru_intval: 0 },
-        };
-
-        if unsafe { ioctl(fd, TUNGETIFF as _, &ifr) } < 0 {
+        if unsafe { tun_interface_flags::get(fd, &mut ifr) }.is_err() {
             let error = Error::IOCtl(io::Error::last_os_error());
             error!(?error, op = "TUNGETIFF", "Failed to get tunnel info");
             return Err(error);
@@ -140,7 +126,7 @@ impl TunSocket {
         if flags & IFF_TUN as c_short == 0 {
             return Err(Error::InvalidTunnelName);
         }
-        let name = std::ffi::CStr::from_bytes_until_nul(&ifr.ifr_name)
+        let name = std::ffi::CStr::from_bytes_until_nul(&ifr.ifr_name.map(|c| c as u8))
             .map_err(|_| Error::InvalidTunnelName)?
             .to_str()
             .map_err(|_| Error::InvalidTunnelName)?
@@ -174,21 +160,22 @@ impl TunSocket {
             fd => fd,
         };
 
-        let name = self.name()?;
-        let iface_name: &[u8] = name.as_ref();
         let mut ifr = ifreq {
             ifr_name: [0; IF_NAMESIZE],
-            ifr_ifru: IfrIfru { ifru_mtu: 0 },
+            ifr_ifru: __c_anonymous_ifr_ifru { ifru_mtu: 0 },
         };
 
-        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+        ifr.ifr_name
+            .iter_mut()
+            .zip(self.name.as_bytes().iter())
+            .for_each(|(slot, char)| *slot = *char as c_char);
 
-        if unsafe { ioctl(fd, SIOCGIFMTU as _, &ifr) } < 0 {
+        if unsafe { get_interface_mtu(fd, &mut ifr) }.is_err() {
             let error = Error::IOCtl(io::Error::last_os_error());
             error!(
                 ?error,
                 op = "SIOCGIFMTU",
-                name,
+                self.name,
                 "Failed to get mtu for tunnel"
             );
             return Err(error);
