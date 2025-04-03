@@ -65,5 +65,5 @@ jobs:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
     - uses: EmbarkStudios/cargo-deny-action@8371184bd11e21dcf8ac82ebf8c9c9f74ebf7268 # v2.0.1
       with:
-        rust-version: 1.77.2 # NOTE: Runs in its own docker container and doesn't support toolchain files
+        rust-version: 1.85.0 # NOTE: Runs in its own docker container and doesn't support toolchain files
 
