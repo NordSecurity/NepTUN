@@ -28,14 +28,14 @@ pub mod tun;
 
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter};
-use std::mem::MaybeUninit;
+use std::mem::{swap, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -47,6 +47,7 @@ use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
+use tracing::{debug, warn};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -121,6 +122,7 @@ pub struct DeviceHandle {
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     threads: (dispatch::Group, Vec<dispatch::Queue>),
+    fds_for_tun: Arc<Lock<Vec<RawFd>>>,
 }
 
 #[derive(Clone)]
@@ -143,7 +145,6 @@ pub struct Device {
 
     listen_port: u16,
     fwmark: Option<u32>,
-    #[cfg(not(target_os = "linux"))]
     update_seq: u32,
 
     iface: Arc<TunSocket>,
@@ -172,9 +173,19 @@ struct ThreadData {
     iface: Arc<TunSocket>,
     src_buf: [u8; MAX_UDP_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
-    #[cfg(not(target_os = "linux"))]
     update_seq: u32,
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<RawFd>>>), Error>;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+type EventLoopThreads = Result<
+    (
+        (dispatch::Group, Vec<dispatch::Queue>),
+        Arc<Lock<Vec<RawFd>>>,
+    ),
+    Error,
+>;
 
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
@@ -188,6 +199,21 @@ impl DeviceHandle {
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
+        let (threads, fds_for_tun) =
+            Self::start_event_loop_threads(n_threads, interface_lock.clone())?;
+
+        Ok(DeviceHandle {
+            device: interface_lock,
+            threads,
+            fds_for_tun,
+        })
+    }
+
+    fn start_event_loop_threads(
+        n_threads: usize,
+        interface_lock: Arc<Lock<Device>>,
+    ) -> EventLoopThreads {
+        let fds_for_tun = Arc::new(Lock::new(vec![]));
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let threads = {
             let group = dispatch::Group::create();
@@ -195,11 +221,15 @@ impl DeviceHandle {
             for i in 0..n_threads {
                 queues.push({
                     let dev = Arc::clone(&interface_lock);
+                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
+                    fds_for_tun
+                        .read()
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
                     let group_clone = group.clone();
                     let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
                     queue.exec_async(move || {
                         group_clone.enter();
-                        DeviceHandle::event_loop(i, &dev)
+                        DeviceHandle::event_loop(thread_local, &dev)
                     });
                     queue
                 });
@@ -213,18 +243,19 @@ impl DeviceHandle {
             for i in 0..n_threads {
                 threads.push({
                     let dev = Arc::clone(&interface_lock);
+                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
+                    fds_for_tun
+                        .read()
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
                     thread::Builder::new()
                         .name(format!("neptun"))
-                        .spawn(move || DeviceHandle::event_loop(i, &dev))?
+                        .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
                 });
             }
             threads
         };
 
-        Ok(DeviceHandle {
-            device: interface_lock,
-            threads,
-        })
+        Ok((threads, fds_for_tun))
     }
 
     pub fn send_uapi_cmd(&self, cmd: &str) -> String {
@@ -264,21 +295,39 @@ impl DeviceHandle {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
     pub fn set_iface(&mut self, new_iface: TunSocket) -> Result<(), Error> {
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safelly cleared.
         // See clear_event_by_fd() function description
+        let mut threads = vec![];
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        swap(&mut threads, &mut self.threads);
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        swap(&mut threads, &mut self.threads.1);
         self.device
             .read()
             .try_writeable(
                 |device| device.trigger_yield(),
-                |device| {
-                    (device.update_seq, _) = device.update_seq.overflowing_add(1);
-                    // Because the event loop is stopped now, this is safe (see clear_event_by_fd() comment)
-                    unsafe {
-                        device.queue.clear_event_by_fd(device.iface.as_raw_fd());
+                |device| -> Result<(), Error> {
+                    let fds_to_unregister = self.fds_for_tun.read().clone();
+                    for fd in fds_to_unregister {
+                        // Because the event loop is stopped now, this is safe (see clear_event_by_fd() comment)
+                        let unregister_ok: bool = unsafe { device.queue.clear_event_by_fd(fd) };
+                        if !unregister_ok {
+                            warn!(
+                                "Failed to clear events handler for fd {fd} and name: {:?}",
+                                device.iface.name()
+                            )
+                        }
+
+                        unsafe {
+                            // This will trigger the exit condition in the event_loop running on a different thread
+                            // for this file descriptor.
+                            libc::close(fd);
+                        }
                     }
+
+                    (device.update_seq, _) = device.update_seq.overflowing_add(1);
                     device.iface = Arc::new(new_iface.set_non_blocking()?);
                     device.register_iface_handler(device.iface.clone())?;
                     device.cancel_yield();
@@ -286,19 +335,26 @@ impl DeviceHandle {
                     Ok(())
                 },
             )
-            .ok_or(Error::SetTunnel)?
+            .ok_or(Error::SetTunnel)??;
+        let (threads, fds_for_tun) = DeviceHandle::start_event_loop_threads(
+            self.device.read().config.n_threads,
+            self.device.clone(),
+        )?;
+        self.threads = threads;
+        self.fds_for_tun = fds_for_tun;
+        Ok(())
     }
 
-    fn event_loop(thread_id: usize, device: &Lock<Device>) {
-        let mut thread_local = DeviceHandle::new_thread_local(thread_id, &device.read());
-
+    fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>) {
         loop {
             let mut device_lock = device.read();
-            #[cfg(not(target_os = "linux"))]
+
             if device_lock.update_seq != thread_local.update_seq {
-                thread_local.update_seq = device_lock.update_seq;
-                thread_local.iface = device_lock.iface.clone();
+                // New threads are started when the tun interface is changed, so this
+                // thread that was started for an older tun should end.
+                return;
             }
+
             // The event loop keeps a read lock on the device, because we assume write access is rarely needed
             let queue = Arc::clone(&device_lock.queue);
 
@@ -359,6 +415,7 @@ impl DeviceHandle {
 
                 iface_local
             },
+            update_seq: device_lock.update_seq,
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -530,7 +587,6 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            #[cfg(not(target_os = "linux"))]
             update_seq: 0,
         };
 
@@ -559,7 +615,7 @@ impl Device {
         if let Some(s) = self.udp4.take() {
             unsafe {
                 // This is safe because the event loop is not running yet
-                self.queue.clear_event_by_fd(s.as_raw_fd())
+                self.queue.clear_event_by_fd(s.as_raw_fd());
             }
         };
 

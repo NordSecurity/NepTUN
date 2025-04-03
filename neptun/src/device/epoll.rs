@@ -6,6 +6,7 @@ use libc::*;
 use parking_lot::Mutex;
 use std::io;
 use std::ops::Deref;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
 use std::time::Duration;
@@ -337,12 +338,16 @@ impl<H> EventPoll<H> {
     ///
     /// This function is only safe to call when the event loop is not running,
     /// otherwise the memory of the handler may get freed while in use.
-    pub unsafe fn clear_event_by_fd(&self, index: RawFd) {
+    pub unsafe fn clear_event_by_fd(&self, index: RawFd) -> bool {
         let mut events = self.events.lock();
         assert!(index >= 0);
         if events[index as usize].take().is_some() {
-            epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut());
+            if epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut()) == -1 {
+                return false;
+            }
+            events[index as usize] = None;
         }
+        true
     }
 }
 
