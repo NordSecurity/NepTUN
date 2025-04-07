@@ -36,6 +36,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -168,6 +169,16 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 }
+
+static mut NUM_PKTS_SENT: u128 = 0;
+static mut NUM_PKTS_ENCRYPTED: u128 = 0;
+static mut ENCRYPTION_TIME: u128 = 0;
+static mut TOTAL_TX_TIME: u128 = 0;
+
+static mut NUM_PKTS_RECV: u128 = 0;
+static mut NUM_PKTS_DECRYPTED: u128 = 0;
+static mut DECRYPTION_TIME: u128 = 0;
+static mut TOTAL_RX_TIME: u128 = 0;
 
 struct ThreadData {
     iface: Arc<TunSocket>,
@@ -799,6 +810,53 @@ impl Device {
             }),
             std::time::Duration::from_millis(250),
         )?;
+
+        self.queue.new_periodic_event(
+            // Log the statistics every 30 seconds
+            Box::new(|_d, _| {
+                unsafe {
+                    if NUM_PKTS_SENT != 0 {
+                        tracing::info!(
+                            "TX Stats in 30 seconds:\n
+                            Packets encrypted: {}\n
+                            Encryption time: {}ns\n
+                            Packets sent: {}\n
+                            Total sending time: {}us\n
+                            ",
+                            NUM_PKTS_ENCRYPTED,
+                            ENCRYPTION_TIME / NUM_PKTS_ENCRYPTED,
+                            NUM_PKTS_SENT,
+                            TOTAL_TX_TIME / NUM_PKTS_SENT
+                        );
+                        NUM_PKTS_ENCRYPTED = 0;
+                        ENCRYPTION_TIME = 0;
+                        NUM_PKTS_SENT = 0;
+                        TOTAL_TX_TIME = 0;
+                    }
+                    if NUM_PKTS_RECV != 0 {
+                        tracing::info!(
+                            "RX Stats in 30 seconds:\n
+                            Packets decrypted: {}\n
+                            Decryption time: {}ns\n
+                            Packets recvd: {}\n
+                            Total recving time: {}us\n
+                            ",
+                            NUM_PKTS_DECRYPTED,
+                            DECRYPTION_TIME / NUM_PKTS_DECRYPTED,
+                            NUM_PKTS_RECV,
+                            TOTAL_RX_TIME / NUM_PKTS_RECV
+                        );
+                        NUM_PKTS_DECRYPTED = 0;
+                        DECRYPTION_TIME = 0;
+                        NUM_PKTS_RECV = 0;
+                        TOTAL_RX_TIME = 0;
+                    }
+                }
+                Action::Continue
+            }),
+            std::time::Duration::from_secs(30),
+        )?;
+
         Ok(())
     }
 
@@ -844,6 +902,7 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
+                    let total_rx_time = Instant::now();
                     let packet = &t.src_buf[..packet_len];
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet =
@@ -879,7 +938,14 @@ impl Device {
                     let mut flush = false; // Are there packets to send from the queue?
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
+                        let decapsulate_time = Instant::now();
+                        let ret = tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..]);
+                        let dt = decapsulate_time.elapsed().as_nanos();
+                        unsafe {
+                            NUM_PKTS_DECRYPTED += 1;
+                            DECRYPTION_TIME += dt;
+                        }
+                        ret
                     };
                     match res {
                         TunnResult::Done => {}
@@ -929,7 +995,11 @@ impl Device {
                             }
                         }
                     };
-
+                    let tt= total_rx_time.elapsed().as_micros();
+                    unsafe {
+                        NUM_PKTS_RECV += 1;
+                        TOTAL_RX_TIME += tt;
+                    }
                     if flush {
                         // Flush pending queue
                         loop {
@@ -991,15 +1061,23 @@ impl Device {
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
                 while let Ok(read_bytes) = udp.recv(src_buf) {
+                    let total_rx_time = Instant::now();
                     let mut flush = false;
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.decapsulate(
+                        let decapsulate_time = Instant::now();
+                        let ret = tun.decapsulate(
                             Some(peer_addr),
                             &t.src_buf[..read_bytes],
                             &mut t.dst_buf[..],
-                        )
+                        );
+                        let dt = decapsulate_time.elapsed().as_nanos();
+                        unsafe {
+                            NUM_PKTS_DECRYPTED += 1;
+                            DECRYPTION_TIME += dt;
+                        }
+                        ret
                     };
 
                     match res {
@@ -1058,7 +1136,11 @@ impl Device {
                             }
                         }
                     };
-
+                    let tt = total_rx_time.elapsed().as_micros();
+                    unsafe {
+                        NUM_PKTS_RECV += 1;
+                        TOTAL_RX_TIME += tt;
+                    }
                     if flush {
                         // Flush pending queue
                         loop {
@@ -1103,6 +1185,7 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
+                    let total_tx_time = Instant::now();
                     let src = match iface.read(&mut t.src_buf[..mtu]) {
                         Ok(src) => src,
                         Err(Error::IfaceRead(e)) => {
@@ -1142,7 +1225,14 @@ impl Device {
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
+                        let encapsulate_time = Instant::now();
+                        let ret = tun.encapsulate(src, &mut t.dst_buf[..]);
+                        let et = encapsulate_time.elapsed().as_nanos();
+                        unsafe {
+                            NUM_PKTS_ENCRYPTED += 1;
+                            ENCRYPTION_TIME += et;
+                        }
+                        ret
                     };
                     match res {
                         TunnResult::Done => {}
@@ -1197,6 +1287,11 @@ impl Device {
                         }
                         _ => panic!("Unexpected result from encapsulate"),
                     };
+                    let tt= total_tx_time.elapsed().as_micros();
+                    unsafe {
+                        NUM_PKTS_SENT += 1;
+                        TOTAL_TX_TIME += tt;
+                    }
                 }
                 Action::Continue
             }),
