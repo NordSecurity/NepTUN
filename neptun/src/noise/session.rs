@@ -211,20 +211,20 @@ impl Session {
 
         // TODO: spec requires padding to 16 bytes, but actually works fine without it
         let n = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            data[..src.len()].copy_from_slice(src);
-            self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut data[..src.len()],
-                )
-                .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
-                })
-                .unwrap()
+            // let mut nonce = [0u8; 12];
+            // nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+            // data[..src.len()].copy_from_slice(src);
+            // self.sender
+            //     .seal_in_place_separate_tag(
+            //         Nonce::assume_unique_for_key(nonce),
+            //         Aad::from(&[]),
+            //         &mut data[..src.len()],
+            //     )
+            //     .map(|tag| {
+            //         data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
+            src.len() + AEAD_SIZE
+            // })
+            // .unwrap()
         };
 
         &mut dst[..DATA_OFFSET + n]
@@ -251,16 +251,17 @@ impl Session {
         self.receiving_counter_quick_check(packet.counter)?;
 
         let ret = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
+            // let mut nonce = [0u8; 12];
+            // nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
             dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
-            self.receiver
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut dst[..ct_len],
-                )
-                .map_err(|_| WireGuardError::InvalidAeadTag)?
+            // self.receiver
+            //     .open_in_place(
+            //         Nonce::assume_unique_for_key(nonce),
+            //         Aad::from(&[]),
+            //         &mut dst[..ct_len],
+            //     )
+            //     .map_err(|_| WireGuardError::InvalidAeadTag)?
+            &mut dst[..ct_len]
         };
 
         // After decryption is done, check counter again, and mark as received
