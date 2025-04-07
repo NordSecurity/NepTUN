@@ -41,7 +41,8 @@ thiserror = { version = "1", optional = true }
 dispatch = { git = "https://github.com/NordSecurity/rust-dispatch.git", rev = "13447cd7221a74ebcce1277ae0cfc9a421a28ec5" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", default-features = false, features = [
+nix = { version = "0.29", default-features = false, features = [
+    "ioctl",
     "time",
     "user",
 ] }
