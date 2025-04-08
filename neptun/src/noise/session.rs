@@ -213,7 +213,7 @@ impl Session {
         let n = {
             // let mut nonce = [0u8; 12];
             // nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            // data[..src.len()].copy_from_slice(src);
+            data[..src.len()].copy_from_slice(src);
             // self.sender
             //     .seal_in_place_separate_tag(
             //         Nonce::assume_unique_for_key(nonce),
