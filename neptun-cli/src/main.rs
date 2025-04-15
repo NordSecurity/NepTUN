@@ -76,6 +76,10 @@ fn main() {
                 .long("disable-connected-udp")
                 .action(clap::ArgAction::SetTrue)
                 .help("Disable connected UDP sockets to each peer"),
+            Arg::new("skt-buff-size")
+                .long("socket-buffer-size")
+                .value_parser(value_parser!(i32))
+                .help("Sets socket buffers to custom size"),
             #[cfg(target_os = "linux")]
             Arg::new("disable-multi-queue")
                 .long("disable-multi-queue")
@@ -88,6 +92,7 @@ fn main() {
     let tun_name: String = matches.get_one::<String>("INTERFACE_NAME").unwrap().clone();
     let n_threads: usize = *matches.get_one("threads").unwrap();
     let log_level: Level = *matches.get_one("verbosity").unwrap();
+    let skt_buffer_size = matches.get_one::<i32>("skt-buff-size").copied();
 
     // Create a socketpair to communicate between forked processes
     let (sock1, sock2) = UnixDatagram::pair().unwrap();
@@ -152,6 +157,7 @@ fn main() {
         protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
         firewall_process_inbound_callback: None,
         firewall_process_outbound_callback: None,
+        skt_buffer_size,
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(&tun_name, config) {

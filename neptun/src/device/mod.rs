@@ -137,6 +137,7 @@ pub struct DeviceConfig {
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
+    pub skt_buffer_size: Option<i32>,
 }
 
 pub struct Device {
@@ -437,6 +438,24 @@ impl Drop for DeviceHandle {
     }
 }
 
+fn modify_skt_buffer_size(socket: i32, buffer_size: i32) {
+    unsafe {
+        for buffer in vec![libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            let res = libc::setsockopt(
+                socket,
+                libc::SOL_SOCKET,
+                buffer,
+                &buffer_size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&buffer_size) as libc::socklen_t,
+            );
+            match res {
+                0 => println!("Socket buffer {buffer} set"),
+                _ => println!("Socket buffer {buffer} failed with {res}"),
+            }
+        }
+    }
+}
+
 impl Device {
     fn next_index(&mut self) -> u32 {
         self.next_index.next()
@@ -644,6 +663,12 @@ impl Device {
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp_sock6.set_nonblocking(true)?;
         self.config.protect.make_external(udp_sock6.as_raw_fd());
+
+        if let Some(buffer_size) = self.config.skt_buffer_size {
+            // Modify IPv4 IPv6 snd and recv buffers
+            modify_skt_buffer_size(udp_sock4.as_raw_fd(), buffer_size);
+            modify_skt_buffer_size(udp_sock6.as_raw_fd(), buffer_size);
+        }
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
@@ -954,7 +979,7 @@ impl Device {
                     peer.set_endpoint(addr);
                     if d.config.use_connected_socket {
                         // No need for aditional checking, as from this point all packets will arive to connected socket handler
-                        if let Ok(sock) = peer.connect_endpoint(d.listen_port) {
+                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
                             d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
                                 .unwrap();
                         }
@@ -1255,5 +1280,39 @@ impl Default for IndexLfsr {
             lfsr: seed,
             mask: Self::random_index(),
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_setting_skt_buffers() {
+        let socket = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let _res = socket.set_reuse_address(true);
+        let _res = socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into());
+
+        let mut buffer_size = 11111;
+        modify_skt_buffer_size(socket.as_raw_fd(), buffer_size);
+
+        let mut get_buf: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            let _res = libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &mut get_buf as *mut _ as *mut libc::c_void,
+                &mut len,
+            );
+        }
+
+        // According to `man 7 socket` linux doubles the buffer size
+        // internally as it assumes half is for internal kernel structures
+        buffer_size *= 2;
+
+        assert!(get_buf == buffer_size);
     }
 }
