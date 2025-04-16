@@ -92,7 +92,7 @@ fn main() {
     let tun_name: String = matches.get_one::<String>("INTERFACE_NAME").unwrap().clone();
     let n_threads: usize = *matches.get_one("threads").unwrap();
     let log_level: Level = *matches.get_one("verbosity").unwrap();
-    let skt_buffer_size = matches.get_one::<i32>("skt-buff-size").copied();
+    let skt_buffer_size = matches.get_one::<u32>("skt-buff-size").copied();
 
     // Create a socketpair to communicate between forked processes
     let (sock1, sock2) = UnixDatagram::pair().unwrap();

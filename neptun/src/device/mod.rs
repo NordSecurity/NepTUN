@@ -137,7 +137,7 @@ pub struct DeviceConfig {
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
-    pub skt_buffer_size: Option<i32>,
+    pub skt_buffer_size: Option<u32>,
 }
 
 pub struct Device {
@@ -438,20 +438,20 @@ impl Drop for DeviceHandle {
     }
 }
 
-fn modify_skt_buffer_size(socket: i32, buffer_size: i32) {
-    unsafe {
-        for buffer in vec![libc::SO_RCVBUF, libc::SO_SNDBUF] {
-            let res = libc::setsockopt(
+fn modify_skt_buffer_size(socket: i32, buffer_size: u32) {
+    for buffer in vec![libc::SO_RCVBUF, libc::SO_SNDBUF] {
+        let res = unsafe {
+            libc::setsockopt(
                 socket,
                 libc::SOL_SOCKET,
                 buffer,
                 &buffer_size as *const _ as *const libc::c_void,
                 std::mem::size_of_val(&buffer_size) as libc::socklen_t,
-            );
-            match res {
-                0 => println!("Socket buffer {buffer} set"),
-                _ => println!("Socket buffer {buffer} failed with {res}"),
-            }
+            )
+        };
+        match res {
+            0 => tracing::debug!("Socket buffer {buffer} set"),
+            _ => tracing::error!("Socket buffer {buffer} failed with {res}"),
         }
     }
 }
@@ -1297,7 +1297,7 @@ mod tests {
         let mut buffer_size = 11111;
         modify_skt_buffer_size(socket.as_raw_fd(), buffer_size);
 
-        let mut get_buf: libc::c_int = 0;
+        let mut get_buf = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         unsafe {
             let _res = libc::getsockopt(
