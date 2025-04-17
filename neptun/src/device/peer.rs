@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, S
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::device::{AllowedIps, Error, MakeExternalNeptun};
+use crate::device::{modify_skt_buffer_size, AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 
 use std::os::fd::AsRawFd;
@@ -109,7 +109,11 @@ impl Peer {
         endpoint.addr = Some(addr);
     }
 
-    pub fn connect_endpoint(&self, port: u16) -> Result<socket2::Socket, Error> {
+    pub fn connect_endpoint(
+        &self,
+        port: u16,
+        skt_buffer_size: Option<u32>,
+    ) -> Result<socket2::Socket, Error> {
         let mut endpoint = self.endpoint.write();
 
         if endpoint.conn.is_some() {
@@ -142,6 +146,10 @@ impl Peer {
         );
 
         endpoint.conn = Some(udp_conn.try_clone().unwrap());
+
+        if let Some(buffer_size) = skt_buffer_size {
+            modify_skt_buffer_size(udp_conn.as_raw_fd(), buffer_size);
+        }
 
         Ok(udp_conn)
     }
@@ -215,6 +223,6 @@ mod tests {
             Arc::new(crate::device::MakeExternalNeptunNoop),
         );
 
-        peer.connect_endpoint(12345).unwrap();
+        peer.connect_endpoint(12345, None).unwrap();
     }
 }

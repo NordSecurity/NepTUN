@@ -272,6 +272,7 @@ mod tests {
                     protect: Arc::new(crate::device::MakeExternalNeptunNoop),
                     firewall_process_inbound_callback: None,
                     firewall_process_outbound_callback: None,
+                    skt_buffer_size: None,
                 },
             )
         }
@@ -561,6 +562,7 @@ mod tests {
                 protect: Arc::new(crate::device::MakeExternalNeptunNoop),
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
+                skt_buffer_size: None,
             },
         );
 
@@ -849,6 +851,7 @@ mod tests {
                 protect: Arc::new(crate::device::MakeExternalNeptunNoop),
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
+                skt_buffer_size: None,
             },
         );
 
