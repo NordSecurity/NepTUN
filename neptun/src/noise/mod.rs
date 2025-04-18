@@ -709,7 +709,9 @@ impl Tunn {
 
 #[cfg(test)]
 mod tests {
-
+    use crate::noise::timers::{
+        REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
+    };
     #[cfg(feature = "mock-instant")]
     use mock_instant::MockClock;
 
