@@ -35,8 +35,7 @@ use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
-// use std::time::{Duration, Instant};
+use std::thread::{self, JoinHandle};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
