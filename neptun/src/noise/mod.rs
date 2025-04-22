@@ -5,6 +5,7 @@
 pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
+pub mod ring_buffers;
 pub mod safe_duration;
 
 #[cfg(test)]
@@ -21,7 +22,7 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +47,12 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+#[derive(Default, Debug)]
+pub struct Endpoint {
+    pub addr: Option<SocketAddr>,
+    pub conn: Option<socket2::Socket>,
+}
+
 #[derive(Debug)]
 pub enum TunnResult<'a> {
     Done,
@@ -58,6 +65,21 @@ pub enum TunnResult<'a> {
 impl<'a> From<WireGuardError> for TunnResult<'a> {
     fn from(err: WireGuardError) -> TunnResult<'a> {
         TunnResult::Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum NeptunResult {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(usize),
+    WriteToTunnelV4(usize, Ipv4Addr),
+    WriteToTunnelV6(usize, Ipv6Addr),
+}
+
+impl From<WireGuardError> for NeptunResult {
+    fn from(err: WireGuardError) -> NeptunResult {
+        NeptunResult::Err(err)
     }
 }
 
@@ -272,24 +294,35 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        dst[16..src.len() + 16].copy_from_slice(src);
+        self.encapsulate_in_place(src.len(), dst)
+    }
+
+    pub fn encapsulate_in_place<'a>(
+        &mut self,
+        src_len: usize,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.format_packet_data(src_len, dst);
+
+            // Send the notification on the channel to encrypt the packet
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
-            if !src.is_empty() {
+            if src_len.ne(&0) {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
             self.tx_bytes += packet.len();
             return TunnResult::WriteToNetwork(packet);
         }
 
-        if !src.is_empty() {
+        if src_len.ne(&0) {
             // If there is no session, queue the packet for future retry,
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
-            self.queue_packet(src);
+            self.queue_packet(&dst[16..src_len + 16]);
         }
 
         // Initiate a new handshake if none is in progress
@@ -430,7 +463,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = { session.format_packet_data(0, dst) };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -596,6 +629,7 @@ impl Tunn {
 
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        // TODO: Fix this with encapsulate without peer ???
         if let Some(packet) = self.dequeue_packet() {
             match self.encapsulate(&packet, dst) {
                 TunnResult::Err(_) => {
