@@ -45,6 +45,7 @@ nix = { version = "0.29", default-features = false, features = [
     "ioctl",
     "time",
     "user",
+    "socket",
 ] }
 
 [dev-dependencies]

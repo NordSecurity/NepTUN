@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::device::{modify_skt_buffer_size, AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -148,7 +148,7 @@ impl Peer {
         endpoint.conn = Some(udp_conn.try_clone().unwrap());
 
         if let Some(buffer_size) = skt_buffer_size {
-            modify_skt_buffer_size(udp_conn.as_raw_fd(), buffer_size);
+            modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
         }
 
         Ok(udp_conn)

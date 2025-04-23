@@ -26,11 +26,12 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
+use nix::sys::socket as NixSocket;
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter};
 use std::mem::{swap, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, BorrowedFd, RawFd};
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,7 +48,6 @@ use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
-use tracing::{debug, warn};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -315,7 +315,7 @@ impl DeviceHandle {
                         // Because the event loop is stopped now, this is safe (see clear_event_by_fd() comment)
                         let unregister_ok: bool = unsafe { device.queue.clear_event_by_fd(fd) };
                         if !unregister_ok {
-                            warn!(
+                            tracing::warn!(
                                 "Failed to clear events handler for fd {fd} and name: {:?}",
                                 device.iface.name()
                             )
@@ -438,22 +438,21 @@ impl Drop for DeviceHandle {
     }
 }
 
-fn modify_skt_buffer_size(socket: i32, buffer_size: u32) {
-    for buffer in vec![libc::SO_RCVBUF, libc::SO_SNDBUF] {
-        let res = unsafe {
-            libc::setsockopt(
-                socket,
-                libc::SOL_SOCKET,
-                buffer,
-                &buffer_size as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&buffer_size) as libc::socklen_t,
-            )
-        };
-        match res {
-            0 => tracing::debug!("Socket buffer {buffer} set"),
-            _ => tracing::error!("Socket buffer {buffer} failed with {res}"),
-        }
+fn set_sock_opt<T: NixSocket::SetSockOpt<Val = usize>>(
+    socket: BorrowedFd<'_>,
+    buffer: T,
+    buffer_size: u32,
+    buffer_name: &str,
+) {
+    match NixSocket::setsockopt(&socket, buffer, &(buffer_size as usize)) {
+        Ok(()) => tracing::info!("Socket buffer {buffer_name:?} set with value {buffer_size}"),
+        Err(e) => tracing::warn!("Socket buffer {buffer_name:?} failed with {e}"),
     }
+}
+
+fn modify_skt_buffer_size(socket: BorrowedFd<'_>, buffer_size: u32) {
+    set_sock_opt(socket, NixSocket::sockopt::RcvBuf, buffer_size, "RcvBuf");
+    set_sock_opt(socket, NixSocket::sockopt::SndBuf, buffer_size, "SndBuf");
 }
 
 impl Device {
@@ -666,8 +665,8 @@ impl Device {
 
         if let Some(buffer_size) = self.config.skt_buffer_size {
             // Modify IPv4 IPv6 snd and recv buffers
-            modify_skt_buffer_size(udp_sock4.as_raw_fd(), buffer_size);
-            modify_skt_buffer_size(udp_sock6.as_raw_fd(), buffer_size);
+            modify_skt_buffer_size(udp_sock4.as_fd(), buffer_size);
+            modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
@@ -1294,25 +1293,13 @@ mod tests {
         let _res = socket.set_reuse_address(true);
         let _res = socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into());
 
-        let mut buffer_size = 11111;
-        modify_skt_buffer_size(socket.as_raw_fd(), buffer_size);
+        const BUFFER_SIZE: u32 = 11111;
+        modify_skt_buffer_size(socket.as_fd(), BUFFER_SIZE);
 
-        let mut get_buf = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        unsafe {
-            let _res = libc::getsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &mut get_buf as *mut _ as *mut libc::c_void,
-                &mut len,
-            );
-        }
+        let get_buf = NixSocket::getsockopt(&socket.as_fd(), NixSocket::sockopt::RcvBuf).unwrap();
 
         // According to `man 7 socket` linux doubles the buffer size
         // internally as it assumes half is for internal kernel structures
-        buffer_size *= 2;
-
-        assert!(get_buf == buffer_size);
+        assert!(get_buf == (BUFFER_SIZE * 2) as usize);
     }
 }
