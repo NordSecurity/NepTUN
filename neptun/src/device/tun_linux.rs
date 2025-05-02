@@ -6,12 +6,13 @@ use super::Error;
 use libc::{
     self, __c_anonymous_ifr_ifru, c_char, c_short, close, fcntl, ifreq, open, read, socket, write,
     AF_INET, F_GETFL, F_SETFL, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, IFNAMSIZ, IF_NAMESIZE,
-    IPPROTO_IP, O_NONBLOCK, O_RDWR, SIOCGIFMTU, SOCK_STREAM,
+    IPPROTO_IP, O_NONBLOCK, O_RDWR, SIOCGIFMTU, SOCK_STREAM, iovec, recvmsg, msghdr
 };
 use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::error;
+use std::ptr::null_mut;
 
 #[cfg(target_os = "linux")]
 mod tun_interface_flags {
@@ -195,9 +196,38 @@ impl TunSocket {
     }
 
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
-        match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
+        // match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
+        //     -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
+        //     n => Ok(&mut dst[..n as usize]),
+        // }
+
+        let mut hdr = [0u8; 4];
+
+        let mut iov = [
+            iovec {
+                iov_base: hdr.as_mut_ptr() as _,
+                iov_len: hdr.len(),
+            },
+            iovec {
+                iov_base: dst.as_mut_ptr() as _,
+                iov_len: dst.len(),
+            },
+        ];
+
+        let mut msg_hdr = msghdr {
+            msg_name: null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov[0],
+            msg_iovlen: iov.len() as _,
+            msg_control: null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+
+        match unsafe { recvmsg(self.fd, &mut msg_hdr, 0) } {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
-            n => Ok(&mut dst[..n as usize]),
+            0..=4 => Ok(&mut dst[..0]),
+            n => Ok(&mut dst[..(n - 4) as usize]),
         }
     }
 }
