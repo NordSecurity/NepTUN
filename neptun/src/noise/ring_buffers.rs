@@ -1,8 +1,8 @@
-use super::Endpoint;
+use crate::device::peer::Peer;
 use once_cell::sync::Lazy;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::sync::Arc;
-const UDP_SIZE: usize = 2048;
+const UDP_SIZE: usize = 1600;
 
 pub const RB_SIZE: usize = 500;
 
@@ -29,7 +29,7 @@ impl<T> RingBuffer<T> {
 pub struct EncryptionTaskData {
     pub data: [u8; UDP_SIZE],
     pub buf_len: usize,
-    pub endpoint: Arc<RwLock<Endpoint>>,
+    pub peer: Option<Arc<Peer>>,
     pub is_element_free: bool,
 }
 
@@ -39,7 +39,7 @@ pub static mut TX_RING_BUFFER: Lazy<RingBuffer<Mutex<EncryptionTaskData>>> = Laz
         deque.push(Mutex::new(EncryptionTaskData {
             data: [0; UDP_SIZE],
             buf_len: 0,
-            endpoint: Arc::default(),
+            peer: None,
             is_element_free: true,
         }));
     }

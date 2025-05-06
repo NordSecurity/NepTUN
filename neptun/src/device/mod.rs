@@ -61,8 +61,6 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100_000; // Number of packets to handle per handler call
 
-// const DELAY: Option<Duration> = Duration::from_secs(61).checked_sub(Duration::from_millis(10));
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("i/o error: {0}")]
@@ -476,7 +474,7 @@ impl Device {
         if let Some(peer) = self.peers.remove(pub_key) {
             // Found a peer to remove, now purge all references to it:
             {
-                Peer::shutdown_endpoint(peer.endpoint_ref()); // close open udp socket and free the closure
+                peer.shutdown_endpoint(); // close open udp socket and free the closure
                 self.peers_by_idx.remove(&peer.index());
             }
             self.peers_by_ip
@@ -652,6 +650,7 @@ impl Device {
         if let Some(s) = self.udp4.take() {
             // Need to handle this error
             let _ = self.close_network_chan_tx.send(());
+            let _ = self.close_network_chan_tx.send(());
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -663,7 +662,7 @@ impl Device {
         }
 
         for peer in self.peers.values() {
-            Peer::shutdown_endpoint(peer.endpoint_ref());
+            peer.shutdown_endpoint();
         }
 
         // Then open new sockets and bind to the port
@@ -701,7 +700,12 @@ impl Device {
         // Send to network in a seperate thread
         let rx_clone = self.network_rx.clone();
         let close_chan_clone = self.close_network_chan_rx.clone();
+        let udp4_c = udp4.clone();
+        let udp6_c = udp6.clone();
         thread::spawn(move || send_to_network(rx_clone, close_chan_clone, udp4, udp6));
+        let rx_clone = self.network_rx.clone();
+        let close_chan_clone = self.close_network_chan_rx.clone();
+        thread::spawn(move || send_to_network(rx_clone, close_chan_clone, udp4_c, udp6_c));
 
         self.listen_port = port;
 
@@ -828,7 +832,7 @@ impl Device {
                     match res {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            Peer::shutdown_endpoint(peer.endpoint_ref()); // close open udp socket
+                            peer.shutdown_endpoint(); // close open udp socket
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -870,7 +874,7 @@ impl Device {
             let endpoint = peer.endpoint();
             if endpoint.conn.is_some() {
                 drop(endpoint);
-                Peer::shutdown_endpoint(peer.endpoint_ref());
+                peer.shutdown_endpoint();
             }
         }
     }
@@ -1184,39 +1188,14 @@ impl Device {
                         };
 
                         let peer = match peers.find(dst_addr) {
-                            Some(peer) => peer,
+                            Some(peer) => peer.clone(),
                             None => continue,
                         };
 
-                        if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                            if !callback(&peer.public_key.0, &element.data[16..len + 16]) {
-                                continue;
-                            }
-                        }
-
-                        let res = {
-                            element.is_element_free = false;
-                            let mut tun = peer.tunnel.lock();
-                            tun.encapsulate_in_place(len, &mut element.data[..])
-                        };
-
-                        match res {
-                            TunnResult::Done => {
-                                element.is_element_free = true;
-                            }
-                            TunnResult::Err(e) => {
-                                element.is_element_free = true;
-                                tracing::error!(message = "Encapsulate error",
-                                    error = ?e,
-                                    public_key = peer.public_key.1)
-                            }
-                            TunnResult::WriteToNetwork(packet) => {
-                                element.buf_len = packet.len();
-                                element.endpoint = peer.endpoint_ref();
-                                let _ = d.network_tx.send(block);
-                            }
-                            _ => panic!("Unexpected result from encapsulate"),
-                        };
+                        element.buf_len = len;
+                        element.is_element_free = false;
+                        element.peer = Some(peer.clone());
+                        let _ = d.network_tx.send(block);
                     }
                 }
                 Action::Continue
@@ -1236,56 +1215,59 @@ fn send_to_network(
     udp4: Arc<Socket>,
     udp6: Arc<Socket>,
 ) {
-    // let mut success_pkts = 0;
-    // let mut dropped_pkts = 0;
-    // let mut now = Instant::now();
     loop {
         crossbeam::channel::select! {
                 recv(network_rx) -> m => {
                     if let Ok(d) = m {
-                    let mut msg = d.lock();
+                    let mut element = d.lock();
                     {
-                    let mut endpoint = msg.endpoint.write();
-                    let packet = &msg.data.as_slice()[..msg.buf_len];
-                    if let Some(conn) = endpoint.conn.as_mut() {
-                        // Prefer to send using the connected socket
-                        if conn.send(packet).is_err() {
-                            tracing::info!(message = "Failed to send packet with the connected socket");
-                            drop(endpoint);
-                            Peer::shutdown_endpoint(msg.endpoint.clone());
-                            // dropped_pkts += 1;
-                        }
-                        // else {
-                        //     success_pkts += 1;
-                        //     tracing::trace!(
-                        //         "Pkt -> ConnSock ({:?}), len: {}",
-                        //         endpoint.addr,
-                        //         packet.len(),
-                        //     );
-                        // }
-                    } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                        if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                            // dropped_pkts += 1;
-                            tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                        }
-                        // else {
-                        //     success_pkts += 1;
-                        // }
-                    } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                        if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                            tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                        }
-                    } else {
-                        tracing::error!("No endpoint");
-                    }
-                    // if now.elapsed() > DELAY.unwrap() {
-                    //     info!("Success:{} - Drop:{}", success_pkts, dropped_pkts);
-                    //     now = Instant::now();
-                    //     success_pkts = 0;
-                    //     dropped_pkts = 0;
+                    let len = element.buf_len;
+                    let peer = element.peer.clone().unwrap();
+                    // Ignore this for now
+                    // if let Some(callback) = &d.config.firewall_process_outbound_callback {
+                    //     if !callback(&peer.public_key.0, &element.data[16..element.buf_len + 16]) {
+                    //         continue;
+                    //     }
                     // }
+
+                    let res = {
+                        let mut tun = peer.tunnel.lock();
+                        tun.encapsulate_in_place(len, &mut element.data[..])
+                    };
+
+                    match res {
+                        TunnResult::Done => {
+                        }
+                        TunnResult::Err(e) => {
+                            tracing::error!(message = "Encapsulate error",
+                                error = ?e,
+                                public_key = peer.public_key.1)
+                        }
+                        TunnResult::WriteToNetwork(packet) => {
+                            let endpoint = peer.endpoint();
+                            if let Some(conn) = endpoint.conn.as_ref() {
+                                // Prefer to send using the connected socket
+                                if conn.send(packet).is_err() {
+                                    tracing::info!(message = "Failed to send packet with the connected socket");
+                                    drop(endpoint);
+                                    peer.shutdown_endpoint();
+                                }
+                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                                if let Err(err) = udp4.send_to(packet, &addr.into()) {
+                                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+                                }
+                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                                if let Err(err) = udp6.send_to(packet, &addr.into()) {
+                                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
+                                }
+                            } else {
+                                tracing::error!("No endpoint");
+                            }
+                        }
+                        _ => panic!("Unexpected result from encapsulate"),
+                    };
+                    element.is_element_free = true;
                 }
-                    msg.is_element_free = true;
         }
         }
             recv(close_chan) -> _n => {
