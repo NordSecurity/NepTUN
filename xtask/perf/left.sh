@@ -74,10 +74,12 @@ do
     base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
     base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
 
+    sleep 2
     # Current NepTUN
     current_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
     current_output="$current_cmd"
-    ip -s link show dev wg2 | awk 'NR==6 {print "success:", $2, "drops:", $4}'
+    ip -s link show dev wg1 | awk 'NR==6 {print "tunnel - success:", $2, "drops:", $4}'
+    ip -s link show dev wg2 | awk 'NR==6 {print "tunnel - success:", $2, "drops:", $4}'
     current_total_datagrams=$(echo "$current_output" |  awk '{print $11}' | awk -F '/' '{print $2}')
     current_lost_datagrams=$(echo "$current_output" | awk '{print $11}' | awk -F '/' '{print $1}')
     current_lost_percentage=$(echo "$current_output" | awk '{print $12}')
@@ -92,5 +94,5 @@ do
     if [[ $value -gt 10 ]]; then
         exit 0
     fi
-    sleep 4
+    sleep 2
 done
