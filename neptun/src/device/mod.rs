@@ -9,6 +9,7 @@ pub mod drop_privileges;
 #[cfg(test)]
 mod integration_tests;
 pub mod peer;
+pub mod ring_buffers;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -40,7 +41,6 @@ use std::thread::{self, JoinHandle};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::ring_buffers::{EncryptionTaskData, RB_SIZE, TX_RING_BUFFER};
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -49,6 +49,7 @@ use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
+use ring_buffers::{EncryptionTaskData, RB_SIZE, TX_RING_BUFFER};
 use socket2::{Domain, Protocol, Socket, Type};
 use tracing::warn;
 use tun::TunSocket;
