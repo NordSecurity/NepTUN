@@ -21,7 +21,7 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,8 +51,7 @@ pub enum TunnResult<'a> {
     Done,
     Err(WireGuardError),
     WriteToNetwork(&'a mut [u8]),
-    WriteToTunnelV4(&'a mut [u8], Ipv4Addr),
-    WriteToTunnelV6(&'a mut [u8], Ipv6Addr),
+    WriteToTunnel(&'a mut [u8], IpAddr),
 }
 
 impl<'a> From<WireGuardError> for TunnResult<'a> {
@@ -359,7 +358,7 @@ impl Tunn {
                 };
 
                 match self.validate_decapsulated_packet(decapsulated_packet) {
-                    TunnResult::WriteToTunnelV4(p, _) => Ok(p),
+                    TunnResult::WriteToTunnel(p, _) => Ok(p),
                     TunnResult::Err(err) => Err(err),
                     _ => Err(WireGuardError::UnexpectedPacket),
                 }
@@ -588,10 +587,7 @@ impl Tunn {
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes += message_data_len(computed_len);
 
-        match src_ip_address {
-            IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
-            IpAddr::V6(addr) => TunnResult::WriteToTunnelV6(&mut packet[..computed_len], addr),
-        }
+        TunnResult::WriteToTunnel(&mut packet[..computed_len], src_ip_address)
     }
 
     /// Get a packet from the queue, and try to encapsulate it
@@ -1019,8 +1015,8 @@ mod tests {
         };
 
         let data = their_tun.decapsulate(None, data, &mut their_dst);
-        assert!(matches!(data, TunnResult::WriteToTunnelV4(..)));
-        let recv_packet_buf = if let TunnResult::WriteToTunnelV4(recv, _addr) = data {
+        assert!(matches!(data, TunnResult::WriteToTunnel(..)));
+        let recv_packet_buf = if let TunnResult::WriteToTunnel(recv, _addr) = data {
             recv
         } else {
             unreachable!();

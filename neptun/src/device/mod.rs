@@ -28,7 +28,7 @@ pub mod tun;
 
 use nix::sys::socket as NixSocket;
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
@@ -136,7 +136,7 @@ pub struct DeviceConfig {
     pub firewall_process_inbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
-        Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
+        Option<Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
     pub skt_buffer_size: Option<u32>,
 }
 
@@ -917,7 +917,7 @@ impl Device {
                                 tracing::warn!(message = "Failed to send packet", error = ?err, dst = ?addr);
                             }
                         }
-                        TunnResult::WriteToTunnelV4(packet, addr) => {
+                        TunnResult::WriteToTunnel(packet, addr) => {
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
                                 if !callback(&peer.public_key.0, packet) {
                                     continue;
@@ -925,26 +925,9 @@ impl Device {
                             }
 
                             if peer.is_allowed_ip(addr) {
-                                t.iface.write4(packet);
+                                _ = t.iface.as_ref().write(packet);
                                 tracing::trace!(
-                                    message = "Writing packet to tunnel v4",
-                                    interface = ?t.iface.name(),
-                                    packet_length = packet.len(),
-                                    src_addr = ?addr,
-                                    public_key = peer.public_key.1
-                                );
-                            }
-                        }
-                        TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
-                                    continue;
-                                }
-                            }
-                            if peer.is_allowed_ip(addr) {
-                                t.iface.write6(packet);
-                                tracing::trace!(
-                                    message = "Writing packet to tunnel v6",
+                                    message = "Writing packet to tunnel",
                                     interface = ?t.iface.name(),
                                     packet_length = packet.len(),
                                     src_addr = ?addr,
@@ -1047,33 +1030,16 @@ impl Device {
                                 tracing::warn!(message="Failed to write packet", error = ?err);
                             }
                         }
-                        TunnResult::WriteToTunnelV4(packet, addr) => {
+                        TunnResult::WriteToTunnel(packet, addr) => {
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
                                 if !callback(&peer.public_key.0, packet) {
                                     continue;
                                 }
                             }
                             if peer.is_allowed_ip(addr) {
-                                t.iface.write4(packet);
+                                _ = t.iface.as_ref().write(packet);
                                 tracing::trace!(
-                                    message = "Writing packet to tunnel v4",
-                                    interface = ?t.iface.name(),
-                                    packet_length = packet.len(),
-                                    src_addr = ?addr,
-                                    public_key = peer.public_key.1
-                                );
-                            }
-                        }
-                        TunnResult::WriteToTunnelV6(packet, addr) => {
-                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
-                                    continue;
-                                }
-                            }
-                            if peer.is_allowed_ip(addr) {
-                                t.iface.write6(packet);
-                                tracing::trace!(
-                                    message = "Writing packet to tunnel v6",
+                                    message = "Writing packet to tunnel",
                                     interface = ?t.iface.name(),
                                     packet_length = packet.len(),
                                     src_addr = ?addr,
@@ -1159,7 +1125,7 @@ impl Device {
 
 
                     if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                        if !callback(&peer.public_key.0, src) {
+                        if !callback(&peer.public_key.0, src, &mut t.iface.as_ref()) {
                             continue;
                         }
                     }

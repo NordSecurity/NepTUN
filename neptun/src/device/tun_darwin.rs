@@ -4,7 +4,7 @@
 
 use super::Error;
 use libc::*;
-use std::io;
+use std::io::{self, Write};
 use std::mem::size_of;
 use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -86,9 +86,29 @@ pub fn parse_utun_name(name: &str) -> Result<u32, Error> {
     }
 }
 
-impl TunSocket {
-    fn write(&self, src: &[u8], af: u8) -> usize {
-        let mut hdr = [0u8, 0u8, 0u8, af as u8];
+fn ip_version(src: &[u8]) -> io::Result<u8> {
+    match src.first().map(|b| b >> 4) {
+        Some(4) => Ok(AF_INET as u8),
+        Some(6) => Ok(AF_INET6 as u8),
+        _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
+impl Write for TunSocket {
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        (&*self).write(src)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+impl Write for &TunSocket {
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        let ip_version = ip_version(src)?;
+
+        let mut hdr = [0u8, 0u8, 0u8, ip_version];
         let mut iov = [
             iovec {
                 iov_base: hdr.as_mut_ptr() as _,
@@ -111,11 +131,17 @@ impl TunSocket {
         };
 
         match unsafe { sendmsg(self.fd, &msg_hdr, 0) } {
-            -1 => 0,
-            n => (n as usize).saturating_sub(hdr.len()),
+            -1 => Err(io::Error::last_os_error()),
+            n => Ok((n as usize).saturating_sub(hdr.len())),
         }
     }
 
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl TunSocket {
     pub fn new(name: &str) -> Result<TunSocket, Error> {
         let idx = parse_utun_name(name)?;
 
@@ -220,14 +246,6 @@ impl TunSocket {
         Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
     }
 
-    pub fn write4(&self, src: &[u8]) -> usize {
-        self.write(src, AF_INET as u8)
-    }
-
-    pub fn write6(&self, src: &[u8]) -> usize {
-        self.write(src, AF_INET6 as u8)
-    }
-
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
         let mut hdr = [0u8; 4];
 
@@ -257,5 +275,18 @@ impl TunSocket {
             0..=4 => Ok(&mut dst[..0]),
             n => Ok(&mut dst[..(n - 4) as usize]),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ip_version() {
+        assert!(ip_version(&[]).is_err());
+        assert!(ip_version(&[4]).is_err());
+        assert_eq!(ip_version(&[4 << 4]).unwrap(), AF_INET as u8);
+        assert_eq!(ip_version(&[6 << 4]).unwrap(), AF_INET6 as u8);
     }
 }

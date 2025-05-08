@@ -6,7 +6,6 @@ use libc::*;
 use parking_lot::Mutex;
 use std::io;
 use std::ops::Deref;
-use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
 use std::time::Duration;
