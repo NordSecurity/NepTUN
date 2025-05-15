@@ -86,5 +86,6 @@ jobs:
       - name: Upload coverage report
         uses: codecov/codecov-action@v5
         with:
-          files: lcov.txt
+          files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
