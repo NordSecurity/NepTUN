@@ -46,9 +46,53 @@ echo "Wireguard-go:"
 iperf3 -i 60 -t 120 --bidir -c 10.0.0.2
 
 echo
+echo "TCP bidirectional tests"
+
+echo
 echo "Base NepTUN:"
 iperf3 -i 60 -t 120 --bidir -c 10.0.1.2
 
 echo
 echo "Current NepTUN:"
 iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
+
+sleep 1
+echo
+echo "UDP unidirectional tests"
+
+bitrates=(500M 800M 1000M 1500M 1800M 2000M 2200M 2500M)
+
+for bitrate in "${bitrates[@]}"
+do
+    echo
+    echo "Running test for bitrate: $bitrate"
+    # Base NepTUN
+    base_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    base_output="$base_cmd"
+    base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
+    base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
+    base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
+    base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
+
+    sleep 2
+    # Current NepTUN
+    current_cmd=$(iperf3 -i 60 -t 120 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
+    current_output="$current_cmd"
+    ip -s link show dev wg1 | awk 'NR==6 {print "Base tunnel - success:", $2, "drops:", $4}'
+    ip -s link show dev wg2 | awk 'NR==6 {print "Current tunnel - success:", $2, "drops:", $4}'
+    current_total_datagrams=$(echo "$current_output" |  awk '{print $11}' | awk -F '/' '{print $2}')
+    current_lost_datagrams=$(echo "$current_output" | awk '{print $11}' | awk -F '/' '{print $1}')
+    current_lost_percentage=$(echo "$current_output" | awk '{print $12}')
+    current_bitrate=$(echo "$current_output" | awk '{print $7 " " $8}')
+
+    # Print results
+    echo "Connection       | Total Datagrams | Lost   |  (%) | Received Bitrate"
+    echo "Base NepTUN      | $base_total_datagrams         | $base_lost_datagrams | $base_lost_percentage  | $base_bitrate "
+    echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
+
+    value=$(echo "$current_lost_percentage" | awk '{gsub(/[^0-9.]/, ""); print $0}')
+    if [[ $value -gt 10 ]]; then
+        exit 0
+    fi
+    sleep 2
+done
