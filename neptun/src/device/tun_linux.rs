@@ -13,19 +13,12 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::error;
 
-#[cfg(target_os = "linux")]
 mod tun_interface_flags {
     use super::*;
     use libc::{TUNGETIFF, TUNSETIFF};
     ioctl_read_bad!(get, TUNGETIFF, ifreq);
+    #[cfg(target_os = "linux")]
     ioctl_write_ptr_bad!(set, TUNSETIFF, ifreq);
-}
-
-#[cfg(target_os = "android")]
-mod tun_interface_flags {
-    use super::*;
-    const TUNGETIFF: u64 = 0x8004_54D2;
-    ioctl_read_bad!(get, TUNGETIFF, ifreq);
 }
 
 ioctl_read_bad!(get_interface_mtu, SIOCGIFMTU, ifreq);
