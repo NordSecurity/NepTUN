@@ -127,7 +127,7 @@ pub struct DeviceHandle {
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     threads: (dispatch::Group, Vec<dispatch::Queue>),
-    fds_for_tun: Arc<Lock<Vec<RawFd>>>,
+    sockets_to_close: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
 
 #[derive(Clone)]
@@ -207,12 +207,12 @@ impl Default for EncryptionTaskData {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<RawFd>>>), Error>;
+type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<Arc<TunSocket>>>>), Error>;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type EventLoopThreads = Result<
     (
         (dispatch::Group, Vec<dispatch::Queue>),
-        Arc<Lock<Vec<RawFd>>>,
+        Arc<Lock<Vec<Arc<TunSocket>>>>,
     ),
     Error,
 >;
@@ -229,13 +229,13 @@ impl DeviceHandle {
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
-        let (threads, fds_for_tun) =
+        let (threads, sockets_to_close) =
             Self::start_event_loop_threads(n_threads, interface_lock.clone())?;
 
         Ok(DeviceHandle {
             device: interface_lock,
             threads,
-            fds_for_tun,
+            sockets_to_close,
         })
     }
 
@@ -243,7 +243,7 @@ impl DeviceHandle {
         n_threads: usize,
         interface_lock: Arc<Lock<Device>>,
     ) -> EventLoopThreads {
-        let fds_for_tun = Arc::new(Lock::new(vec![]));
+        let sockets_to_close = Arc::new(Lock::new(vec![]));
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let threads = {
             let group = dispatch::Group::create();
@@ -252,9 +252,9 @@ impl DeviceHandle {
                 queues.push({
                     let dev = Arc::clone(&interface_lock);
                     let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
-                    fds_for_tun
+                    sockets_to_close
                         .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
                     let group_clone = group.clone();
                     let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
                     queue.exec_async(move || {
@@ -274,9 +274,9 @@ impl DeviceHandle {
                 threads.push({
                     let dev = Arc::clone(&interface_lock);
                     let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
-                    fds_for_tun
+                    sockets_to_close
                         .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
                     thread::Builder::new()
                         .name(format!("neptun"))
                         .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
@@ -285,7 +285,7 @@ impl DeviceHandle {
             threads
         };
 
-        Ok((threads, fds_for_tun))
+        Ok((threads, sockets_to_close))
     }
 
     pub fn send_uapi_cmd(&self, cmd: &str) -> String {
@@ -339,22 +339,21 @@ impl DeviceHandle {
             .try_writeable(
                 |device| device.trigger_yield(),
                 |device| -> Result<(), Error> {
-                    let fds_to_unregister = self.fds_for_tun.read().clone();
-                    for fd in fds_to_unregister {
+                    let sockets_to_close = self.sockets_to_close.read().clone();
+                    for tun_socket in sockets_to_close {
                         // Because the event loop is stopped now, this is safe (see clear_event_by_fd() comment)
-                        let unregister_ok: bool = unsafe { device.queue.clear_event_by_fd(fd) };
+                        let unregister_ok: bool =
+                            unsafe { device.queue.clear_event_by_fd(tun_socket.as_raw_fd()) };
                         if !unregister_ok {
                             tracing::warn!(
-                                "Failed to clear events handler for fd {fd} and name: {:?}",
+                                "Failed to clear events handler for fd {tun_socket:?} and name: {:?}",
                                 device.iface.name()
                             )
                         }
 
-                        unsafe {
-                            // This will trigger the exit condition in the event_loop running on a different thread
-                            // for this file descriptor.
-                            libc::close(fd);
-                        }
+                        // This will trigger the exit condition in the event_loop running on a different thread
+                        // for this file descriptor.
+                        tun_socket.force_close();
                     }
 
                     (device.update_seq, _) = device.update_seq.overflowing_add(1);
@@ -366,12 +365,12 @@ impl DeviceHandle {
                 },
             )
             .ok_or(Error::SetTunnel)??;
-        let (threads, fds_for_tun) = DeviceHandle::start_event_loop_threads(
+        let (threads, sockets_to_close) = DeviceHandle::start_event_loop_threads(
             self.device.read().config.n_threads,
             self.device.clone(),
         )?;
         self.threads = threads;
-        self.fds_for_tun = fds_for_tun;
+        self.sockets_to_close = sockets_to_close;
         Ok(())
     }
 
