@@ -37,6 +37,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use tracing::{debug, trace};
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
@@ -297,6 +298,7 @@ impl DeviceHandle {
     }
 
     pub fn set_iface(&mut self, new_iface: TunSocket) -> Result<(), Error> {
+        trace!("new_iface: {new_iface:?}");
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safelly cleared.
         // See clear_event_by_fd() function description
@@ -324,6 +326,7 @@ impl DeviceHandle {
                         unsafe {
                             // This will trigger the exit condition in the event_loop running on a different thread
                             // for this file descriptor.
+                            debug!(message = "Closing file descriptor", fd = fd);
                             libc::close(fd);
                         }
                     }
@@ -399,6 +402,10 @@ impl DeviceHandle {
             src_buf: [0u8; MAX_UDP_SIZE],
             dst_buf: [0u8; MAX_UDP_SIZE],
             iface: if _thread_id == 0 || !device_lock.config.use_multi_queue {
+                debug!(
+                    "Thread {_thread_id} will reuse the fd {:?}",
+                    device_lock.iface
+                );
                 // For the first thread use the original iface
                 Arc::clone(&device_lock.iface)
             } else {
@@ -409,6 +416,7 @@ impl DeviceHandle {
                         .set_non_blocking()
                         .unwrap(),
                 );
+                debug!("Thread {_thread_id} will use a new fd: {:?}", iface_local);
 
                 device_lock
                     .register_iface_handler(Arc::clone(&iface_local))
