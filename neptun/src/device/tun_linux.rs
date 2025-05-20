@@ -12,7 +12,7 @@ use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicBool;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 mod tun_interface_flags {
     use super::*;
@@ -221,10 +221,10 @@ impl TunSocket {
         };
 
         if !was_already_closed {
-            trace!("Will close fd: {:?} in drop of TunSocket", self.fd);
+            debug!("Will close fd: {:?}", self.fd); // TODO: make it trace before merge
             unsafe { close(self.fd) };
         } else {
-            trace!("Skipping close fd: {:?} in drop of TunSocket", self.fd);
+            debug!("Skipping closing of fd: {:?}", self.fd); // TODO: make it trace before merge
         }
     }
 }
