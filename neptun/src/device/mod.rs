@@ -123,7 +123,7 @@ pub struct DeviceHandle {
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     threads: (dispatch::Group, Vec<dispatch::Queue>),
-    fds_for_tun: Arc<Lock<Vec<RawFd>>>,
+    fds_for_tun: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
 
 #[derive(Clone)]
@@ -179,12 +179,12 @@ struct ThreadData {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<RawFd>>>), Error>;
+type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<Arc<TunSocket>>>>), Error>;
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type EventLoopThreads = Result<
     (
         (dispatch::Group, Vec<dispatch::Queue>),
-        Arc<Lock<Vec<RawFd>>>,
+        Arc<Lock<Vec<Arc<TunSocket>>>>,
     ),
     Error,
 >;
@@ -226,7 +226,7 @@ impl DeviceHandle {
                     let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
                     fds_for_tun
                         .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
                     let group_clone = group.clone();
                     let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
                     queue.exec_async(move || {
@@ -248,7 +248,7 @@ impl DeviceHandle {
                     let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
                     fds_for_tun
                         .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.as_raw_fd()));
+                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
                     thread::Builder::new()
                         .name(format!("neptun"))
                         .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
@@ -298,7 +298,7 @@ impl DeviceHandle {
     }
 
     pub fn set_iface(&mut self, new_iface: TunSocket) -> Result<(), Error> {
-        trace!("new_iface: {new_iface:?}");
+        debug!("new_iface: {new_iface:?}");
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safelly cleared.
         // See clear_event_by_fd() function description
@@ -313,22 +313,21 @@ impl DeviceHandle {
                 |device| device.trigger_yield(),
                 |device| -> Result<(), Error> {
                     let fds_to_unregister = self.fds_for_tun.read().clone();
-                    for fd in fds_to_unregister {
+                    for tun_socket in fds_to_unregister {
                         // Because the event loop is stopped now, this is safe (see clear_event_by_fd() comment)
-                        let unregister_ok: bool = unsafe { device.queue.clear_event_by_fd(fd) };
+                        let unregister_ok: bool =
+                            unsafe { device.queue.clear_event_by_fd(tun_socket.as_raw_fd()) };
                         if !unregister_ok {
                             tracing::warn!(
-                                "Failed to clear events handler for fd {fd} and name: {:?}",
+                                "Failed to clear events handler for fd {tun_socket:?} and name: {:?}",
                                 device.iface.name()
                             )
                         }
 
-                        unsafe {
-                            // This will trigger the exit condition in the event_loop running on a different thread
-                            // for this file descriptor.
-                            debug!(message = "Closing file descriptor", fd = fd);
-                            libc::close(fd);
-                        }
+                        // This will trigger the exit condition in the event_loop running on a different thread
+                        // for this file descriptor.
+                        debug!(message = "Closing file descriptor", fd = tun_socket.as_raw_fd());
+                        tun_socket.force_close();
                     }
 
                     (device.update_seq, _) = device.update_seq.overflowing_add(1);
