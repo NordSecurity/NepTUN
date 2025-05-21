@@ -9,7 +9,7 @@ use libc::{
     IPPROTO_IP, O_NONBLOCK, O_RDWR, SIOCGIFMTU, SOCK_STREAM,
 };
 use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use tracing::error;
 
@@ -41,14 +41,30 @@ impl AsRawFd for TunSocket {
     }
 }
 
-impl TunSocket {
-    fn write(&self, src: &[u8]) -> usize {
+impl Write for TunSocket {
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        (&*self).write(src)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
+    }
+}
+
+impl Write for &TunSocket {
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
         match unsafe { write(self.fd, src.as_ptr() as _, src.len()) } {
-            -1 => 0,
-            n => n as usize,
+            -1 => Err(io::Error::last_os_error()),
+            n => Ok(n as usize),
         }
     }
 
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl TunSocket {
     pub fn new(name: &str) -> Result<TunSocket, Error> {
         // If the provided name appears to be a FD, use that.
         let provided_fd = name.parse::<i32>();
@@ -177,14 +193,6 @@ impl TunSocket {
         unsafe { close(fd) };
 
         Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
-    }
-
-    pub fn write4(&self, src: &[u8]) -> usize {
-        self.write(src)
-    }
-
-    pub fn write6(&self, src: &[u8]) -> usize {
-        self.write(src)
     }
 
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {

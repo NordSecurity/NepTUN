@@ -184,7 +184,7 @@ impl Client {
                     self.sock.send_to(p, from).await?;
                     bytes_read = 0;
                 }
-                TunnResult::WriteToTunnelV4(p, _) => {
+                TunnResult::WriteToTunnel(p, _) => {
                     let (_, payload_start, payload_end) = Self::parse_udp_packet(p)?;
                     assert!(buf.len() >= payload_end - payload_start);
                     buf[0..payload_end - payload_start]
