@@ -44,6 +44,8 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+use crossbeam_channel::{Receiver, Sender};
+use num_cpus;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -56,7 +58,10 @@ use thiserror::Error;
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
-const MAX_ITR: usize = 100; // Number of packets to handle per handler call
+const MAX_ITR: usize = 100;
+const PKT_SIZE: usize = 1600;
+const CHANNEL_SIZE: usize = 500;
+const WG_HEADER_OFFSET: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -150,8 +155,8 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
-    udp4: Option<socket2::Socket>,
-    udp6: Option<socket2::Socket>,
+    udp4: Option<Arc<socket2::Socket>>,
+    udp6: Option<Arc<socket2::Socket>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -168,6 +173,12 @@ pub struct Device {
     mtu: AtomicUsize,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    close_network_worker_tx: Sender<()>,
+    close_network_worker_rx: Receiver<()>,
+
+    network_rx: Receiver<EncryptionTaskData>,
+    network_tx: Sender<EncryptionTaskData>,
 }
 
 struct ThreadData {
@@ -175,6 +186,24 @@ struct ThreadData {
     src_buf: [u8; MAX_UDP_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
     update_seq: u32,
+}
+
+struct EncryptionTaskData {
+    data: [u8; PKT_SIZE],
+    buf_len: usize,
+    peer: Option<Arc<Peer>>,
+    iface: Option<Arc<TunSocket>>,
+}
+
+impl Default for EncryptionTaskData {
+    fn default() -> Self {
+        EncryptionTaskData {
+            data: [0; PKT_SIZE],
+            buf_len: 0,
+            peer: None,
+            iface: None,
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -585,6 +614,9 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
+        let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
+        let (close_network_worker_tx, close_network_worker_rx) =
+            crossbeam_channel::bounded(num_cpus::get_physical());
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -605,6 +637,10 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            network_tx,
+            network_rx,
+            close_network_worker_tx,
+            close_network_worker_rx,
             update_seq: 0,
         };
 
@@ -631,6 +667,11 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
+            for _ in 0..num_cpus::get_physical() {
+                if let Err(e) = self.close_network_worker_tx.send(()) {
+                    tracing::error!("Unable to close network thread {e}");
+                }
+            }
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -671,8 +712,27 @@ impl Device {
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
         self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
+
+        let udp4 = Arc::new(udp_sock4);
+        let udp6 = Arc::new(udp_sock6);
+        self.udp4 = Some(udp4.clone());
+        self.udp6 = Some(udp6.clone());
+
+        // Process packet in a seperate thread
+        for _ in 0..num_cpus::get_physical() {
+            let rx_clone = self.network_rx.clone();
+            let close_chan_clone = self.close_network_worker_rx.clone();
+            let udp4_c = udp4.clone();
+            let udp6_c = udp6.clone();
+            let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
+                Some(f.clone())
+            } else {
+                None
+            };
+            thread::spawn(move || {
+                network_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+            });
+        }
 
         self.listen_port = port;
 
@@ -1088,13 +1148,13 @@ impl Device {
                 // * Send encapsulated packet to the peer's endpoint
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
-                let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
-
                 let peers = &d.peers_by_ip;
-                for _ in 0..MAX_ITR {
-                    let src = match iface.read(&mut t.src_buf[..mtu]) {
-                        Ok(src) => src,
+                loop {
+                    let mut element = EncryptionTaskData::default();
+                    let len = match iface
+                        .read(&mut element.data[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET])
+                    {
+                        Ok(src) => src.len(),
                         Err(Error::IfaceRead(e)) => {
                             let ek = e.kind();
                             if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
@@ -1113,7 +1173,9 @@ impl Device {
                         }
                     };
 
-                    let dst_addr = match Tunn::dst_address(src) {
+                    let dst_addr = match Tunn::dst_address(
+                        &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET],
+                    ) {
                         Some(addr) => addr,
                         None => continue,
                     };
@@ -1123,16 +1185,56 @@ impl Device {
                         None => continue,
                     };
 
+                    element.buf_len = len;
+                    element.peer = Some(peer.clone());
+                    element.iface = Some(t.iface.clone());
+                    if let Err(e) = d.network_tx.send(element) {
+                        tracing::warn!("Unable to forward data onto network worker {e}");
+                    }
+                }
+                Action::Continue
+            }),
+        )?;
+        Ok(())
+    }
 
-                    if let Some(callback) = &d.config.firewall_process_outbound_callback {
-                        if !callback(&peer.public_key.0, src, &mut t.iface.as_ref()) {
-                            continue;
+    pub fn iface(&self) -> &TunSocket {
+        &self.iface
+    }
+}
+
+fn network_worker(
+    network_rx: Receiver<EncryptionTaskData>,
+    close_chan: Receiver<()>,
+    udp4: Arc<socket2::Socket>,
+    udp6: Arc<socket2::Socket>,
+    firewall_process_outbound_callback: Option<
+        Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
+    >,
+) {
+    loop {
+        crossbeam_channel::select! {
+            recv(network_rx) -> element => {
+                if let Ok(mut element) = element {
+                    let len = element.buf_len;
+                    let peer = if let Some(p) = element.peer.clone() {
+                        p
+                    } else {
+                        tracing::error!("Empty peer");
+                        continue;
+                    };
+
+                    if let Some(callback) = &firewall_process_outbound_callback {
+                        if let Some(i) = element.iface {
+                            if !callback(&peer.public_key.0, &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET], &mut i.as_ref()) {
+                                continue;
+                            }
                         }
                     }
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
-                        tun.encapsulate(src, &mut t.dst_buf[..])
+                        tun.encapsulate_in_place(len, &mut element.data[..])
                     };
                     match res {
                         TunnResult::Done => {}
@@ -1151,10 +1253,9 @@ impl Device {
                                     peer.shutdown_endpoint();
                                 } else {
                                     tracing::trace!(
-                                        "Pkt -> ConnSock ({:?}), len: {}, dst_addr: {}",
+                                        "Pkt -> ConnSock ({:?}), len: {}",
                                         endpoint.addr,
                                         packet.len(),
-                                        dst_addr
                                     );
                                 }
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
@@ -1163,7 +1264,6 @@ impl Device {
                                 } else {
                                     tracing::trace!(
                                         message = "Writing packet to network v4",
-                                        interface = ?t.iface.name(),
                                         packet_length = packet.len(),
                                         src_addr = ?addr,
                                         public_key = peer.public_key.1
@@ -1175,7 +1275,6 @@ impl Device {
                                 } else {
                                     tracing::trace!(
                                         message = "Writing packet to network v6",
-                                        interface = ?t.iface.name(),
                                         packet_length = packet.len(),
                                         src_addr = ?addr,
                                         public_key = peer.public_key.1
@@ -1188,14 +1287,11 @@ impl Device {
                         _ => panic!("Unexpected result from encapsulate"),
                     };
                 }
-                Action::Continue
-            }),
-        )?;
-        Ok(())
-    }
-
-    pub fn iface(&self) -> &TunSocket {
-        &self.iface
+            }
+            recv(close_chan) -> _n => {
+                break;
+            }
+        }
     }
 }
 
