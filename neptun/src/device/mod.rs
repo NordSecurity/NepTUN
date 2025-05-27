@@ -1068,92 +1068,96 @@ impl Device {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
-                let mut iter = MAX_ITR;
+                // let mut iter = MAX_ITR;
 
-                // Safety: the `recv_from` implementation promises not to write uninitialised
-                // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-
-                while let Ok(read_bytes) = udp.recv(src_buf) {
+                for _ in 0..MAX_ITR {
                     let mut element = EncryptionTaskData::default();
-                    element.buf_len = read_bytes.clone();
-                    element.peer = Some(peer.clone());
-                    element.peer_addr = Some(peer_addr.clone());
-                    element.iface = Some(t.iface.clone());
-                    element.data[..read_bytes].copy_from_slice(&t.src_buf[..read_bytes]);
-                    if let Err(e) = d.tunnel_tx.send(element) {
-                        tracing::warn!("Unable to forward data onto network worker {e}");
-                    }
-                    // let mut flush = false;
+                    // Safety: the `recv_from` implementation promises not to write uninitialised
+                    // bytes to the buffer, so this casting is safe.
+                    let src_buf = unsafe {
+                        &mut *(&mut element.data[..] as *mut [u8] as *mut [MaybeUninit<u8>])
+                    };
 
-                    // let res = {
-                    //     let mut tun = peer.tunnel.lock();
-                    //     tun.decapsulate(
-                    //         Some(peer_addr),
-                    //         &t.src_buf[..read_bytes],
-                    //         &mut t.dst_buf[..],
-                    //     )
-                    // };
+                    if let Ok(read_bytes) = udp.recv(src_buf) {
+                        element.buf_len = read_bytes.clone();
+                        element.peer = Some(peer.clone());
+                        element.peer_addr = Some(peer_addr.clone());
+                        element.iface = Some(t.iface.clone());
+                        if let Err(e) = d.tunnel_tx.send(element) {
+                            tracing::warn!("Unable to forward data onto network worker {e}");
+                        }
+                        // let mut flush = false;
 
-                    // match res {
-                    //     TunnResult::Done => {}
-                    //     TunnResult::Err(e) => match e {
-                    //         WireGuardError::DuplicateCounter => {
-                    //             // TODO(LLT-6071): revert back to having error level for all error types
-                    //             tracing::debug!(message="Decapsulate error",
-                    //                 error=?e,
-                    //                 public_key=peer.public_key.1)
-                    //         }
-                    //         _ => {
-                    //             tracing::error!(message="Decapsulate error",
-                    //                 error=?e,
-                    //                 public_key = peer.public_key.1)
-                    //         }
-                    //     },
-                    //     TunnResult::WriteToNetwork(packet) => {
-                    //         flush = true;
-                    //         if let Err(err) = udp.send(packet) {
-                    //             tracing::warn!(message="Failed to write packet", error = ?err);
-                    //         }
-                    //     }
-                    //     TunnResult::WriteToTunnel(packet, addr) => {
-                    //         if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                    //             if !callback(&peer.public_key.0, packet) {
-                    //                 continue;
-                    //             }
-                    //         }
-                    //         if peer.is_allowed_ip(addr) {
-                    //             _ = t.iface.as_ref().write(packet);
-                    //             tracing::trace!(
-                    //                 message = "Writing packet to tunnel",
-                    //                 interface = ?t.iface.name(),
-                    //                 packet_length = packet.len(),
-                    //                 src_addr = ?addr,
-                    //                 public_key = peer.public_key.1
-                    //             );
-                    //         }
-                    //     }
-                    // };
+                        // let res = {
+                        //     let mut tun = peer.tunnel.lock();
+                        //     tun.decapsulate(
+                        //         Some(peer_addr),
+                        //         &t.src_buf[..read_bytes],
+                        //         &mut t.dst_buf[..],
+                        //     )
+                        // };
 
-                    // if flush {
-                    //     // Flush pending queue
-                    //     loop {
-                    //         let res = {
-                    //             let mut tun = peer.tunnel.lock();
-                    //             tun.decapsulate(None, &[], &mut t.dst_buf[..])
-                    //         };
-                    //         let TunnResult::WriteToNetwork(packet) = res else {
-                    //             break;
-                    //         };
-                    //         if let Err(err) = udp.send(packet) {
-                    //             tracing::warn!(message="Failed to flush queue", error = ?err);
-                    //         }
-                    //     }
-                    // }
+                        // match res {
+                        //     TunnResult::Done => {}
+                        //     TunnResult::Err(e) => match e {
+                        //         WireGuardError::DuplicateCounter => {
+                        //             // TODO(LLT-6071): revert back to having error level for all error types
+                        //             tracing::debug!(message="Decapsulate error",
+                        //                 error=?e,
+                        //                 public_key=peer.public_key.1)
+                        //         }
+                        //         _ => {
+                        //             tracing::error!(message="Decapsulate error",
+                        //                 error=?e,
+                        //                 public_key = peer.public_key.1)
+                        //         }
+                        //     },
+                        //     TunnResult::WriteToNetwork(packet) => {
+                        //         flush = true;
+                        //         if let Err(err) = udp.send(packet) {
+                        //             tracing::warn!(message="Failed to write packet", error = ?err);
+                        //         }
+                        //     }
+                        //     TunnResult::WriteToTunnel(packet, addr) => {
+                        //         if let Some(callback) = &d.config.firewall_process_inbound_callback {
+                        //             if !callback(&peer.public_key.0, packet) {
+                        //                 continue;
+                        //             }
+                        //         }
+                        //         if peer.is_allowed_ip(addr) {
+                        //             _ = t.iface.as_ref().write(packet);
+                        //             tracing::trace!(
+                        //                 message = "Writing packet to tunnel",
+                        //                 interface = ?t.iface.name(),
+                        //                 packet_length = packet.len(),
+                        //                 src_addr = ?addr,
+                        //                 public_key = peer.public_key.1
+                        //             );
+                        //         }
+                        //     }
+                        // };
 
-                    iter -= 1;
-                    if iter == 0 {
+                        // if flush {
+                        //     // Flush pending queue
+                        //     loop {
+                        //         let res = {
+                        //             let mut tun = peer.tunnel.lock();
+                        //             tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                        //         };
+                        //         let TunnResult::WriteToNetwork(packet) = res else {
+                        //             break;
+                        //         };
+                        //         if let Err(err) = udp.send(packet) {
+                        //             tracing::warn!(message="Failed to flush queue", error = ?err);
+                        //         }
+                        //     }
+                        // }
+
+                        // iter -= 1;
+                        // if iter == 0 {
+                        //     break;
+                        // }
+                    } else {
                         break;
                     }
                 }
