@@ -18,7 +18,7 @@ ip address add dev wg0 10.0.0.1/24
 ip link set up dev wg0
 
 # /neptun/base/neptun-cli --disable-drop-privileges wg1
-sudo ip link add dev wg1 type wireguard
+ip link add dev wg1 type wireguard
 wg set wg1 \
     listen-port 51821 \
     private-key <(echo sKZoT3qgxDm1bWny+1ttoi00qS2KXvo1L4Zb265wr3c=) \
@@ -29,7 +29,7 @@ ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
 # /neptun/current/neptun-cli --disable-drop-privileges wg2
-sudo ip link add dev wg2 type wireguard
+ip link add dev wg2 type wireguard
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
