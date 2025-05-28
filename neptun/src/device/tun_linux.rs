@@ -11,7 +11,8 @@ use libc::{
 use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
-use tracing::error;
+use std::sync::atomic::AtomicBool;
+use tracing::{error, trace};
 
 mod tun_interface_flags {
     use super::*;
@@ -27,11 +28,12 @@ ioctl_read_bad!(get_interface_mtu, SIOCGIFMTU, ifreq);
 pub struct TunSocket {
     fd: RawFd,
     name: String,
+    already_closed: AtomicBool,
 }
 
 impl Drop for TunSocket {
     fn drop(&mut self) {
-        unsafe { close(self.fd) };
+        self.force_close();
     }
 }
 
@@ -72,6 +74,7 @@ impl TunSocket {
             return Ok(TunSocket {
                 fd,
                 name: name.to_string(),
+                already_closed: AtomicBool::new(false),
             });
         }
 
@@ -117,7 +120,11 @@ impl TunSocket {
         }
 
         let name = name.to_string();
-        Ok(TunSocket { fd, name })
+        Ok(TunSocket {
+            fd,
+            name,
+            already_closed: AtomicBool::new(false),
+        })
     }
 
     pub fn new_from_fd(fd: RawFd) -> Result<TunSocket, Error> {
@@ -140,7 +147,11 @@ impl TunSocket {
             .to_str()
             .map_err(|_| Error::InvalidTunnelName)?
             .to_owned();
-        Ok(TunSocket { fd, name })
+        Ok(TunSocket {
+            fd,
+            name,
+            already_closed: AtomicBool::new(false),
+        })
     }
 
     pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
@@ -199,6 +210,26 @@ impl TunSocket {
         match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
             n => Ok(&mut dst[..n as usize]),
+        }
+    }
+
+    /// Normally the file descriptor managed by self is closed in the drop. This functions
+    /// allows for manual close of the fd. The fd will only be closed once, regardless of how
+    /// many times this function is called, either when it is called for the first time or in
+    /// the drop.
+    pub fn force_close(&self) {
+        let was_already_closed = match self.already_closed.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(old) => old,
+            Err(old) => old,
+        };
+
+        if !was_already_closed {
+            unsafe { close(self.fd) };
         }
     }
 }
