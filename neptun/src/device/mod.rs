@@ -1084,7 +1084,7 @@ impl Device {
                         element.peer_addr = Some(peer_addr.clone());
                         element.iface = Some(t.iface.clone());
                         if let Err(e) = d.tunnel_tx.send(element) {
-                            tracing::warn!("Unable to forward data onto network worker {e}");
+                            tracing::warn!("Unable to forward data onto tunnel worker {e}");
                         }
                         // let mut flush = false;
 
