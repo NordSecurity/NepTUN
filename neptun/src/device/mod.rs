@@ -60,7 +60,7 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100_000;
 const PKT_SIZE: usize = 1600;
-const CHANNEL_SIZE: usize = 500;
+const CHANNEL_SIZE: usize = 800;
 const WG_HEADER_OFFSET: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -621,7 +621,7 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
-        let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
+        let (network_tx, network_rx) = crossbeam_channel::bounded(50);
         let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
@@ -677,11 +677,11 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            for _ in 0..num_cpus::get_physical() {
-                if let Err(e) = self.close_network_worker_tx.send(()) {
-                    tracing::error!("Unable to close network thread {e}");
-                }
+            // for _ in 0..num_cpus::get_physical() {
+            if let Err(e) = self.close_network_worker_tx.send(()) {
+                tracing::error!("Unable to close network thread {e}");
             }
+            // }
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -729,20 +729,20 @@ impl Device {
         self.udp6 = Some(udp6.clone());
 
         // Process packet in a seperate thread
-        for _ in 0..num_cpus::get_physical() {
-            let rx_clone = self.network_rx.clone();
-            let close_chan_clone = self.close_network_worker_rx.clone();
-            let udp4_c = udp4.clone();
-            let udp6_c = udp6.clone();
-            let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
-                Some(f.clone())
-            } else {
-                None
-            };
-            thread::spawn(move || {
-                network_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
-            });
-        }
+        // for _ in 0..num_cpus::get_physical() {
+        let rx_clone = self.network_rx.clone();
+        let close_chan_clone = self.close_network_worker_rx.clone();
+        let udp4_c = udp4.clone();
+        let udp6_c = udp6.clone();
+        let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
+            Some(f.clone())
+        } else {
+            None
+        };
+        thread::spawn(move || {
+            network_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+        });
+        // }
 
         let rx_clone = self.tunnel_rx.clone();
         let fw_callback = if let Some(f) = &self.config.firewall_process_inbound_callback {
