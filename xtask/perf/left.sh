@@ -62,14 +62,14 @@ sleep 1
 echo
 echo "UDP unidirectional tests"
 
-bitrates=(500M 800M 1000M 1500M 1800M 2000M 2200M 2500M)
+bitrates=(1500M)
 
 for bitrate in "${bitrates[@]}"
 do
     echo
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
-    base_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    base_cmd=$(iperf3 -i 10 -k 4M -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
     base_output="$base_cmd"
     base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
     base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
@@ -78,7 +78,7 @@ do
 
     sleep 2
     # Current NepTUN
-    current_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
+    current_cmd=$(iperf3 -i 10 -k 4M -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
     current_output="$current_cmd"
     ip -s link show dev wg1 | awk 'NR==6 {print "Base tunnel - success:", $2, "drops:", $4}'
     ip -s link show dev wg2 | awk 'NR==6 {print "Current tunnel - success:", $2, "drops:", $4}'
