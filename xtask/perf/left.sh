@@ -17,8 +17,7 @@ wg set wg0 \
 ip address add dev wg0 10.0.0.1/24
 ip link set up dev wg0
 
-# /neptun/base/neptun-cli --disable-drop-privileges wg1
-ip link add dev wg1 type wireguard
+/neptun/base/neptun-cli --disable-drop-privileges wg1
 wg set wg1 \
     listen-port 51821 \
     private-key <(echo sKZoT3qgxDm1bWny+1ttoi00qS2KXvo1L4Zb265wr3c=) \
@@ -28,8 +27,7 @@ wg set wg1 \
 ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
-# /neptun/current/neptun-cli --disable-drop-privileges wg2
-ip link add dev wg2 type wireguard
+/neptun/base/neptun-cli --disable-drop-privileges wg2
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -69,7 +67,7 @@ do
     echo
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
-    base_cmd=$(iperf3 -i 10 -k 4M -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    base_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
     base_output="$base_cmd"
     base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
     base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
@@ -78,7 +76,7 @@ do
 
     sleep 2
     # Current NepTUN
-    current_cmd=$(iperf3 -i 10 -k 4M -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
+    current_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
     current_output="$current_cmd"
     ip -s link show dev wg1 | awk 'NR==6 {print "Base tunnel - success:", $2, "drops:", $4}'
     ip -s link show dev wg2 | awk 'NR==6 {print "Current tunnel - success:", $2, "drops:", $4}'
