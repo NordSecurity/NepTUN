@@ -9,6 +9,7 @@ use std::mem::size_of;
 use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::null_mut;
+use std::sync::atomic::AtomicBool;
 
 const CTRL_NAME: &[u8] = b"com.apple.net.utun_control";
 
@@ -52,11 +53,12 @@ const SIOCGIFMTU: u64 = 0x0000_0000_c020_6933;
 #[derive(Default, Debug)]
 pub struct TunSocket {
     fd: RawFd,
+    already_closed: AtomicBool,
 }
 
 impl Drop for TunSocket {
     fn drop(&mut self) {
-        unsafe { close(self.fd) };
+        self.force_close();
     }
 }
 
@@ -184,11 +186,17 @@ impl TunSocket {
             return Err(Error::Connect(err_string));
         }
 
-        Ok(TunSocket { fd })
+        Ok(TunSocket {
+            fd,
+            already_closed: AtomicBool::new(false),
+        })
     }
 
     pub fn new_from_fd(fd: RawFd) -> Result<TunSocket, Error> {
-        Ok(TunSocket { fd })
+        Ok(TunSocket {
+            fd,
+            already_closed: AtomicBool::new(false),
+        })
     }
 
     pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
@@ -274,6 +282,26 @@ impl TunSocket {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
             0..=4 => Ok(&mut dst[..0]),
             n => Ok(&mut dst[..(n - 4) as usize]),
+        }
+    }
+
+    /// Normally the file descriptor managed by self is closed in the drop. This functions
+    /// allows for manual close of the fd. The fd will only be closed once, regardless of how
+    /// many times this function is called, either when it is called for the first time or in
+    /// the drop.
+    pub fn force_close(&self) {
+        let was_already_closed = match self.already_closed.compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(old) => old,
+            Err(old) => old,
+        };
+
+        if !was_already_closed {
+            unsafe { close(self.fd) };
         }
     }
 }
