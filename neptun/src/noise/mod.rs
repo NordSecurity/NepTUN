@@ -343,35 +343,34 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
-    pub fn decapsulate_in_place<'a>(
-        &mut self,
-        src_addr: Option<IpAddr>,
-        data_len: usize,
-        packet_buffer: &'a mut [u8],
-    ) -> TunnResult<'a> {
-        if data_len == 0 {
-            // Indicates a repeated call
-            return self.send_queued_packet(packet_buffer);
-        }
+    // pub fn decapsulate_in_place<'a>(
+    //     &mut self,
+    //     src_addr: Option<IpAddr>,
+    //     data_len: usize,
+    //     packet_buffer: &'a mut [u8],
+    // ) -> TunnResult<'a> {
+    //     if data_len == 0 {
+    //         // Indicates a repeated call
+    //         return self.send_queued_packet(packet_buffer);
+    //     }
 
-        let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
-            .rate_limiter
-            .verify_packet(src_addr, packet_buffer[..data_len], &mut cookie)
-        {
-            Ok(packet) => packet,
-            Err(TunnResult::WriteToNetwork(cookie)) => {
-                packet_buffer[..cookie.len()].copy_from_slice(cookie);
-                self.tx_bytes += cookie.len();
-                return TunnResult::WriteToNetwork(&mut packet_buffer[..cookie.len()]);
-            }
-            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
-            _ => unreachable!(),
-        };
+    //     let mut cookie = [0u8; COOKIE_REPLY_SZ];
+    //     let packet = match self
+    //         .rate_limiter
+    //         .verify_packet(src_addr, &mut packet_buffer[..data_len], &mut cookie)
+    //     {
+    //         Ok(packet) => packet,
+    //         Err(TunnResult::WriteToNetwork(cookie)) => {
+    //             packet_buffer[..cookie.len()].copy_from_slice(cookie);
+    //             self.tx_bytes += cookie.len();
+    //             return TunnResult::WriteToNetwork(&mut packet_buffer[..cookie.len()]);
+    //         }
+    //         Err(TunnResult::Err(e)) => return TunnResult::Err(e),
+    //         _ => unreachable!(),
+    //     };
 
-        TunnResult::Done
-        // self.handle_verified_packet(packet, packet_buffer)
-    }
+    //     self.handle_verified_packet(packet)
+    // }
 
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
@@ -393,7 +392,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, datagram.len(), &mut cookie)
+            .verify_packet(src_addr, datagram, &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
