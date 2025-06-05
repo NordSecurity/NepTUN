@@ -136,6 +136,43 @@ impl Tunn {
         self.peer_static_public
     }
 
+    pub fn parse_incoming_packet_in_place(src: &mut [u8], data_len: usize) -> Result<Packet, WireGuardError> {
+        if data_len < 4 {
+            return Err(WireGuardError::InvalidPacket);
+        }
+
+        // Checks the type, as well as the reserved zero fields
+        let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
+
+        Ok(match (packet_type, data_len) {
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
+                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
+                    .expect("length already checked above"),
+                encrypted_static: &src[40..88],
+                encrypted_timestamp: &src[88..116],
+            }),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
+                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
+                    .expect("length already checked above"),
+                encrypted_nothing: &src[44..60],
+            }),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
+                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                nonce: &src[8..32],
+                encrypted_cookie: &src[32..64],
+            }),
+            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
+                encrypted_encapsulated_packet: &src[16..],
+            }),
+            _ => return Err(WireGuardError::InvalidPacket),
+        })
+    }
+
     #[inline(always)]
     pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
         if src.len() < 4 {
@@ -306,6 +343,36 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
+    pub fn decapsulate_in_place<'a>(
+        &mut self,
+        src_addr: Option<IpAddr>,
+        data_len: usize,
+        packet_buffer: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        if data_len == 0 {
+            // Indicates a repeated call
+            return self.send_queued_packet(packet_buffer);
+        }
+
+        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        let packet = match self
+            .rate_limiter
+            .verify_packet(src_addr, packet_buffer[..data_len], &mut cookie)
+        {
+            Ok(packet) => packet,
+            Err(TunnResult::WriteToNetwork(cookie)) => {
+                packet_buffer[..cookie.len()].copy_from_slice(cookie);
+                self.tx_bytes += cookie.len();
+                return TunnResult::WriteToNetwork(&mut packet_buffer[..cookie.len()]);
+            }
+            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
+            _ => unreachable!(),
+        };
+
+        TunnResult::Done
+        // self.handle_verified_packet(packet, packet_buffer)
+    }
+
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
@@ -326,7 +393,7 @@ impl Tunn {
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
         let packet = match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
+            .verify_packet(src_addr, datagram, datagram.len(), &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {

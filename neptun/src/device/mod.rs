@@ -58,9 +58,9 @@ use thiserror::Error;
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
-const MAX_ITR: usize = 100_000;
+const MAX_ITR: usize = 100;
 const PKT_SIZE: usize = 1600;
-const CHANNEL_SIZE: usize = 800;
+const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -621,7 +621,7 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
-        let (network_tx, network_rx) = crossbeam_channel::bounded(50);
+        let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
@@ -677,11 +677,11 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            // for _ in 0..num_cpus::get_physical() {
-            if let Err(e) = self.close_network_worker_tx.send(()) {
-                tracing::error!("Unable to close network thread {e}");
+            for _ in 0..num_cpus::get_physical() {
+                if let Err(e) = self.close_network_worker_tx.send(()) {
+                    tracing::error!("Unable to close network thread {e}");
+                }
             }
-            // }
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -729,20 +729,20 @@ impl Device {
         self.udp6 = Some(udp6.clone());
 
         // Process packet in a seperate thread
-        // for _ in 0..num_cpus::get_physical() {
-        let rx_clone = self.network_rx.clone();
-        let close_chan_clone = self.close_network_worker_rx.clone();
-        let udp4_c = udp4.clone();
-        let udp6_c = udp6.clone();
-        let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
-            Some(f.clone())
-        } else {
-            None
-        };
-        thread::spawn(move || {
-            network_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
-        });
-        // }
+        for _ in 0..num_cpus::get_physical() {
+            let rx_clone = self.network_rx.clone();
+            let close_chan_clone = self.close_network_worker_rx.clone();
+            let udp4_c = udp4.clone();
+            let udp6_c = udp6.clone();
+            let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
+                Some(f.clone())
+            } else {
+                None
+            };
+            thread::spawn(move || {
+                network_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+            });
+        }
 
         let rx_clone = self.tunnel_rx.clone();
         let fw_callback = if let Some(f) = &self.config.firewall_process_inbound_callback {
@@ -1020,7 +1020,7 @@ impl Device {
                         loop {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
+                                tun.decapsulate_in_place(None, &[], &mut t.dst_buf[..])
                             };
 
                             let TunnResult::WriteToNetwork(packet) = res else {
@@ -1079,6 +1079,17 @@ impl Device {
                     };
 
                     if let Ok(read_bytes) = udp.recv(src_buf) {
+                        // let mut flush = false;
+
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.decapsulate_in_place(
+                                Some(peer_addr),
+                                read_bytes,
+                                &mut element.data[..],
+                            )
+                        };
+
                         element.buf_len = read_bytes.clone();
                         element.peer = Some(peer.clone());
                         element.peer_addr = Some(peer_addr.clone());
@@ -1086,16 +1097,6 @@ impl Device {
                         if let Err(e) = d.tunnel_tx.send(element) {
                             tracing::warn!("Unable to forward data onto tunnel worker {e}");
                         }
-                        // let mut flush = false;
-
-                        // let res = {
-                        //     let mut tun = peer.tunnel.lock();
-                        //     tun.decapsulate(
-                        //         Some(peer_addr),
-                        //         &t.src_buf[..read_bytes],
-                        //         &mut t.dst_buf[..],
-                        //     )
-                        // };
 
                         // match res {
                         //     TunnResult::Done => {}
@@ -1119,7 +1120,8 @@ impl Device {
                         //         }
                         //     }
                         //     TunnResult::WriteToTunnel(packet, addr) => {
-                        //         if let Some(callback) = &d.config.firewall_process_inbound_callback {
+                        //         if let Some(callback) = &d.config.firewall_process_inbound_callback
+                        //         {
                         //             if !callback(&peer.public_key.0, packet) {
                         //                 continue;
                         //             }
@@ -1136,7 +1138,6 @@ impl Device {
                         //         }
                         //     }
                         // };
-
                         // if flush {
                         //     // Flush pending queue
                         //     loop {
@@ -1340,14 +1341,14 @@ fn tunnel_worker(
                 continue;
             };
             // To remove this!
-            let mut dst_buf = [0u8; 1700];
+            // let mut dst_buf = [0u8; 1700];
 
             let mut flush = false;
 
-            let res = {
-                let mut tun = peer.tunnel.lock();
-                tun.decapsulate(msg.peer_addr, &msg.data[..read_bytes], &mut dst_buf[..])
-            };
+            // let res = {
+            //     let mut tun = peer.tunnel.lock();
+            //     tun.decapsulate(msg.peer_addr, &msg.data[..read_bytes], &mut dst_buf[..])
+            // };
 
             match res {
                 TunnResult::Done => {}
