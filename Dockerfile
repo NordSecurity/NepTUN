@@ -8,6 +8,7 @@ RUN apt-get update && \
         iputils-ping \
         net-tools \
         wireguard-tools \
+        wireguard \
         git \
         wget \
         ca-certificates && \
