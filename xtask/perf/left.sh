@@ -18,18 +18,19 @@ ip address add dev wg0 10.0.0.1/24
 ip link set up dev wg0
 
 # /neptun/base/neptun-cli --disable-drop-privileges wg1
-ip link add dev wg1 type wireguard
-wg set wg1 \
-    listen-port 51821 \
-    private-key <(echo sKZoT3qgxDm1bWny+1ttoi00qS2KXvo1L4Zb265wr3c=) \
-    peer CMWokCGH+YPN7CL2C2aAkDlnhw1blH0tKPOnEOgzrxM= \
-    allowed-ips 10.0.1.2/32 \
-    endpoint 176.0.0.3:51821
-ip address add dev wg1 10.0.1.1/24
-ip link set up dev wg1
+# ip link add dev wg1 type wireguard
+# wg set wg1 \
+#     listen-port 51821 \
+#     private-key <(echo sKZoT3qgxDm1bWny+1ttoi00qS2KXvo1L4Zb265wr3c=) \
+#     peer CMWokCGH+YPN7CL2C2aAkDlnhw1blH0tKPOnEOgzrxM= \
+#     allowed-ips 10.0.1.2/32 \
+#     endpoint 176.0.0.3:51821
+# ip address add dev wg1 10.0.1.1/24
+# ip link set up dev wg1
 
-# /neptun/base/neptun-cli --disable-drop-privileges wg2
-ip link add dev wg2 type wireguard
+# /neptun/current/neptun-cli --disable-drop-privileges wg2
+# ip link add dev wg2 type wireguard
+wireguard-go wg0
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -39,20 +40,20 @@ wg set wg2 \
 ip address add dev wg2 10.0.2.1/24
 ip link set up dev wg2
 
-echo
-echo "Raw network:"
-iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
+# echo
+# echo "Raw network:"
+# iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
 
 echo
 echo "Wireguard-go:"
-iperf3 -i 30 -t 60 --bidir -c 10.0.0.2
+iperf3 -i 30 -t 60 -u -b 2000M -c 10.0.0.2
 
-echo
-echo "TCP bidirectional tests"
+# echo
+# echo "TCP bidirectional tests"
 
-echo
-echo "Base NepTUN:"
-iperf3 -i 30 -t 60 -c 10.0.1.2
+# echo
+# echo "Base NepTUN:"
+# iperf3 -i 30 -t 60 -c 10.0.1.2
 
 echo
 echo "Current NepTUN:"
@@ -69,12 +70,12 @@ do
     echo
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
-    base_cmd=$(iperf3 -i 30 -t 60 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
-    base_output="$base_cmd"
-    base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
-    base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
-    base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
-    base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
+    # base_cmd=$(iperf3 -i 30 -t 60 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    # base_output="$base_cmd"
+    # base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
+    # base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
+    # base_lost_percentage=$(echo "$base_output" | awk '{print $12}')
+    # base_bitrate=$(echo "$base_output" | awk '{print $7 " " $8}')
 
     sleep 2
     # Current NepTUN
@@ -93,8 +94,8 @@ do
     echo "Current NepTUN   | $current_total_datagrams         | $current_lost_datagrams |  $current_lost_percentage | $current_bitrate "
 
     value=$(echo "$current_lost_percentage" | awk '{gsub(/[^0-9.]/, ""); print $0}')
-    if [[ $value -gt 10 ]]; then
-        exit 0
-    fi
+    # if [[ $value -gt 10 ]]; then
+    #     exit 0
+    # fi
     sleep 2
 done
