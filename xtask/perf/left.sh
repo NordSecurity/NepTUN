@@ -7,15 +7,15 @@
 # in any real deployments                            #
 ######################################################
 
-wireguard-go wg0
-wg set wg0 \
-    listen-port 51820 \
-    private-key <(echo AH7jKt6M0RS21MkRG+URrfgmwvJqdhVvqtKeF4WR+E8=) \
-    peer mqrc8+LD+6zvMeCtyCcIBPEYuXT74lq1Hros0Np8ZgA= \
-    allowed-ips 10.0.0.2/32 \
-    endpoint 176.0.0.3:51820
-ip address add dev wg0 10.0.0.1/24
-ip link set up dev wg0
+# wireguard-go wg0
+# wg set wg0 \
+#     listen-port 51820 \
+#     private-key <(echo AH7jKt6M0RS21MkRG+URrfgmwvJqdhVvqtKeF4WR+E8=) \
+#     peer mqrc8+LD+6zvMeCtyCcIBPEYuXT74lq1Hros0Np8ZgA= \
+#     allowed-ips 10.0.0.2/32 \
+#     endpoint 176.0.0.3:51820
+# ip address add dev wg0 10.0.0.1/24
+# ip link set up dev wg0
 
 # /neptun/base/neptun-cli --disable-drop-privileges wg1
 # ip link add dev wg1 type wireguard
@@ -29,8 +29,7 @@ ip link set up dev wg0
 # ip link set up dev wg1
 
 # /neptun/current/neptun-cli --disable-drop-privileges wg2
-# ip link add dev wg2 type wireguard
-wireguard-go wg2
+ip link add dev wg2 type wireguard
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -44,9 +43,9 @@ ip link set up dev wg2
 # echo "Raw network:"
 # iperf3 -i 10 -t  10 --bidir -c 176.0.0.3
 
-echo
-echo "Wireguard-go:"
-iperf3 -i 30 -t 60 -u -b 2000M -c 10.0.0.2
+# echo
+# echo "Wireguard-go:"
+# iperf3 -i 30 -t 60 --bidir -c 10.0.0.2
 
 # echo
 # echo "TCP bidirectional tests"
