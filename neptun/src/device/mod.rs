@@ -180,8 +180,8 @@ pub struct Device {
     network_rx: Receiver<EncryptionTaskData>,
     network_tx: Sender<EncryptionTaskData>,
 
-    tunnel_rx: Receiver<EncryptionTaskData>,
-    tunnel_tx: Sender<EncryptionTaskData>,
+    tunnel_rx: Receiver<DecryptionTaskData>,
+    tunnel_tx: Sender<DecryptionTaskData>,
 }
 
 struct ThreadData {
@@ -196,9 +196,6 @@ struct EncryptionTaskData {
     buf_len: usize,
     peer: Option<Arc<Peer>>,
     iface: Option<Arc<TunSocket>>,
-    peer_addr: Option<IpAddr>,
-    udp: Option<Arc<socket2::Socket>>,
-    res: DecryptResult,
 }
 
 impl Default for EncryptionTaskData {
@@ -208,7 +205,24 @@ impl Default for EncryptionTaskData {
             buf_len: 0,
             peer: None,
             iface: None,
-            peer_addr: None,
+        }
+    }
+}
+
+struct DecryptionTaskData {
+    data: [u8; PKT_SIZE],
+    peer: Option<Arc<Peer>>,
+    iface: Option<Arc<TunSocket>>,
+    udp: Option<Arc<socket2::Socket>>,
+    res: DecryptResult,
+}
+
+impl Default for DecryptionTaskData {
+    fn default() -> Self {
+        DecryptionTaskData {
+            data: [0; PKT_SIZE],
+            peer: None,
+            iface: None,
             udp: None,
             res: DecryptResult::Done,
         }
@@ -1061,7 +1075,7 @@ impl Device {
                     if d.config.use_connected_socket {
                         // No need for aditional checking, as from this point all packets will arive to connected socket handler
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                            d.register_conn_handler(Arc::clone(peer), Arc::new(sock), ip_addr)
                                 .unwrap();
                         }
                     }
@@ -1080,7 +1094,7 @@ impl Device {
     fn register_conn_handler(
         &self,
         peer: Arc<Peer>,
-        udp: socket2::Socket,
+        udp: Arc<socket2::Socket>,
         peer_addr: IpAddr,
     ) -> Result<(), Error> {
         self.queue.new_event(
@@ -1092,7 +1106,7 @@ impl Device {
                 // let mut iter = MAX_ITR;
 
                 for _ in 0..MAX_ITR {
-                    let mut element = EncryptionTaskData::default();
+                    let mut element = DecryptionTaskData::default();
                     // Safety: the `recv_from` implementation promises not to write uninitialised
                     // bytes to the buffer, so this casting is safe.
                     let src_buf = unsafe {
@@ -1100,7 +1114,6 @@ impl Device {
                     };
 
                     if let Ok(read_bytes) = udp.recv(src_buf) {
-                        // let mut flush = false;
 
                         let res = {
                             let mut tun = peer.tunnel.lock();
@@ -1112,8 +1125,8 @@ impl Device {
                         };
 
                         element.peer = Some(peer.clone());
-                        element.peer_addr = Some(peer_addr.clone());
                         element.iface = Some(t.iface.clone());
+                        element.udp = Some(udp.clone());
                         element.res = res.into();
                         if let Err(e) = d.tunnel_tx.send(element) {
                             tracing::warn!("Unable to forward data onto tunnel worker {e}");
@@ -1349,7 +1362,7 @@ fn network_worker(
 }
 
 fn tunnel_worker(
-    tunnel_rx: Receiver<EncryptionTaskData>,
+    tunnel_rx: Receiver<DecryptionTaskData>,
     firewall_process_inbound_callback: Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
 ) {
     loop {
@@ -1360,15 +1373,7 @@ fn tunnel_worker(
                 tracing::error!("Empty peer");
                 continue;
             };
-            // To remove this!
-            // let mut dst_buf = [0u8; 1700];
-
             let mut flush = false;
-
-            // let res = {
-            //     let mut tun = peer.tunnel.lock();
-            //     tun.decapsulate(msg.peer_addr, &msg.data[..read_bytes], &mut dst_buf[..])
-            // };
 
             match msg.res {
                 DecryptResult::Done => {}
