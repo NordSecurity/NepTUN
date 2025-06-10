@@ -93,7 +93,7 @@ mod tests {
             .await
             .expect("Failed to recv");
 
-        match b.tunnel.lock().decapsulate_in_place(
+        match b.tunnel.lock().decapsulate(
             None,
             &receiving_buffer[..bytes_read],
             &mut sending_buffer,
@@ -116,7 +116,7 @@ mod tests {
             .await
             .expect("Failed to recv");
 
-        match a.tunnel.lock().decapsulate_in_place(
+        match a.tunnel.lock().decapsulate(
             None,
             &receiving_buffer[..bytes_read],
             &mut sending_buffer,
@@ -140,7 +140,7 @@ mod tests {
             .await
             .expect("Failed to recv");
 
-        match b.tunnel.lock().decapsulate_in_place(
+        match b.tunnel.lock().decapsulate(
             None,
             &receiving_buffer[..bytes_read],
             &mut sending_buffer,

@@ -54,9 +54,9 @@ ip link set up dev wg2
 # echo "Base NepTUN:"
 # iperf3 -i 30 -t 60 -c 10.0.1.2
 
-echo
-echo "Current NepTUN:"
-iperf3 -i 30 -t 60 -c 10.0.2.2
+# echo
+# echo "Current NepTUN:"
+# iperf3 -i 30 -t 60 -c 10.0.2.2
 
 sleep 1
 echo
@@ -69,7 +69,7 @@ do
     echo
     echo "Running test for bitrate: $bitrate"
     # Base NepTUN
-    # base_cmd=$(iperf3 -i 30 -t 60 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
+    # base_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.1.2 | awk '/receiver/')
     # base_output="$base_cmd"
     # base_total_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $2}')
     # base_lost_datagrams=$(echo "$base_output" | awk '{print $11}' | awk -F '/' '{print $1}')
@@ -78,9 +78,9 @@ do
 
     sleep 2
     # Current NepTUN
-    current_cmd=$(iperf3 -i 30 -t 60 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
+    current_cmd=$(iperf3 -i 10 -t 30 -u -b "$bitrate" -c 10.0.2.2 | awk '/receiver/')
     current_output="$current_cmd"
-    ip -s link show dev wg1 | awk 'NR==6 {print "Base tunnel - success:", $2, "drops:", $4}'
+    # ip -s link show dev wg1 | awk 'NR==6 {print "Base tunnel - success:", $2, "drops:", $4}'
     ip -s link show dev wg2 | awk 'NR==6 {print "Current tunnel - success:", $2, "drops:", $4}'
     current_total_datagrams=$(echo "$current_output" |  awk '{print $11}' | awk -F '/' '{print $2}')
     current_lost_datagrams=$(echo "$current_output" | awk '{print $11}' | awk -F '/' '{print $1}')

@@ -58,7 +58,7 @@ use thiserror::Error;
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
-const MAX_ITR: usize = 100;
+const MAX_ITR: usize = 100_000;
 const PKT_SIZE: usize = 1600;
 const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
@@ -243,7 +243,9 @@ impl<'a> From<TunnResult<'a>> for DecryptResult {
             TunnResult::Err(err) => DecryptResult::Err(err),
             TunnResult::Done => DecryptResult::Done,
             TunnResult::WriteToNetwork(buffer) => DecryptResult::WriteToNetwork(buffer.len()),
-            TunnResult::WriteToTunnel(buffer, addr) => DecryptResult::WriteToTunnel(buffer.len(), addr),
+            TunnResult::WriteToTunnel(buffer, addr) => {
+                DecryptResult::WriteToTunnel(buffer.len(), addr)
+            }
         }
     }
 }
@@ -657,7 +659,7 @@ impl Device {
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
         let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
-        let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
+        let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(300);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
 
@@ -1114,7 +1116,6 @@ impl Device {
                     };
 
                     if let Ok(read_bytes) = udp.recv(src_buf) {
-
                         let res = {
                             let mut tun = peer.tunnel.lock();
                             tun.decapsulate(
@@ -1128,7 +1129,7 @@ impl Device {
                         element.iface = Some(t.iface.clone());
                         element.udp = Some(udp.clone());
                         element.res = res.into();
-                        if let Err(e) = d.tunnel_tx.send(element) {
+                        if let Err(e) = d.tunnel_tx.try_send(element) {
                             tracing::warn!("Unable to forward data onto tunnel worker {e}");
                         }
 
