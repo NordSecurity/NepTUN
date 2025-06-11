@@ -659,7 +659,7 @@ impl Device {
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
         let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
-        let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(300);
+        let (tunnel_tx, tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE*10);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
 
