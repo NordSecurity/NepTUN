@@ -57,9 +57,10 @@ use thiserror::Error;
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
-const MAX_UDP_SIZE: usize = (1 << 16) - 1;
+// Max packet size of 1550 because packets are limited by the MTU sizes
+// used in wild networks.
+const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
-const PKT_SIZE: usize = 1600;
 const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
 
@@ -177,33 +178,22 @@ pub struct Device {
     close_network_worker_tx: Sender<()>,
     close_network_worker_rx: Receiver<()>,
 
-    network_rx: Receiver<EncryptionTaskData>,
-    network_tx: Sender<EncryptionTaskData>,
+    tunnel_to_socket_rx: Receiver<NetworkTaskData>,
+    tunnel_to_socket_tx: Sender<NetworkTaskData>,
 }
 
 struct ThreadData {
     iface: Arc<TunSocket>,
-    src_buf: [u8; MAX_UDP_SIZE],
-    dst_buf: [u8; MAX_UDP_SIZE],
+    src_buf: [u8; MAX_PKT_SIZE],
+    dst_buf: [u8; MAX_PKT_SIZE],
     update_seq: u32,
 }
 
-struct EncryptionTaskData {
-    data: [u8; PKT_SIZE],
+struct NetworkTaskData {
+    data: [u8; MAX_PKT_SIZE],
     buf_len: usize,
-    peer: Option<Arc<Peer>>,
-    iface: Option<Arc<TunSocket>>,
-}
-
-impl Default for EncryptionTaskData {
-    fn default() -> Self {
-        EncryptionTaskData {
-            data: [0; PKT_SIZE],
-            buf_len: 0,
-            peer: None,
-            iface: None,
-        }
-    }
+    peer: Arc<Peer>,
+    iface: Arc<TunSocket>,
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -424,8 +414,8 @@ impl DeviceHandle {
     fn new_thread_local(_thread_id: usize, device_lock: &LockReadGuard<Device>) -> ThreadData {
         #[cfg(target_os = "linux")]
         let t_local = ThreadData {
-            src_buf: [0u8; MAX_UDP_SIZE],
-            dst_buf: [0u8; MAX_UDP_SIZE],
+            src_buf: [0u8; MAX_PKT_SIZE],
+            dst_buf: [0u8; MAX_PKT_SIZE],
             iface: if _thread_id == 0 || !device_lock.config.use_multi_queue {
                 // For the first thread use the original iface
                 Arc::clone(&device_lock.iface)
@@ -449,8 +439,8 @@ impl DeviceHandle {
 
         #[cfg(not(target_os = "linux"))]
         let t_local = ThreadData {
-            src_buf: [0u8; MAX_UDP_SIZE],
-            dst_buf: [0u8; MAX_UDP_SIZE],
+            src_buf: [0u8; MAX_PKT_SIZE],
+            dst_buf: [0u8; MAX_PKT_SIZE],
             iface: Arc::clone(&device_lock.iface),
             update_seq: device_lock.update_seq,
         };
@@ -613,7 +603,7 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
-        let (network_tx, network_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
+        let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
 
@@ -636,8 +626,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            network_tx,
-            network_rx,
+            tunnel_to_socket_tx,
+            tunnel_to_socket_rx,
             close_network_worker_tx,
             close_network_worker_rx,
             update_seq: 0,
@@ -719,7 +709,7 @@ impl Device {
 
         // Process packet in a seperate thread
         for _ in 0..num_cpus::get_physical() {
-            let rx_clone = self.network_rx.clone();
+            let rx_clone = self.tunnel_to_socket_rx.clone();
             let close_chan_clone = self.close_network_worker_rx.clone();
             let udp4_c = udp4.clone();
             let udp6_c = udp6.clone();
@@ -1149,9 +1139,8 @@ impl Device {
 
                 let peers = &d.peers_by_ip;
                 loop {
-                    let mut element = EncryptionTaskData::default();
                     let len = match iface
-                        .read(&mut element.data[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET])
+                        .read(&mut t.src_buf[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET])
                     {
                         Ok(src) => src.len(),
                         Err(Error::IfaceRead(e)) => {
@@ -1173,7 +1162,7 @@ impl Device {
                     };
 
                     let dst_addr = match Tunn::dst_address(
-                        &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET],
+                        &t.src_buf[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET],
                     ) {
                         Some(addr) => addr,
                         None => continue,
@@ -1184,10 +1173,13 @@ impl Device {
                         None => continue,
                     };
 
-                    element.buf_len = len;
-                    element.peer = Some(peer.clone());
-                    element.iface = Some(t.iface.clone());
-                    if let Err(e) = d.network_tx.send(element) {
+                    let element = NetworkTaskData {
+                        data: t.src_buf,
+                        buf_len: len,
+                        peer: peer.clone(),
+                        iface: t.iface.clone(),
+                    };
+                    if let Err(e) = d.tunnel_to_socket_tx.send(element) {
                         tracing::warn!("Unable to forward data onto network worker {e}");
                     }
                 }
@@ -1203,7 +1195,7 @@ impl Device {
 }
 
 fn network_worker(
-    network_rx: Receiver<EncryptionTaskData>,
+    network_rx: Receiver<NetworkTaskData>,
     close_chan: Receiver<()>,
     udp4: Arc<socket2::Socket>,
     udp6: Arc<socket2::Socket>,
@@ -1216,19 +1208,12 @@ fn network_worker(
             recv(network_rx) -> element => {
                 if let Ok(mut element) = element {
                     let len = element.buf_len;
-                    let peer = if let Some(p) = element.peer.clone() {
-                        p
-                    } else {
-                        tracing::error!("Empty peer");
-                        continue;
-                    };
+                    let peer = element.peer;
 
                     if let Some(callback) = &firewall_process_outbound_callback {
-                        if let Some(i) = element.iface {
-                            if !callback(&peer.public_key.0, &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET], &mut i.as_ref()) {
+                            if !callback(&peer.public_key.0, &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET], &mut element.iface.as_ref()) {
                                 continue;
                             }
-                        }
                     }
 
                     let res = {
