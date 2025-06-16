@@ -7,6 +7,14 @@
 # in any real deployments                            #
 ######################################################
 
+if [ "$TEST_TYPE" = "download" ]; then
+    ip link add dev wg1 type wireguard
+    ip link add dev wg2 type wireguard
+else
+    /neptun/base/neptun-cli --disable-drop-privileges wg1
+    /neptun/current/neptun-cli --disable-drop-privileges wg2
+fi
+
 wireguard-go wg0
 wg set wg0 \
     listen-port 51820 \
@@ -17,7 +25,6 @@ wg set wg0 \
 ip address add dev wg0 10.0.0.1/24
 ip link set up dev wg0
 
-/neptun/base/neptun-cli --disable-drop-privileges wg1
 wg set wg1 \
     listen-port 51821 \
     private-key <(echo sKZoT3qgxDm1bWny+1ttoi00qS2KXvo1L4Zb265wr3c=) \
@@ -27,7 +34,6 @@ wg set wg1 \
 ip address add dev wg1 10.0.1.1/24
 ip link set up dev wg1
 
-/neptun/current/neptun-cli --disable-drop-privileges wg2
 wg set wg2 \
     listen-port 51822 \
     private-key <(echo 0Fn5JWI1QGDiaVYLDBSLklIEBUujfpX1oH/UGI2D62k=) \
@@ -50,11 +56,11 @@ echo "TCP bidirectional tests"
 
 echo
 echo "Base NepTUN:"
-iperf3 -i 60 -t 120 --bidir -c 10.0.1.2
+iperf3 -i 60 -t 120 -c 10.0.1.2
 
 echo
 echo "Current NepTUN:"
-iperf3 -i 60 -t 120 --bidir -c 10.0.2.2
+iperf3 -i 60 -t 120 -c 10.0.2.2
 
 sleep 1
 echo
