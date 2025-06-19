@@ -1153,7 +1153,7 @@ impl Device {
                 loop {
                     let mut batched_pkts = Vec::with_capacity(10);
                     let mut tunnel_buffer_exhaused = false;
-                    for _ in 0..batched_pkts.len() {
+                    for _ in 0..batched_pkts.capacity() {
                         let len = match iface
                             .read(&mut t.src_buf[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET])
                         {
