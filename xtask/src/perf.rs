@@ -4,8 +4,15 @@ use xshell::{cmd, Shell};
 #[derive(Parser, Debug)]
 pub struct Cmd {
     /// Git ref of the benchmark base
-    #[arg(short, long)]
+    #[arg(short, long, help = "Git reference to use as the benchmark base")]
     base: String,
+    /// Optional test type ("upload", "download")
+    #[arg(
+        short,
+        long,
+        help = "Type of test to run (\"upload\" or \"download\"). Defaults to \"upload\""
+    )]
+    test_type: Option<String>,
 }
 
 struct GitWorktree {
@@ -46,6 +53,10 @@ impl Cmd {
         let worktree = GitWorktree::new("base", &self.base);
         build_neptun_cli(".");
         build_neptun_cli(&worktree.name);
+
+        if let Some(test_type) = &self.test_type {
+            std::env::set_var("TEST_TYPE", test_type);
+        }
 
         let sh = Shell::new().expect("Failed to create shell object");
         cmd!(

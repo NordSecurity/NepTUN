@@ -47,6 +47,9 @@ jobs:
 
   performance-tests:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        test_type: [ upload, download ]
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
       with:
@@ -55,7 +58,7 @@ jobs:
         sudo apt update
         sudo apt install -y libpcap-dev
     - run: docker build -t neptun-runner:0.0.1 .
-    - run: cargo xtask perf --base main
+    - run: cargo xtask perf --base main --test-type ${{ matrix.test_type }}
 
   xray-tests:
     runs-on: ubuntu-24.04

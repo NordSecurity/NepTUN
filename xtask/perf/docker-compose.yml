@@ -17,6 +17,8 @@ services:
       - ../../target/release:/neptun/current
       - ../../base/target/release:/neptun/base
       - .:/neptun/config
+    environment:
+      - TEST_TYPE=${TEST_TYPE}
 
   right:
     hostname: right
@@ -36,6 +38,8 @@ services:
       - ../../target/release:/neptun/current
       - ../../base/target/release:/neptun/base
       - .:/neptun/config
+    environment:
+      - TEST_TYPE=${TEST_TYPE}
 
 networks:
   default:
