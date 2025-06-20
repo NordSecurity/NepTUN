@@ -63,7 +63,7 @@ const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
 const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
-const NUM_OF_BATCHED_PKTS: usize = 20;
+const NUM_OF_BATCHED_PKTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
