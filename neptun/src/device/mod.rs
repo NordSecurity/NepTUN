@@ -987,17 +987,21 @@ impl Device {
                             }
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
-                            // Forward the packet to the tunnel worker
-                            // This is used to handle only data packets not handshake packets
-                            let worker_data = TunnelWorkerData {
-                                buf_len: packet.len(),
-                                addr,
-                                buffer: t.dst_buf,
-                                iface: t.iface.clone(),
-                                peer: peer.clone(),
-                            };
-                            if let Err(e) = d.socket_to_tunnel_tx.send(worker_data) {
-                                tracing::warn!("Unable to forward data onto tunnel worker {e}");
+                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
+                                if !callback(&peer.public_key.0, packet) {
+                                    continue;
+                                }
+                            }
+
+                            if peer.is_allowed_ip(addr) {
+                                _ = t.iface.as_ref().write(packet);
+                                tracing::trace!(
+                                    message = "Writing packet to tunnel",
+                                    interface = ?t.iface.name(),
+                                    packet_length = packet.len(),
+                                    src_addr = ?addr,
+                                    public_key = peer.public_key.1
+                                );
                             }
                         }
                     };
