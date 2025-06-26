@@ -158,6 +158,8 @@ fn main() {
         firewall_process_inbound_callback: None,
         firewall_process_outbound_callback: None,
         skt_buffer_size,
+        inter_thread_channel_size: None,
+        max_inter_thread_batched_pkts: None,
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(&tun_name, config) {
