@@ -63,7 +63,7 @@ const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
 const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
-const NUM_OF_BATCHED_PKTS: usize = 50;
+const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -144,7 +144,9 @@ pub struct DeviceConfig {
         Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
-    pub skt_buffer_size: Option<u32>,
+    pub skt_buffer_size: Option<usize>,
+    pub inter_thread_channel_size: Option<usize>,
+    pub max_inter_thread_batched_pkts: Option<usize>,
 }
 
 pub struct Device {
@@ -473,16 +475,16 @@ impl Drop for DeviceHandle {
 fn set_sock_opt<T: NixSocket::SetSockOpt<Val = usize>>(
     socket: BorrowedFd<'_>,
     buffer: T,
-    buffer_size: u32,
+    buffer_size: usize,
     buffer_name: &str,
 ) {
-    match NixSocket::setsockopt(&socket, buffer, &(buffer_size as usize)) {
+    match NixSocket::setsockopt(&socket, buffer, &buffer_size) {
         Ok(()) => tracing::info!("Socket buffer {buffer_name:?} set with value {buffer_size}"),
         Err(e) => tracing::warn!("Socket buffer {buffer_name:?} failed with {e}"),
     }
 }
 
-fn modify_skt_buffer_size(socket: BorrowedFd<'_>, buffer_size: u32) {
+fn modify_skt_buffer_size(socket: BorrowedFd<'_>, buffer_size: usize) {
     set_sock_opt(socket, NixSocket::sockopt::RcvBuf, buffer_size, "RcvBuf");
     set_sock_opt(socket, NixSocket::sockopt::SndBuf, buffer_size, "SndBuf");
 }
@@ -617,8 +619,9 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
-        let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
-        let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
+        let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
+        let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
+        let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical());
 
@@ -1060,9 +1063,9 @@ impl Device {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
-
+                let max_batched_pkts = d.config.max_inter_thread_batched_pkts.unwrap_or(MAX_INTERTHREAD_BATCHED_PKTS);
                 loop {
-                    let mut batched_pkts = Vec::with_capacity(NUM_OF_BATCHED_PKTS);
+                    let mut batched_pkts = Vec::with_capacity(max_batched_pkts);
                     let mut socket_buffer_exhausted = false;
                     for _ in 0..batched_pkts.capacity() {
                         // Safety: the `recv_from` implementation promises not to write uninitialised
@@ -1165,8 +1168,12 @@ impl Device {
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
                 let peers = &d.peers_by_ip;
+                let max_batched_pkts = d
+                    .config
+                    .max_inter_thread_batched_pkts
+                    .unwrap_or(MAX_INTERTHREAD_BATCHED_PKTS);
                 loop {
-                    let mut batched_pkts = Vec::with_capacity(NUM_OF_BATCHED_PKTS);
+                    let mut batched_pkts = Vec::with_capacity(max_batched_pkts);
                     let mut tunnel_buffer_exhausted = false;
                     for _ in 0..batched_pkts.capacity() {
                         let mut buffer = [0u8; MAX_PKT_SIZE];
@@ -1405,7 +1412,7 @@ mod tests {
         let _res = socket.set_reuse_address(true);
         let _res = socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into());
 
-        const BUFFER_SIZE: u32 = 11111;
+        const BUFFER_SIZE: usize = 11111;
         modify_skt_buffer_size(socket.as_fd(), BUFFER_SIZE);
 
         let get_buf = NixSocket::getsockopt(&socket.as_fd(), NixSocket::sockopt::RcvBuf).unwrap();

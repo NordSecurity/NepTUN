@@ -112,7 +112,7 @@ impl Peer {
     pub fn connect_endpoint(
         &self,
         port: u16,
-        skt_buffer_size: Option<u32>,
+        skt_buffer_size: Option<usize>,
     ) -> Result<socket2::Socket, Error> {
         let mut endpoint = self.endpoint.write();
 
