@@ -94,7 +94,9 @@ impl Peer {
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
-            conn.shutdown(Shutdown::Both).unwrap();
+            if let Err(e) = conn.shutdown(Shutdown::Both) {
+                tracing::error!("Error in conn shutdown {}", e);
+            }
         }
     }
 

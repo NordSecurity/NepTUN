@@ -280,7 +280,9 @@ impl DeviceHandle {
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     pub fn wait(&mut self) {
         while let Some(thread) = self.threads.pop() {
-            thread.join().unwrap();
+            if let Err(e) = thread.join() {
+                tracing::error!("Unable to gracefully close thread. {:?}", e);
+            }
         }
     }
 
