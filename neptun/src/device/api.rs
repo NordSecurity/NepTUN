@@ -300,6 +300,7 @@ fn api_set_peer<R: Read>(
     d: &mut Device,
     pub_key: x25519::PublicKey,
 ) -> i32 {
+    panic!("Manually triggered panic");
     let mut cmd = String::new();
 
     let mut update_only = false;
