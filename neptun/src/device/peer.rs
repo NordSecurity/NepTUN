@@ -94,6 +94,7 @@ impl Peer {
     pub fn shutdown_endpoint(&self) {
         if let Some(conn) = self.endpoint.write().conn.take() {
             tracing::info!("Disconnecting from endpoint");
+            panic!("Manually triggered panic 1");
             conn.shutdown(Shutdown::Both).unwrap();
         }
     }
