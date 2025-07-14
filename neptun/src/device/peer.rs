@@ -106,7 +106,9 @@ impl Peer {
             return;
         }
         if let Some(conn) = endpoint.conn.take() {
-            conn.shutdown(Shutdown::Both).unwrap();
+            if let Err(e) = conn.shutdown(Shutdown::Both) {
+                tracing::error!("Error in conn shutdown {}", e);
+            }
         }
         endpoint.addr = Some(addr);
     }
@@ -122,9 +124,14 @@ impl Peer {
             return Err(Error::Connect("Connected".to_owned()));
         }
 
-        let addr = endpoint
-            .addr
-            .expect("Attempt to connect to undefined endpoint");
+        let addr = if let Some(addr) = endpoint.addr {
+            addr
+        } else {
+            tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
+            return Err(Error::InternalError(
+                "Peer endpoint was not specified".to_owned(),
+            ));
+        };
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
@@ -144,10 +151,10 @@ impl Peer {
         tracing::info!(
             message="Connected endpoint",
             port=port,
-            endpoint=?endpoint.addr.unwrap()
+            endpoint=?addr
         );
 
-        endpoint.conn = Some(udp_conn.try_clone().unwrap());
+        endpoint.conn = Some(udp_conn.try_clone()?);
 
         if let Some(buffer_size) = skt_buffer_size {
             modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
