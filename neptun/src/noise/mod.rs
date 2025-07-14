@@ -304,7 +304,10 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = match session.format_packet_data(src, dst) {
+                Ok(packet) => packet,
+                Err(e) => return TunnResult::Err(e)
+            };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -459,7 +462,10 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = match session.format_packet_data(&[], dst) {
+            Ok(packet) => packet,
+            Err(e) => return Err(e)
+        };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
