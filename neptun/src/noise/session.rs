@@ -224,7 +224,10 @@ impl Session {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     src.len() + AEAD_SIZE
                 })
-                .unwrap()
+                .unwrap_or_else(|e| {
+                    tracing::error!("Error calculating size {}", e);
+                    0
+                })
         };
 
         &mut dst[..DATA_OFFSET + n]
