@@ -20,4 +20,5 @@ pub enum WireGuardError {
     LockFailed,
     ConnectionExpired,
     UnderLoad,
+    CryptoFailed,
 }

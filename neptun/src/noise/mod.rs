@@ -143,31 +143,58 @@ impl Tunn {
         }
 
         // Checks the type, as well as the reserved zero fields
-        let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
+        let packet_type = u32::from_le_bytes(src[0..4].try_into().map_err(|e| {
+            tracing::error!("Error getting packet type {}", e);
+            WireGuardError::InvalidPacket
+        })?);
 
         Ok(match (packet_type, src.len()) {
             (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                sender_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
+                    tracing::error!("Error getting HANDSHAKE_INIT sender_idx {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                    .expect("length already checked above"),
+                    .map_err(|e| {
+                        tracing::error!("Error getting HANDSHAKE_INIT unencrypted_ephemeral {}", e);
+                        WireGuardError::InvalidPacket
+                    })?,
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                sender_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
+                    tracing::error!("Error getting HANDSHAKE_RESP sender_idx {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
+                receiver_idx: u32::from_le_bytes(src[8..12].try_into().map_err(|e| {
+                    tracing::error!("Error getting HANDSHAKE_RESP receiver_idx {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("length already checked above"),
+                    .map_err(|e| {
+                        tracing::error!("Error getting HANDSHAKE_RESP unencrypted_ephemeral {}", e);
+                        WireGuardError::InvalidPacket
+                    })?,
                 encrypted_nothing: &src[44..60],
             }),
             (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                receiver_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
+                    tracing::error!("Error getting COOKIE_REPLY receiver_idx {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
             (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
-                receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
+                receiver_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
+                    tracing::error!("Error getting DATA receiver_idx {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
+                counter: u64::from_le_bytes(src[8..16].try_into().map_err(|e| {
+                    tracing::error!("Error getting DATA counter {}", e);
+                    WireGuardError::InvalidPacket
+                })?),
                 encrypted_encapsulated_packet: &src[16..],
             }),
             _ => return Err(WireGuardError::InvalidPacket),
@@ -188,14 +215,14 @@ impl Tunn {
                 let addr_bytes: [u8; IPV4_IP_SZ] = packet
                     [IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ]
                     .try_into()
-                    .unwrap();
+                    .ok()?;
                 Some(IpAddr::from(addr_bytes))
             }
             6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
                 let addr_bytes: [u8; IPV6_IP_SZ] = packet
                     [IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ]
                     .try_into()
-                    .unwrap();
+                    .ok()?;
                 Some(IpAddr::from(addr_bytes))
             }
             _ => None,
@@ -285,7 +312,10 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src_len, dst);
+            let packet = match session.format_packet_data(src_len, dst) {
+                Ok(packet) => packet,
+                Err(e) => return TunnResult::Err(e),
+            };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if src_len.ne(&0) {
@@ -440,7 +470,10 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(0, dst);
+        let keepalive_packet = match session.format_packet_data(0, dst) {
+            Ok(packet) => packet,
+            Err(e) => return Err(e),
+        };
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -563,26 +596,44 @@ impl Tunn {
                 return TunnResult::Done; // This is keepalive, and not an error
             }
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    [IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ]
-                    .try_into()
-                    .unwrap();
+                let len_bytes: [u8; IP_LEN_SZ] =
+                    match packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].try_into() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Error getting IPV4 len_bytes {}", e);
+                            return TunnResult::Err(WireGuardError::InvalidPacket);
+                        }
+                    };
+                let addr_bytes: [u8; IPV4_IP_SZ] =
+                    match packet[IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ].try_into() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Error getting IPV4 addr_bytes {}", e);
+                            return TunnResult::Err(WireGuardError::InvalidPacket);
+                        }
+                    };
                 (
                     u16::from_be_bytes(len_bytes) as usize,
                     IpAddr::from(addr_bytes),
                 )
             }
             _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
-                    .try_into()
-                    .unwrap();
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    [IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ]
-                    .try_into()
-                    .unwrap();
+                let len_bytes: [u8; IP_LEN_SZ] =
+                    match packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ].try_into() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Error getting IPV6 len_bytes {}", e);
+                            return TunnResult::Err(WireGuardError::InvalidPacket);
+                        }
+                    };
+                let addr_bytes: [u8; IPV6_IP_SZ] =
+                    match packet[IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ].try_into() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("Error getting IPV6 addr_bytes {}", e);
+                            return TunnResult::Err(WireGuardError::InvalidPacket);
+                        }
+                    };
                 (
                     u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
                     IpAddr::from(addr_bytes),

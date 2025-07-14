@@ -144,7 +144,10 @@ fn aead_chacha20_open_inner(
     data: &[u8],
     aad: &[u8],
 ) -> Result<(), ring::error::Unspecified> {
-    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
+    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).map_err(|e| {
+        tracing::error!("Error getting key {}", e);
+        ring::error::Unspecified
+    })?);
 
     let mut inner_buffer = data.to_owned();
 
@@ -208,8 +211,14 @@ impl Tai64N {
         }
 
         let (sec_bytes, nano_bytes) = buf.split_at(std::mem::size_of::<u64>());
-        let secs = u64::from_be_bytes(sec_bytes.try_into().unwrap());
-        let nano = u32::from_be_bytes(nano_bytes.try_into().unwrap());
+        let secs = u64::from_be_bytes(sec_bytes.try_into().map_err(|e| {
+            tracing::error!("Error parsing timestamp {}", e);
+            WireGuardError::InvalidTai64nTimestamp
+        })?);
+        let nano = u32::from_be_bytes(nano_bytes.try_into().map_err(|e| {
+            tracing::error!("Error parsing timestamp {}", e);
+            WireGuardError::InvalidTai64nTimestamp
+        })?);
 
         // WireGuard does not actually expect tai64n timestamp, just monotonically increasing one
         //if secs < (1u64 << 62) || secs >= (1u64 << 63) {
@@ -673,7 +682,7 @@ impl Handshake {
             msg: packet.encrypted_cookie,
         };
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
-            .unwrap()
+            .map_err(|_| WireGuardError::InvalidAeadTag)?
             .decrypt(packet.nonce.into(), payload)
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
@@ -809,7 +818,8 @@ impl Handshake {
                 peer_index,
             } => (chaining_key, hash, peer_ephemeral_public, peer_index),
             _ => {
-                panic!("Unexpected attempt to call send_handshake_response");
+                tracing::error!("Unexpected attempt to call send_handshake_response");
+                return Err(WireGuardError::UnexpectedPacket);
             }
         };
 
