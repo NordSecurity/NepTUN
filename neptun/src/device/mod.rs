@@ -542,20 +542,33 @@ impl Device {
         preshared_key: Option<[u8; 32]>,
     ) -> Result<Arc<Peer>, Error> {
         let next_index = self.next_index();
-        let device_key_pair = self
-            .key_pair
-            .as_ref()
-            .expect("Private key must be set first");
+        let device_key_pair = match self.key_pair.as_ref() {
+            Some(keypair) => keypair,
+            None => {
+                tracing::error!("No device keypair specified for a peer");
+                return Err(Error::InternalError(
+                    "No device keypair specified for a peer".to_owned(),
+                ));
+            }
+        };
 
-        let tunn = Tunn::new(
+        let tunn = match Tunn::new(
             device_key_pair.0.clone(),
             pub_key.clone(),
             preshared_key,
             keepalive,
             next_index,
             None,
-        )
-        .unwrap();
+        ) {
+            Ok(tunn) => tunn,
+            Err(e) => {
+                tracing::error!("Failed to create state for peer {0}", e);
+                return Err(Error::InternalError(format!(
+                    "Failed to create state for peer {0}",
+                    e
+                )));
+            }
+        };
 
         let peer = Arc::new(Peer::new(
             tunn,
@@ -658,7 +671,9 @@ impl Device {
 
         if port == 0 {
             // Random port was assigned
-            port = udp_sock4.local_addr()?.as_socket().unwrap().port();
+            if let Some(socket) = udp_sock4.local_addr()?.as_socket() {
+                port = socket.port();
+            }
         }
 
         let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
@@ -831,13 +846,17 @@ impl Device {
     }
 
     pub fn trigger_yield(&self) {
-        self.queue
-            .trigger_notification(self.yield_notice.as_ref().unwrap())
+        match self.yield_notice.as_ref() {
+            Some(notice) => self.queue.trigger_notification(notice),
+            None => tracing::error!("Notification requested while there is no notice"),
+        }
     }
 
     pub(crate) fn trigger_exit(&self) {
-        self.queue
-            .trigger_notification(self.exit_notice.as_ref().unwrap())
+        match self.exit_notice.as_ref() {
+            Some(notice) => self.queue.trigger_notification(notice),
+            None => tracing::error!("Exit requested while there is no notice"),
+        }
     }
 
     pub(crate) fn drop_connected_sockets(&self) {
@@ -851,8 +870,10 @@ impl Device {
     }
 
     pub fn cancel_yield(&self) {
-        self.queue
-            .stop_notification(self.yield_notice.as_ref().unwrap())
+        match self.yield_notice.as_ref() {
+            Some(notice) => self.queue.stop_notification(notice),
+            None => tracing::error!("Cancellation requested while there is no notice"),
+        }
     }
 
     fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
@@ -863,7 +884,7 @@ impl Device {
                 let mut iter = MAX_ITR;
                 let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
 
-                let rate_limiter = d.rate_limiter.as_ref().unwrap();
+                let rate_limiter = d.rate_limiter.as_ref();
 
                 // Loop while we have packets on the anonymous connection
 
@@ -873,8 +894,9 @@ impl Device {
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
                     let packet = &t.src_buf[..packet_len];
+
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-                    let parsed_packet =
+                    let parsed_packet = if let Some(rate_limiter) = rate_limiter {
                         match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
                             Ok(packet) => packet,
                             Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -884,7 +906,13 @@ impl Device {
                                 continue;
                             }
                             Err(_) => continue,
-                        };
+                        }
+                    } else {
+                        match Tunn::parse_incoming_packet(packet) {
+                            Ok(packet) => packet,
+                            Err(_) => continue,
+                        }
+                    };
 
                     let peer = match &parsed_packet {
                         Packet::HandshakeInit(p) => {
@@ -983,8 +1011,10 @@ impl Device {
                     if d.config.use_connected_socket {
                         // No need for aditional checking, as from this point all packets will arive to connected socket handler
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
-                                .unwrap();
+                            if let Err(e) = d.register_conn_handler(Arc::clone(peer), sock, ip_addr) {
+                                tracing::error!("Failed to register connected socket handler {0}", e);
+                                peer.shutdown_endpoint();
+                            }
                         }
                     }
 
