@@ -94,6 +94,8 @@ pub enum Error {
     ApiSocket(io::Error),
     #[error("Set tunnel error: Failed to get device lock when setting tunnel")]
     SetTunnel,
+    #[error("Internal error occured: {0}")]
+    InternalError(String),
 }
 
 // What the event loop should do after a handler returns
