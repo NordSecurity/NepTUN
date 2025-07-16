@@ -196,6 +196,7 @@ impl DeviceHandle {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<DeviceHandle, Error> {
+        tracing::info!("NepTUN starting up");
         let n_threads = config.n_threads;
         let mut wg_interface = Device::new_with_tun(tun, config)?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
