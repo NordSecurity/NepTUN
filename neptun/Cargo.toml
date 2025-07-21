@@ -9,6 +9,7 @@ authors = [
 ]
 license = "BSD-3-Clause"
 edition = "2018"
+build = "build.rs"
 
 [features]
 default = []
