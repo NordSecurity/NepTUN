@@ -225,7 +225,7 @@ type EventLoopThreads = Result<
 
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        tracing::info!("NepTUN starting up. GIT_SHA: {}", env!("VERGEN_GIT_SHA"));
+        tracing::info!("NepTUN starting up. GIT_SHA: {}", env!("GIT_SHA"));
         Self::new_with_tun(TunSocket::new(name)?, config)
     }
 
