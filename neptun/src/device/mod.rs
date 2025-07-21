@@ -576,33 +576,23 @@ impl Device {
         preshared_key: Option<[u8; 32]>,
     ) -> Result<Arc<Peer>, Error> {
         let next_index = self.next_index();
-        let device_key_pair = match self.key_pair.as_ref() {
-            Some(keypair) => keypair,
-            None => {
-                tracing::error!("No device keypair specified for a peer");
-                return Err(Error::InternalError(
-                    "No device keypair specified for a peer".to_owned(),
-                ));
-            }
-        };
+        let device_key_pair = self.key_pair.as_ref().ok_or_else(|| {
+            tracing::error!("No device keypair specified for a peer");
+            Error::InternalError("No device keypair specified for a peer".to_owned())
+        })?;
 
-        let tunn = match Tunn::new(
+        let tunn = Tunn::new(
             device_key_pair.0.clone(),
             pub_key.clone(),
             preshared_key,
             keepalive,
             next_index,
             None,
-        ) {
-            Ok(tunn) => tunn,
-            Err(e) => {
-                tracing::error!("Failed to create state for peer {}", e);
-                return Err(Error::InternalError(format!(
-                    "Failed to create state for peer {}",
-                    e
-                )));
-            }
-        };
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to create state for peer {}", e);
+            Error::InternalError(format!("Failed to create state for peer {}", e))
+        })?;
 
         let peer = Arc::new(Peer::new(
             tunn,
@@ -969,21 +959,24 @@ impl Device {
                     let packet = &t.src_buf[..packet_len];
 
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-                    let parsed_packet = if let Some(rate_limiter) = rate_limiter {
-                        match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
-                            Ok(packet) => packet,
-                            Err(TunnResult::WriteToNetwork(cookie)) => {
-                                if let Err(err) = udp.send_to(cookie, &addr) {
-                                    tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
+                    let parsed_packet = match rate_limiter {
+                        Some(rate_limiter) => {
+                            match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
+                                Ok(packet) => packet,
+                                Err(TunnResult::WriteToNetwork(cookie)) => {
+                                    if let Err(err) = udp.send_to(cookie, &addr) {
+                                        tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
+                                    }
+                                    continue;
                                 }
-                                continue;
+                                Err(_) => continue,
                             }
-                            Err(_) => continue,
-                        }
-                    } else {
-                        match Tunn::parse_incoming_packet(packet) {
-                            Ok(packet) => packet,
-                            Err(_) => continue,
+                        },
+                        None => {
+                            match Tunn::parse_incoming_packet(packet) {
+                                Ok(packet) => packet,
+                                Err(_) => continue,
+                            }
                         }
                     };
 

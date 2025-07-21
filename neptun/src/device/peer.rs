@@ -124,14 +124,14 @@ impl Peer {
             return Err(Error::Connect("Connected".to_owned()));
         }
 
-        let addr = if let Some(addr) = endpoint.addr {
-            addr
-        } else {
-            tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
-            return Err(Error::InternalError(
-                "Peer endpoint was not specified".to_owned(),
-            ));
-        };
+        let addr = endpoint.addr.ok_or_else(||
+            {
+                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
+                Error::InternalError(
+                    "Peer endpoint was not specified".to_owned(),
+                )
+            }
+        )?;
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;

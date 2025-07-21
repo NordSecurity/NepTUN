@@ -470,10 +470,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = match session.format_packet_data(0, dst) {
-            Ok(packet) => packet,
-            Err(e) => return Err(e),
-        };
+        let keepalive_packet = session.format_packet_data(0, dst)?;
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
