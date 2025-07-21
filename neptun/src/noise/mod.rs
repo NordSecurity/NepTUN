@@ -306,7 +306,7 @@ impl Tunn {
             // Send the packet using an established session
             let packet = match session.format_packet_data(src, dst) {
                 Ok(packet) => packet,
-                Err(e) => return TunnResult::Err(e)
+                Err(e) => return TunnResult::Err(e),
             };
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
@@ -462,10 +462,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = match session.format_packet_data(&[], dst) {
-            Ok(packet) => packet,
-            Err(e) => return Err(e)
-        };
+        let keepalive_packet = session.format_packet_data(&[], dst)?;
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;

@@ -194,10 +194,18 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> Result<&'a mut [u8], WireGuardError> {
+    pub(super) fn format_packet_data<'a>(
+        &self,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
-            tracing::warn!("Destination packet is too small: {} {}", dst.len(), src.len());
-            return Err(WireGuardError::IncorrectPacketLength)
+            tracing::warn!(
+                "Destination packet is too small: {} {}",
+                dst.len(),
+                src.len()
+            );
+            return Err(WireGuardError::IncorrectPacketLength);
         }
 
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
@@ -225,8 +233,8 @@ impl Session {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     src.len() + AEAD_SIZE
                 })
-                .or_else(|e|{
-                    tracing::error!("Failed to encrypt a packet {0}", e);
+                .or_else(|e| {
+                    tracing::error!("Failed to encrypt a packet {}", e);
                     Err(WireGuardError::CryptoFailed)
                 })?
         };
