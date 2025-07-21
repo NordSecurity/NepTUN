@@ -198,9 +198,14 @@ impl Session {
         &self,
         payload_len: usize,
         packet_buffer: &'a mut [u8],
-    ) -> &'a mut [u8] {
+    ) -> Result<&'a mut [u8], WireGuardError> {
         if packet_buffer.len() < payload_len + super::DATA_OVERHEAD_SZ {
-            panic!("The destination buffer is too small");
+            tracing::warn!(
+                "Destination packet is too small: {} < {}",
+                packet_buffer.len(),
+                payload_len + super::DATA_OVERHEAD_SZ
+            );
+            return Err(WireGuardError::IncorrectPacketLength);
         }
 
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
@@ -227,10 +232,13 @@ impl Session {
                     data[payload_len..payload_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
                     payload_len + AEAD_SIZE
                 })
-                .unwrap()
+                .or_else(|e| {
+                    tracing::error!("Failed to encrypt a packet {}", e);
+                    Err(WireGuardError::CryptoFailed)
+                })?
         };
 
-        &mut packet_buffer[..DATA_OFFSET + n]
+        Ok(&mut packet_buffer[..DATA_OFFSET + n])
     }
 
     /// packet - a data packet we received from the network
