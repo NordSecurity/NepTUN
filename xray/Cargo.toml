@@ -20,6 +20,5 @@ tokio = { version = "1.41", features = ["macros", "rt-multi-thread", "time", "ne
 x25519-dalek = "2.0"
 
 [dependencies.neptun]
-version = "0.6.0"
 path = "../neptun"
 features = ["device", "xray"]
