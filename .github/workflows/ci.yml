@@ -19,6 +19,26 @@ jobs:
     needs: trigger
     uses: ./.github/workflows/linters.yml
 
+  coverage:
+    needs: trigger
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust
+      run: rustup update stable
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Generate code coverage
+      run: |
+        sudo apt-get install -y libpcap-dev
+        cargo xtask code-coverage --context ci
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: lcov.info
+        fail_ci_if_error: true
+
   tests:
     needs: trigger
     uses: ./.github/workflows/tests.yml
@@ -27,6 +47,7 @@ jobs:
     needs:
     - linters
     - tests
+    - coverage
     runs-on: ubuntu-24.04
     steps:
     - name: Collect statuses from all jobs
