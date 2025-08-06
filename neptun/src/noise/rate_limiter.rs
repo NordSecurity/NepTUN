@@ -8,7 +8,6 @@ use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, W
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
@@ -30,13 +29,14 @@ const RESET_PERIOD: u64 = 1;
 type Cookie = [u8; COOKIE_SIZE];
 
 /// There are two places where WireGuard requires "randomness" for cookies
-/// * The 24 byte nonce in the cookie massage - here the only goal is to avoid nonce reuse
+/// * The 24 byte nonce in the cookie message - here the only goal is to avoid nonce reuse
 /// * A secret value that changes every two minutes
-/// Because the main goal of the cookie is simply for a party to prove ownership of an IP address
-/// we can relax the randomness definition a bit, in order to avoid locking, because using less
-/// resources is the main goal of any DoS prevention mechanism.
-/// In order to avoid locking and calls to rand we derive pseudo random values using the AEAD and
+/// The main goal of the cookie is simply for a party to prove ownership of an IP address.
+/// In order to avoid calls to rand we derive pseudo random values using the AEAD and
 /// some counters.
+/// Mutex<u64> is used in order to support 32bit targets without sacrificing security.
+/// Given low number of peers the mutex should not introduce observable contention. If it happens
+/// then AtomicU32 should be considered with reduced security guarantees(as it wraps around sooner).
 pub struct RateLimiter {
     /// The key we use to derive the nonce
     nonce_key: [u8; 32],
@@ -44,12 +44,12 @@ pub struct RateLimiter {
     secret_key: [u8; 16],
     start_time: Instant,
     /// A single 64 bit counter (should suffice for many years)
-    nonce_ctr: AtomicU64,
+    nonce_ctr: Mutex<u64>,
     mac1_key: [u8; 32],
     cookie_key: Key,
     limit: u64,
-    /// The counter since last reset
-    count: AtomicU64,
+    /// The counter since last reset    
+    count: Mutex<u64>,
     /// The time last reset was performed on this rate limiter
     last_reset: Mutex<Instant>,
 }
@@ -62,11 +62,11 @@ impl RateLimiter {
             nonce_key: Self::rand_bytes(),
             secret_key,
             start_time: Instant::now(),
-            nonce_ctr: AtomicU64::new(0),
+            nonce_ctr: Mutex::new(0),
             mac1_key: b2s_hash(LABEL_MAC1, public_key.as_bytes()),
             cookie_key: b2s_hash(LABEL_COOKIE, public_key.as_bytes()).into(),
             limit,
-            count: AtomicU64::new(0),
+            count: Mutex::new(0),
             last_reset: Mutex::new(Instant::now()),
         }
     }
@@ -83,7 +83,7 @@ impl RateLimiter {
         let current_time = Instant::now();
         let mut last_reset_time = self.last_reset.lock();
         if current_time.duration_since(*last_reset_time).as_secs() >= RESET_PERIOD {
-            self.count.store(0, Ordering::SeqCst);
+            *self.count.lock() = 0;
             *last_reset_time = current_time;
         }
     }
@@ -106,13 +106,25 @@ impl RateLimiter {
     }
 
     fn nonce(&self) -> [u8; COOKIE_NONCE_SIZE] {
-        let ctr = self.nonce_ctr.fetch_add(1, Ordering::Relaxed);
+        let old_val = {
+            let mut lock = self.nonce_ctr.lock();
+            let val = *lock;
+            *lock += 1;
+            val
+        };
 
-        b2s_mac_24(&self.nonce_key, &ctr.to_le_bytes())
+        b2s_mac_24(&self.nonce_key, &old_val.to_le_bytes())
     }
 
     fn is_under_load(&self) -> bool {
-        self.count.fetch_add(1, Ordering::SeqCst) >= self.limit
+        let old_val = {
+            let mut lock = self.count.lock();
+            let val = *lock;
+            *lock += 1;
+            val
+        };
+
+        old_val >= self.limit
     }
 
     pub(crate) fn format_cookie_reply<'a>(
