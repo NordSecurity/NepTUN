@@ -180,8 +180,8 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    close_network_worker_tx: Sender<()>,
-    close_network_worker_rx: Receiver<()>,
+    close_network_worker_tx: Option<Sender<()>>,
+    close_tun_worker_tx: Option<Sender<()>>,
 
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
     tunnel_to_socket_tx: Sender<Vec<NetworkTaskData>>,
@@ -630,8 +630,6 @@ impl Device {
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
         let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
-        let (close_network_worker_tx, close_network_worker_rx) =
-            crossbeam_channel::bounded(num_cpus::get_physical());
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -654,10 +652,10 @@ impl Device {
             rate_limiter: None,
             tunnel_to_socket_tx,
             tunnel_to_socket_rx,
-            close_network_worker_tx,
-            close_network_worker_rx,
+            close_network_worker_tx: None,
             socket_to_tunnel_tx,
             socket_to_tunnel_rx,
+            close_tun_worker_tx: None,
             update_seq: 0,
         };
 
@@ -684,9 +682,16 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            for _ in 0..num_cpus::get_physical() {
-                if let Err(e) = self.close_network_worker_tx.send(()) {
-                    tracing::error!("Unable to close network thread {e}");
+            if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
+                for _ in 0..num_cpus::get_physical() {
+                    if let Err(e) = close_network_worker_tx.try_send(()) {
+                        tracing::error!("Unable to close network thread {e}");
+                    }
+                }
+            }
+            if let Some(close_tun_worker_tx) = &self.close_tun_worker_tx {
+                if let Err(e) = close_tun_worker_tx.try_send(()) {
+                    tracing::error!("Unable to close tun thread {e}");
                 }
             }
             unsafe {
@@ -737,10 +742,17 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
+        // Construct a different closing channel per thread
+        let (close_network_worker_tx, close_network_worker_rx) =
+            crossbeam_channel::bounded(num_cpus::get_physical() * 5);
+        let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
+        self.close_network_worker_tx = Some(close_network_worker_tx);
+        self.close_tun_worker_tx = Some(close_tun_worker_tx);
+
         // Process packet in a seperate thread
         for _ in 0..num_cpus::get_physical() {
             let rx_clone = self.tunnel_to_socket_rx.clone();
-            let close_chan_clone = self.close_network_worker_rx.clone();
+            let close_chan_clone = close_network_worker_rx.clone();
             let udp4_c = udp4.clone();
             let udp6_c = udp6.clone();
             let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
@@ -755,7 +767,7 @@ impl Device {
 
         let rx_clone = self.socket_to_tunnel_rx.clone();
         let fw_callback = self.config.firewall_process_inbound_callback.clone();
-        thread::spawn(move || write_to_tun_worker(rx_clone, fw_callback));
+        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
 
         self.listen_port = port;
 
@@ -1354,29 +1366,37 @@ fn write_to_socket_worker(
 
 fn write_to_tun_worker(
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
+    close_chan: Receiver<()>,
     firewall_process_inbound_callback: Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
 ) {
     loop {
-        if let Ok(batched_pkts) = socket_to_tunnel_rx.recv() {
-            for t in batched_pkts {
-                let peer = t.peer;
+        crossbeam_channel::select! {
+            recv(socket_to_tunnel_rx) -> batched_pkts => {
+                if let Ok(batched_pkts) = batched_pkts {
+                    for t in batched_pkts {
+                        let peer = t.peer;
 
-                if let Some(callback) = &firewall_process_inbound_callback {
-                    if !callback(&peer.public_key.0, &t.buffer[..t.buf_len]) {
-                        continue;
+                        if let Some(callback) = &firewall_process_inbound_callback {
+                            if !callback(&peer.public_key.0, &t.buffer[..t.buf_len]) {
+                                continue;
+                            }
+                        }
+                        if peer.is_allowed_ip(t.addr) {
+                            _ = t.iface.as_ref().write(&t.buffer[..t.buf_len]);
+                            tracing::trace!(
+                                message = "Writing packet to tunnel",
+                                packet_length = t.buf_len,
+                                src_addr = ?t.addr,
+                                public_key = peer.public_key.1
+                            );
+                        }
                     }
                 }
-                if peer.is_allowed_ip(t.addr) {
-                    _ = t.iface.as_ref().write(&t.buffer[..t.buf_len]);
-                    tracing::trace!(
-                        message = "Writing packet to tunnel",
-                        packet_length = t.buf_len,
-                        src_addr = ?t.addr,
-                        public_key = peer.public_key.1
-                    );
-                }
             }
-        };
+            recv(close_chan) -> _n => {
+                break;
+            }
+        }
     }
 }
 
