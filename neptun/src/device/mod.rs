@@ -619,7 +619,7 @@ impl Device {
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(CHANNEL_SIZE);
         let (close_network_worker_tx, close_network_worker_rx) =
-            crossbeam_channel::bounded(num_cpus::get_physical());
+            crossbeam_channel::bounded(num_cpus::get_physical() / 2);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -672,7 +672,7 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            for _ in 0..num_cpus::get_physical() {
+            for _ in 0..num_cpus::get_physical() / 2 {
                 if let Err(e) = self.close_network_worker_tx.send(()) {
                     tracing::error!("Unable to close network thread {e}");
                 }
@@ -724,7 +724,7 @@ impl Device {
         self.udp6 = Some(udp6.clone());
 
         // Process packet in a seperate thread
-        for _ in 0..num_cpus::get_physical() {
+        for _ in 0..num_cpus::get_physical() / 2 {
             let rx_clone = self.tunnel_to_socket_rx.clone();
             let close_chan_clone = self.close_network_worker_rx.clone();
             let udp4_c = udp4.clone();
