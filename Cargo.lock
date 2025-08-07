@@ -837,7 +837,7 @@ checksum = "717e29a243b81f8130e31e24e04fb151b04a44b5a7d05370935f7d937e9de06d"
 
 [[package]]
 name = "neptun"
-version = "2.2.1"
+version = "2.3.1"
 dependencies = [
  "aead",
  "base64 0.13.1",
