@@ -156,7 +156,10 @@ impl TunSocket {
             ctl_id: 0,
             ctl_name: [0u8; 96],
         };
-        info.ctl_name[..CTRL_NAME.len()].copy_from_slice(CTRL_NAME);
+        #[allow(clippy::indexing_slicing)]
+        {
+            info.ctl_name[..CTRL_NAME.len()].copy_from_slice(CTRL_NAME);
+        }
 
         if unsafe { ioctl(fd, CTLIOCGINFO, &mut info as *mut ctl_info) } < 0 {
             unsafe { close(fd) };
@@ -226,6 +229,7 @@ impl TunSocket {
             return Err(Error::GetSockOpt(io::Error::last_os_error()));
         }
 
+        #[allow(clippy::indexing_slicing)]
         Ok(String::from_utf8_lossy(&tunnel_name[..(tunnel_name_len - 1) as usize]).to_string())
     }
 
@@ -243,7 +247,10 @@ impl TunSocket {
             ifr_ifru: IfrIfru { ifru_mtu: 0 },
         };
 
-        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+        #[allow(clippy::indexing_slicing)]
+        {
+            ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+        }
 
         if unsafe { ioctl(fd, SIOCGIFMTU, &ifr) } < 0 {
             return Err(Error::IOCtl(io::Error::last_os_error()));
@@ -280,8 +287,12 @@ impl TunSocket {
 
         match unsafe { recvmsg(self.fd, &mut msg_hdr, 0) } {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
-            0..=4 => Ok(&mut dst[..0]),
-            n => Ok(&mut dst[..(n - 4) as usize]),
+            0..=4 => Ok(dst
+                .get_mut(..0)
+                .ok_or(Error::InternalError("Zero index out of bounds".to_owned()))?),
+            n => Ok(dst
+                .get_mut(..(n - 4) as usize)
+                .ok_or(Error::InternalError("(n-4) Index out of bounds".to_owned()))?),
         }
     }
 

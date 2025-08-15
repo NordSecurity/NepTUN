@@ -21,4 +21,8 @@ pub enum WireGuardError {
     ConnectionExpired,
     UnderLoad,
     CryptoFailed,
+    InvalidLength,
+    InvalidIndex,
+    RingUnspecifiedError,
+    SystemTimeError,
 }

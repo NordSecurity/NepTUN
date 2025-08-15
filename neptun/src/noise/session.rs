@@ -48,6 +48,7 @@ struct ReceivingKeyCounterValidator {
 }
 
 impl ReceivingKeyCounterValidator {
+    #[allow(clippy::indexing_slicing)]
     #[inline(always)]
     fn set_bit(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
@@ -56,6 +57,7 @@ impl ReceivingKeyCounterValidator {
         self.bitmap[word] |= 1 << bit;
     }
 
+    #[allow(clippy::indexing_slicing)]
     #[inline(always)]
     fn clear_bit(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
@@ -65,6 +67,7 @@ impl ReceivingKeyCounterValidator {
     }
 
     /// Clear the word that contains idx
+    #[allow(clippy::indexing_slicing)]
     #[inline(always)]
     fn clear_word(&mut self, idx: u64) {
         let bit_idx = idx % N_BITS;
@@ -73,6 +76,7 @@ impl ReceivingKeyCounterValidator {
     }
 
     /// Returns true if bit is set, false otherwise
+    #[allow(clippy::indexing_slicing)]
     #[inline(always)]
     fn check_bit(&self, idx: u64) -> bool {
         let bit_idx = idx % N_BITS;
@@ -158,17 +162,21 @@ impl Session {
         peer_index: u32,
         receiving_key: [u8; 32],
         sending_key: [u8; 32],
-    ) -> Session {
-        Session {
+    ) -> Result<Session, WireGuardError> {
+        Ok(Session {
             receiving_index: local_index,
             sending_index: peer_index,
             receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
+                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key)
+                    .map_err(|_| WireGuardError::RingUnspecifiedError)?,
             ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            sender: LessSafeKey::new(
+                UnboundKey::new(&CHACHA20_POLY1305, &sending_key)
+                    .map_err(|_| WireGuardError::RingUnspecifiedError)?,
+            ),
             sending_key_counter: AtomicUsize::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
-        }
+        })
     }
 
     pub(super) fn local_index(&self) -> usize {
@@ -221,24 +229,33 @@ impl Session {
         // TODO: spec requires padding to 16 bytes, but actually works fine without it
         let n = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+            nonce
+                .get_mut(4..12)
+                .ok_or(WireGuardError::InvalidIndex)?
+                .copy_from_slice(&sending_key_counter.to_le_bytes());
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..payload_len],
+                    data.get_mut(..payload_len)
+                        .ok_or(WireGuardError::InvalidLength)?,
                 )
                 .map(|tag| {
-                    data[payload_len..payload_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    #[allow(clippy::indexing_slicing)]
+                    {
+                        data[payload_len..payload_len + AEAD_SIZE].copy_from_slice(tag.as_ref());
+                    }
                     payload_len + AEAD_SIZE
                 })
-                .or_else(|e| {
+                .map_err(|e| {
                     tracing::error!("Failed to encrypt a packet {}", e);
-                    Err(WireGuardError::CryptoFailed)
+                    WireGuardError::CryptoFailed
                 })?
         };
 
-        Ok(&mut packet_buffer[..DATA_OFFSET + n])
+        packet_buffer
+            .get_mut(..DATA_OFFSET + n)
+            .ok_or(WireGuardError::InvalidLength)
     }
 
     /// packet - a data packet we received from the network
@@ -253,7 +270,7 @@ impl Session {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
         if packet.receiver_idx != self.receiving_index {
             return Err(WireGuardError::WrongIndex);
@@ -263,13 +280,18 @@ impl Session {
 
         let ret = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            nonce
+                .get_mut(4..12)
+                .ok_or(WireGuardError::InvalidIndex)?
+                .copy_from_slice(&packet.counter.to_le_bytes());
+            dst.get_mut(..ct_len)
+                .ok_or(WireGuardError::InvalidLength)?
+                .copy_from_slice(packet.encrypted_encapsulated_packet);
             self.receiver
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut dst[..ct_len],
+                    dst.get_mut(..ct_len).ok_or(WireGuardError::InvalidLength)?,
                 )
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
         };
@@ -299,7 +321,7 @@ impl Session {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
+            return Err(WireGuardError::DestinationBufferTooSmall);
         }
         let decrypt_key = if packet.receiver_idx == self.receiving_index {
             &self.receiver
@@ -311,13 +333,18 @@ impl Session {
 
         let ret = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            nonce
+                .get_mut(4..12)
+                .ok_or(WireGuardError::InvalidIndex)?
+                .copy_from_slice(&packet.counter.to_le_bytes());
+            dst.get_mut(..ct_len)
+                .ok_or(WireGuardError::InvalidLength)?
+                .copy_from_slice(packet.encrypted_encapsulated_packet);
             decrypt_key
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut dst[..ct_len],
+                    dst.get_mut(..ct_len).ok_or(WireGuardError::InvalidLength)?,
                 )
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
         };

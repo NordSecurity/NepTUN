@@ -12,7 +12,7 @@ use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicBool;
-use tracing::{error, trace};
+use tracing::error;
 
 mod tun_interface_flags {
     use super::*;
@@ -209,7 +209,12 @@ impl TunSocket {
     pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
         match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
             -1 => Err(Error::IfaceRead(io::Error::last_os_error())),
-            n => Ok(&mut dst[..n as usize]),
+            n => dst
+                .get_mut(..n as usize)
+                .ok_or(Error::IfaceRead(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "Failed to read from TUN device. Packet larger than buffer size",
+                ))),
         }
     }
 

@@ -10,6 +10,7 @@ use crate::serialization::KeyBytes;
 use crate::x25519;
 use hex::encode as encode_hex;
 use libc::*;
+use std::convert::TryInto;
 use std::fs::{create_dir, remove_file};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -23,14 +24,20 @@ fn create_sock_dir() {
 
     if let Ok((saved_uid, saved_gid)) = get_saved_ids() {
         unsafe {
-            let c_path = std::ffi::CString::new(SOCK_DIR).unwrap();
-            // The directory is under the root user, but we want to be able to
-            // delete the files there when we exit, so we need to change the owner
-            chown(
-                c_path.as_bytes_with_nul().as_ptr() as _,
-                saved_uid,
-                saved_gid,
-            );
+            match std::ffi::CString::new(SOCK_DIR) {
+                Ok(c_path) => {
+                    // The directory is under the root user, but we want to be able to
+                    // delete the files there when we exit, so we need to change the owner
+                    chown(
+                        c_path.as_bytes_with_nul().as_ptr() as _,
+                        saved_uid,
+                        saved_gid,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Unable to create sock dir {e}");
+                }
+            }
         }
     }
 }
@@ -232,11 +239,11 @@ fn api_set<R: Read>(reader: &mut BufReader<R>, d: &mut LockReadGuard<Device>) ->
                 }
                 {
                     let parsed_cmd: Vec<&str> = cmd.split('=').collect();
-                    if parsed_cmd.len() != 2 {
-                        return EPROTO;
-                    }
 
-                    let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+                    let [key, val]: [&str; 2] = match parsed_cmd.try_into() {
+                        Ok(arr) => arr,
+                        Err(_) => return EPROTO,
+                    };
 
                     match key {
                         "private_key" => match val.parse::<KeyBytes>() {
@@ -328,10 +335,12 @@ fn api_set_peer<R: Read>(
         }
         {
             let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
-            if parsed_cmd.len() != 2 {
-                return EPROTO;
-            }
-            let (key, val) = (parsed_cmd[0], parsed_cmd[1]);
+
+            let [key, val]: [&str; 2] = match parsed_cmd.try_into() {
+                Ok(arr) => arr,
+                Err(_) => return EPROTO,
+            };
+
             match key {
                 "update_only" => match val.parse::<bool>().map(|val| update_only = val) {
                     Ok(_) => {}

@@ -229,7 +229,13 @@ impl<H: Sync + Send> EventPoll<H> {
             _ => return WaitResult::Error("unexpected number of events returned".to_string()),
         }
 
-        let event_data = unsafe { (event.u64 as *mut Event<H>).as_mut().unwrap() };
+        let event_data = match unsafe { (event.u64 as *mut Event<H>).as_mut() } {
+            Some(e) => e,
+            None => {
+                tracing::warn!("Event data is empty");
+                return WaitResult::Error("Empty event data".to_string());
+            }
+        };
 
         let guard = EventGuard {
             epoll: self.epoll,
@@ -276,6 +282,7 @@ impl<H: Sync + Send> EventPoll<H> {
             events.push(None); // resize doesn't work because Clone is not satisfied
         }
 
+        #[allow(clippy::indexing_slicing)]
         if events[index].take().is_some() {
             // Properly remove the previous event first
             unsafe {
@@ -283,25 +290,42 @@ impl<H: Sync + Send> EventPoll<H> {
             };
         }
 
-        events[index] = Some(data);
+        #[allow(clippy::indexing_slicing)]
+        {
+            events[index] = Some(data);
+        }
     }
 
     /// Trigger a notification
     pub fn trigger_notification(&self, notification_event: &EventRef) {
         let events = self.events.lock();
 
-        let event_ref = &(*events)[notification_event.trigger as usize];
-        let event_data = event_ref.as_ref().expect("Expected an event");
+        let event_ref = &(*events).get(notification_event.trigger as usize);
+        let event_ref = match event_ref {
+            Some(e) => e,
+            None => {
+                tracing::error!("No notification event trigger");
+                return;
+            }
+        };
+        let event_data = if let Some(e) = event_ref.as_ref() {
+            e
+        } else {
+            tracing::error!("Expected an event");
+            return;
+        };
 
         if !event_data.notifier {
-            panic!("Can only trigger a notification event");
+            tracing::warn!("Can only trigger a notification event");
+            return;
         }
 
         // Write some data to the eventfd to trigger an EPOLLIN event
+        #[allow(clippy::indexing_slicing)]
         unsafe {
             write(
                 notification_event.trigger,
-                &(std::u64::MAX - 1).to_ne_bytes()[0] as *const u8 as _,
+                &(u64::MAX - 1).to_ne_bytes()[0] as *const u8 as _,
                 8,
             )
         };
@@ -311,11 +335,24 @@ impl<H: Sync + Send> EventPoll<H> {
     pub fn stop_notification(&self, notification_event: &EventRef) {
         let events = self.events.lock();
 
-        let event_ref = &(*events)[notification_event.trigger as usize];
-        let event_data = event_ref.as_ref().expect("Expected an event");
+        let event_ref = &(*events).get(notification_event.trigger as usize);
+        let event_ref = match event_ref {
+            Some(e) => e,
+            None => {
+                tracing::error!("No notification event trigger");
+                return;
+            }
+        };
+        let event_data = if let Some(e) = event_ref.as_ref() {
+            e
+        } else {
+            tracing::error!("Expected an event");
+            return;
+        };
 
         if !event_data.notifier {
-            panic!("Can only trigger a notification event");
+            tracing::warn!("Can only trigger a notification event");
+            return;
         }
 
         let mut buf = [0u8; 8];
@@ -340,6 +377,7 @@ impl<H> EventPoll<H> {
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) -> bool {
         let mut events = self.events.lock();
         assert!(index >= 0);
+        #[allow(clippy::indexing_slicing)]
         if events[index as usize].take().is_some() {
             if epoll_ctl(self.epoll, EPOLL_CTL_DEL, index, null_mut()) == -1 {
                 return false;
@@ -350,14 +388,14 @@ impl<H> EventPoll<H> {
     }
 }
 
-impl<'a, H> Deref for EventGuard<'a, H> {
+impl<H> Deref for EventGuard<'_, H> {
     type Target = H;
     fn deref(&self) -> &H {
         &self.event.handler
     }
 }
 
-impl<'a, H> Drop for EventGuard<'a, H> {
+impl<H> Drop for EventGuard<'_, H> {
     fn drop(&mut self) {
         if self.event.needs_read {
             // Must read from the event to reset it before we enable it
@@ -377,7 +415,7 @@ impl<'a, H> Drop for EventGuard<'a, H> {
     }
 }
 
-impl<'a, H> EventGuard<'a, H> {
+impl<H> EventGuard<'_, H> {
     /// Get a mutable reference to the stored value
     #[allow(dead_code)]
     pub fn get_mut(&mut self) -> &mut H {
