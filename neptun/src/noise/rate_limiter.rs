@@ -134,7 +134,7 @@ impl RateLimiter {
         mac1: &[u8],
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < super::COOKIE_REPLY_SZ {
+        if dst.len() < super::COOKIE_REPLY_SZ as usize {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -161,7 +161,7 @@ impl RateLimiter {
 
         encrypted_cookie[16..].copy_from_slice(&tag);
 
-        Ok(&mut dst[..super::COOKIE_REPLY_SZ])
+        Ok(&mut dst[..super::COOKIE_REPLY_SZ as usize])
     }
 
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed

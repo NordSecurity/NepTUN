@@ -46,7 +46,7 @@ mod tests {
             }
         }
 
-        fn assert_tx_rx(&self, tx_bytes: usize, rx_bytes: usize) {
+        fn assert_tx_rx(&self, tx_bytes: u64, rx_bytes: u64) {
             let (_, tx, rx, _, _) = self.tunnel.lock().stats();
             assert_eq!(tx, tx_bytes);
             assert_eq!(rx, rx_bytes);
