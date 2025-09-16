@@ -199,11 +199,11 @@ impl Session {
         payload_len: usize,
         packet_buffer: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if packet_buffer.len() < payload_len + super::DATA_OVERHEAD_SZ {
+        if packet_buffer.len() < payload_len + super::DATA_OVERHEAD_SZ as usize {
             tracing::warn!(
                 "Destination packet is too small: {} < {}",
                 packet_buffer.len(),
-                payload_len + super::DATA_OVERHEAD_SZ
+                payload_len + super::DATA_OVERHEAD_SZ as usize
             );
             return Err(WireGuardError::IncorrectPacketLength);
         }

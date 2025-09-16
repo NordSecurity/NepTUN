@@ -725,7 +725,7 @@ impl Handshake {
         &mut self,
         dst: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
-        if dst.len() < super::HANDSHAKE_INIT_SZ {
+        if dst.len() < super::HANDSHAKE_INIT_SZ as usize {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -798,14 +798,14 @@ impl Handshake {
             }),
         );
 
-        self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_INIT_SZ])
+        self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_INIT_SZ as usize])
     }
 
     fn format_handshake_response<'a>(
         &mut self,
         dst: &'a mut [u8],
     ) -> Result<(&'a mut [u8], Session), WireGuardError> {
-        if dst.len() < super::HANDSHAKE_RESP_SZ {
+        if dst.len() < super::HANDSHAKE_RESP_SZ as usize {
             return Err(WireGuardError::DestinationBufferTooSmall);
         }
 
@@ -890,7 +890,8 @@ impl Handshake {
         let temp2 = b2s_hmac(&temp1, &[0x01]);
         let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
 
-        let dst = self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_RESP_SZ])?;
+        let dst =
+            self.append_mac1_and_mac2(local_index, &mut dst[..super::HANDSHAKE_RESP_SZ as usize])?;
 
         Ok((dst, Session::new(local_index, peer_index, temp2, temp3)))
     }

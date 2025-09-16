@@ -74,8 +74,8 @@ pub struct Tunn {
     packet_queue: VecDeque<Vec<u8>>,
     /// Keeps tabs on the expiring timers
     timers: timers::Timers,
-    tx_bytes: usize,
-    rx_bytes: usize,
+    tx_bytes: u64,
+    rx_bytes: u64,
     rate_limiter: Arc<RateLimiter>,
 
     pub peer_static_public: x25519_dalek::PublicKey,
@@ -87,10 +87,10 @@ const HANDSHAKE_RESP: MessageType = 2;
 const COOKIE_REPLY: MessageType = 3;
 const DATA: MessageType = 4;
 
-const HANDSHAKE_INIT_SZ: usize = 148;
-const HANDSHAKE_RESP_SZ: usize = 92;
-const COOKIE_REPLY_SZ: usize = 64;
-const DATA_OVERHEAD_SZ: usize = 32;
+const HANDSHAKE_INIT_SZ: u64 = 148;
+const HANDSHAKE_RESP_SZ: u64 = 92;
+const COOKIE_REPLY_SZ: u64 = 64;
+const DATA_OVERHEAD_SZ: u64 = 32;
 
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
@@ -148,7 +148,7 @@ impl Tunn {
             WireGuardError::InvalidPacket
         })?);
 
-        Ok(match (packet_type, src.len()) {
+        Ok(match (packet_type, src.len() as u64) {
             (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
                     tracing::error!("Error getting HANDSHAKE_INIT sender_idx {}", e);
@@ -186,7 +186,7 @@ impl Tunn {
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+            (DATA, DATA_OVERHEAD_SZ..=std::u64::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
                     tracing::error!("Error getting DATA receiver_idx {}", e);
                     WireGuardError::InvalidPacket
@@ -321,7 +321,7 @@ impl Tunn {
             if src_len.ne(&0) {
                 self.timer_tick(TimerName::TimeLastDataPacketSent);
             }
-            self.tx_bytes += packet.len();
+            self.tx_bytes += packet.len() as u64;
             return TunnResult::WriteToNetwork(packet);
         }
 
@@ -353,7 +353,7 @@ impl Tunn {
             return self.send_queued_packet(dst);
         }
 
-        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        let mut cookie = [0u8; COOKIE_REPLY_SZ as usize];
         let packet = match self
             .rate_limiter
             .verify_packet(src_addr, datagram, &mut cookie)
@@ -361,7 +361,7 @@ impl Tunn {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
                 dst[..cookie.len()].copy_from_slice(cookie);
-                self.tx_bytes += cookie.len();
+                self.tx_bytes += cookie.len() as u64;
                 return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
@@ -450,7 +450,7 @@ impl Tunn {
 
         // We are ready to send a Handshake response
         // Increase the tx_bytes accordingly
-        self.tx_bytes += packet.len();
+        self.tx_bytes += packet.len() as u64;
         Ok(TunnResult::WriteToNetwork(packet))
     }
 
@@ -481,7 +481,7 @@ impl Tunn {
         self.set_current_session(l_idx);
 
         tracing::debug!("Sending keepalive");
-        self.tx_bytes += keepalive_packet.len();
+        self.tx_bytes += keepalive_packet.len() as u64;
 
         Ok(TunnResult::WriteToNetwork(keepalive_packet)) // Send a keepalive as a response
     }
@@ -499,7 +499,7 @@ impl Tunn {
 
         // We received a valid cookie reply
         // Increase the rx_bytes accordingly
-        self.rx_bytes += COOKIE_REPLY_SZ;
+        self.rx_bytes += COOKIE_REPLY_SZ as u64;
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeCookieReceived);
@@ -576,7 +576,7 @@ impl Tunn {
                     self.timer_tick(TimerName::TimeLastHandshakeStarted);
                 }
                 self.timer_tick(TimerName::TimeLastPacketSent);
-                self.tx_bytes += packet.len();
+                self.tx_bytes += packet.len() as u64;
 
                 TunnResult::WriteToNetwork(packet)
             }
@@ -589,7 +589,7 @@ impl Tunn {
     fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => {
-                self.rx_bytes += message_data_len(0);
+                self.rx_bytes += message_data_len(0) as u64;
                 return TunnResult::Done; // This is keepalive, and not an error
             }
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
@@ -644,7 +644,7 @@ impl Tunn {
         }
 
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += message_data_len(computed_len);
+        self.rx_bytes += message_data_len(computed_len) as u64;
 
         TunnResult::WriteToTunnel(&mut packet[..computed_len], src_ip_address)
     }
@@ -717,7 +717,7 @@ impl Tunn {
     /// * Time since last handshake in seconds
     /// * Data bytes sent
     /// * Data bytes received
-    pub fn stats(&self) -> (Option<Duration>, usize, usize, f32, Option<u32>) {
+    pub fn stats(&self) -> (Option<Duration>, u64, u64, f32, Option<u32>) {
         let time = self.time_since_last_handshake();
         let tx_bytes = self.tx_bytes;
         let rx_bytes = self.rx_bytes;
