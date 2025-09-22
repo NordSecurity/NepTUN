@@ -822,6 +822,15 @@ mod tests {
         packet
     }
 
+    fn create_large_ipv4_udp_packet() -> Vec<u8> {
+        let header =
+            etherparse::PacketBuilder::ipv4([192, 168, 1, 2], [192, 168, 1, 3], 5).udp(5678, 23);
+        let payload = [0u8; 1400];
+        let mut packet = Vec::<u8>::with_capacity(header.size(payload.len()));
+        header.write(&mut packet, &payload).unwrap();
+        packet
+    }
+
     #[cfg(feature = "mock-instant")]
     fn update_timer_results_in_handshake(tun: &mut Tunn) {
         let mut dst = vec![0u8; 2048];
@@ -1081,5 +1090,31 @@ mod tests {
             unreachable!();
         };
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    #[test]
+    fn test_long_running_streams() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let mut my_dst = [0u8; 1500];
+        let mut their_dst = [0u8; 1500];
+
+        let sent_packet_buf = create_large_ipv4_udp_packet();
+
+        for _ in 0..4_000_000 {
+            let data = my_tun.encapsulate(&sent_packet_buf, &mut my_dst);
+
+            let data = if let TunnResult::WriteToNetwork(sent) = data {
+                sent
+            } else {
+                unreachable!("Invalid TunnResult type");
+            };
+
+            their_tun.decapsulate(None, data, &mut their_dst);
+        }
+
+        let (_, _, rx, _, _) = their_tun.stats();
+        let (_, tx, _, _, _) = my_tun.stats();
+        assert!(rx >= 1424 * 4_000_000, "Rx bytes overflowed");
+        assert!(tx >= 1424 * 4_000_000, "Tx bytes overflowed");
     }
 }
