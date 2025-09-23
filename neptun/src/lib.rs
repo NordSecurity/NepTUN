@@ -1,4 +1,4 @@
-#![allow(clippy::all)]
+#![allow(clippy::type_complexity)]
 #![allow(semicolon_in_expressions_from_macros)]
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause

@@ -16,7 +16,7 @@ pub(crate) struct Instant {
 impl Instant {
     pub(crate) fn now() -> Self {
         // std::time::Instant unwraps as well, so feel safe doing so here
-        let t = clock_gettime(CLOCK_ID).unwrap();
+        let t = clock_gettime(CLOCK_ID).unwrap_or(TimeSpec::new(0, 0));
         Self { t }
     }
 

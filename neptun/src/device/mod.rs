@@ -26,7 +26,19 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
+use crate::noise::errors::WireGuardError;
+use crate::noise::handshake::parse_handshake_anon;
+use crate::noise::rate_limiter::RateLimiter;
+use crate::noise::{Packet, Tunn, TunnResult};
+use crate::x25519;
+use allowed_ips::AllowedIps;
+use crossbeam_channel::{Receiver, Sender};
 use nix::sys::socket as NixSocket;
+use num_cpus;
+use peer::{AllowedIP, Peer};
+use poll::{EventPoll, EventRef, WaitResult};
+use rand_core::{OsRng, RngCore};
+use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
@@ -36,20 +48,9 @@ use std::os::fd::{AsFd, BorrowedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-
-use crate::noise::errors::WireGuardError;
-use crate::noise::handshake::parse_handshake_anon;
-use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
-use crate::x25519;
-use allowed_ips::AllowedIps;
-use crossbeam_channel::{Receiver, Sender};
-use num_cpus;
-use peer::{AllowedIP, Peer};
-use poll::{EventPoll, EventRef, WaitResult};
-use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Type};
+use std::thread;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::thread::JoinHandle;
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -260,7 +261,7 @@ impl DeviceHandle {
             for i in 0..n_threads {
                 queues.push({
                     let dev = Arc::clone(&interface_lock);
-                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
+                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
                     sockets_to_close
                         .read()
                         .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
@@ -282,12 +283,12 @@ impl DeviceHandle {
             for i in 0..n_threads {
                 threads.push({
                     let dev = Arc::clone(&interface_lock);
-                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read());
+                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
                     sockets_to_close
                         .read()
                         .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
                     thread::Builder::new()
-                        .name(format!("neptun"))
+                        .name("neptun".to_string())
                         .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
                 });
             }
@@ -304,7 +305,12 @@ impl DeviceHandle {
             let mut writer = BufWriter::new(&mut response);
             api::api_exec(&mut self.device.read(), &mut reader, &mut writer);
         }
-        std::str::from_utf8(&response).unwrap().to_owned()
+        std::str::from_utf8(&response)
+            .unwrap_or_else(|_| {
+                tracing::warn!("Malformed response string");
+                ""
+            })
+            .to_owned()
     }
 
     pub fn trigger_exit(&self) {
@@ -432,7 +438,10 @@ impl DeviceHandle {
         }
     }
 
-    fn new_thread_local(_thread_id: usize, device_lock: &LockReadGuard<Device>) -> ThreadData {
+    fn new_thread_local(
+        _thread_id: usize,
+        device_lock: &LockReadGuard<Device>,
+    ) -> Result<ThreadData, Error> {
         #[cfg(target_os = "linux")]
         let t_local = ThreadData {
             src_buf: [0u8; MAX_PKT_SIZE],
@@ -442,12 +451,8 @@ impl DeviceHandle {
                 Arc::clone(&device_lock.iface)
             } else {
                 // For for the rest create a new iface queue
-                let iface_local = Arc::new(
-                    TunSocket::new(&device_lock.iface.name().unwrap())
-                        .unwrap()
-                        .set_non_blocking()
-                        .unwrap(),
-                );
+                let iface_local =
+                    Arc::new(TunSocket::new(&device_lock.iface.name()?)?.set_non_blocking()?);
 
                 device_lock
                     .register_read_iface_handler(Arc::clone(&iface_local))
@@ -466,7 +471,7 @@ impl DeviceHandle {
             update_seq: device_lock.update_seq,
         };
 
-        t_local
+        Ok(t_local)
     }
 }
 
@@ -537,10 +542,10 @@ impl Device {
             }
 
             if replace_ips {
-                self.peers_by_ip.remove(&|p| Arc::ptr_eq(&peer, p));
-                peer.set_allowed_ips(&allowed_ips);
+                self.peers_by_ip.remove(&|p| Arc::ptr_eq(peer, p));
+                peer.set_allowed_ips(allowed_ips);
             } else {
-                peer.add_allowed_ips(&allowed_ips);
+                peer.add_allowed_ips(allowed_ips);
             }
 
             if let Some(keepalive) = keepalive {
@@ -552,8 +557,7 @@ impl Device {
             }
 
             for AllowedIP { addr, cidr } in allowed_ips {
-                self.peers_by_ip
-                    .insert(*addr, *cidr as _, Arc::clone(&peer));
+                self.peers_by_ip.insert(*addr, *cidr as _, Arc::clone(peer));
             }
         } else {
             if update_only {
@@ -584,7 +588,7 @@ impl Device {
 
         let tunn = Tunn::new(
             device_key_pair.0.clone(),
-            pub_key.clone(),
+            pub_key,
             preshared_key,
             keepalive,
             next_index,
@@ -599,7 +603,7 @@ impl Device {
             tunn,
             next_index,
             endpoint,
-            &allowed_ips,
+            allowed_ips,
             preshared_key,
             self.config.protect.clone(),
         ));
@@ -670,7 +674,14 @@ impl Device {
         {
             // Only for macOS write the actual socket name into WG_TUN_NAME_FILE
             if let Ok(name_file) = std::env::var("WG_TUN_NAME_FILE") {
-                std::fs::write(&name_file, device.iface.name().unwrap().as_bytes()).unwrap();
+                std::fs::write(
+                    &name_file,
+                    device
+                        .iface
+                        .name()
+                        .map_err(|_| Error::InvalidTunnelName)?
+                        .as_bytes(),
+                )?;
                 device.cleanup_paths.push(name_file);
             }
         }
@@ -734,8 +745,8 @@ impl Device {
             modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
-        self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
-        self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
+        self.register_udp_handler(udp_sock4.try_clone()?)?;
+        self.register_udp_handler(udp_sock6.try_clone()?)?;
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
@@ -755,11 +766,11 @@ impl Device {
             let close_chan_clone = close_network_worker_rx.clone();
             let udp4_c = udp4.clone();
             let udp6_c = udp6.clone();
-            let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
-                Some(f.clone())
-            } else {
-                None
-            };
+            let fw_callback = self
+                .config
+                .firewall_process_outbound_callback
+                .as_ref()
+                .map(|f| f.clone());
             thread::spawn(move || {
                 write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
             });
@@ -807,11 +818,6 @@ impl Device {
 
         self.key_pair = key_pair;
         self.rate_limiter = Some(rate_limiter);
-
-        // Remove all the bad peers
-        for _ in bad_peers {
-            unimplemented!();
-        }
     }
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -911,7 +917,7 @@ impl Device {
                                 tracing::warn!(message = "Failed to send timers request", error = ?err, dst = ?endpoint_addr);
                             }
                         }
-                        _ => panic!("Unexpected result from update_timers"),
+                        _ => tracing::error!("Unexpected result from update_timers"),
                     };
                 }
                 Action::Continue
@@ -958,7 +964,12 @@ impl Device {
             Box::new(move |d, t| {
                 // Handler that handles anonymous packets over UDP
                 let mut iter = MAX_ITR;
-                let (private_key, public_key) = d.key_pair.as_ref().expect("Key not set");
+                let (private_key, public_key) = if let Some((sk, pk)) = d.key_pair.as_ref() {
+                    (sk, pk)
+                } else {
+                    tracing::error!("Empty key pair");
+                    return Action::Exit;
+                };
 
                 let rate_limiter = d.rate_limiter.as_ref();
 
@@ -969,12 +980,19 @@ impl Device {
                 let src_buf =
                     unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
                 while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = &t.src_buf[..packet_len];
+                    let packet = match t.src_buf.get(..packet_len) {
+                        Some(p) => p,
+                        None => {tracing::error!("Buffer size different from packet length"); continue;},
+                    };
 
+                    let sock = match addr.as_socket() {
+                        Some(s) => s,
+                        None => {tracing::warn!("Invalid socket address family"); continue;}
+                    };
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
                     let parsed_packet = match rate_limiter {
                         Some(rate_limiter) => {
-                            match rate_limiter.verify_packet(Some(addr.as_socket().unwrap().ip()), packet, &mut t.dst_buf) {
+                            match rate_limiter.verify_packet(Some(sock.ip()), packet, &mut t.dst_buf) {
                                 Ok(packet) => packet,
                                 Err(TunnResult::WriteToNetwork(cookie)) => {
                                     if let Err(err) = udp.send_to(cookie, &addr) {
@@ -1067,9 +1085,8 @@ impl Device {
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let addr = addr.as_socket().unwrap();
-                    let ip_addr = addr.ip();
-                    peer.set_endpoint(addr);
+                    let ip_addr = sock.ip();
+                    peer.set_endpoint(sock);
                     if d.config.use_connected_socket {
                         // No need for aditional checking, as from this point all packets will arive to connected socket handler
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
@@ -1119,6 +1136,7 @@ impl Device {
                             let mut buffer = [0u8; MAX_PKT_SIZE];
                             let res = {
                                 let mut tun = peer.tunnel.lock();
+                                #[allow(clippy::indexing_slicing)]
                                 tun.decapsulate(
                                     Some(peer_addr),
                                     t.src_buf[..read_bytes].as_ref(),
@@ -1207,6 +1225,11 @@ impl Device {
                 // * Send encapsulated packet to the peer's endpoint
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
+                if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
+                    tracing::error!("Insufficient packet buffer size");
+                    return Action::Exit;
+                }
+
                 let peers = &d.peers_by_ip;
                 let max_batched_pkts = d
                     .config
@@ -1217,6 +1240,7 @@ impl Device {
                     let mut tunnel_buffer_exhausted = false;
                     for _ in 0..batched_pkts.capacity() {
                         let mut buffer = [0u8; MAX_PKT_SIZE];
+                        #[allow(clippy::indexing_slicing)] // Size already checked above
                         let len = match iface
                             .read(&mut buffer[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET])
                         {
@@ -1242,6 +1266,7 @@ impl Device {
                             }
                         };
 
+                        #[allow(clippy::indexing_slicing)] // Size already checked above
                         let dst_addr = match Tunn::dst_address(
                             &buffer[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET],
                         ) {
@@ -1295,7 +1320,11 @@ fn write_to_socket_worker(
                         let len = element.buf_len;
 
                         if let Some(callback) = &firewall_process_outbound_callback {
-                                if !callback(&element.peer.public_key.0, &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET], &mut element.iface.as_ref()) {
+                                let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                                    Some(b) => b,
+                                    None => continue,
+                                };
+                                if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
                                     continue;
                                 }
                         }
@@ -1352,7 +1381,10 @@ fn write_to_socket_worker(
                                     tracing::error!("No endpoint");
                                 }
                             }
-                            _ => panic!("Unexpected result from encapsulate"),
+                            _ => {
+                                tracing::error!("Unexpected result from encapsulate");
+                                continue;
+                            },
                         };
                     }
                 }
@@ -1376,13 +1408,17 @@ fn write_to_tun_worker(
                     for t in batched_pkts {
                         let peer = t.peer;
 
+                        let buffer = match t.buffer.get(..t.buf_len) {
+                            Some(b) => b,
+                            None => {tracing::warn!("Length is greater than buffer space"); continue},
+                        };
                         if let Some(callback) = &firewall_process_inbound_callback {
-                            if !callback(&peer.public_key.0, &t.buffer[..t.buf_len]) {
+                            if !callback(&peer.public_key.0, buffer) {
                                 continue;
                             }
                         }
                         if peer.is_allowed_ip(t.addr) {
-                            _ = t.iface.as_ref().write(&t.buffer[..t.buf_len]);
+                            _ = t.iface.as_ref().write(buffer);
                             tracing::trace!(
                                 message = "Writing packet to tunnel",
                                 packet_length = t.buf_len,

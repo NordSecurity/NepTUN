@@ -25,7 +25,7 @@ impl<T> Lock<T> {
 
 impl<T: ?Sized> Lock<T> {
     /// Acquire a read lock
-    pub fn read(&self) -> LockReadGuard<T> {
+    pub fn read(&self) -> LockReadGuard<'_, T> {
         let (ref lock, ref cvar) = &self.wants_write;
         let mut wants_write = lock.lock();
         while *wants_write {
@@ -45,7 +45,7 @@ pub struct LockReadGuard<'a, T: 'a + ?Sized> {
     inner: RwLockReadGuard<'a, T>,
 }
 
-impl<'a, T: ?Sized> LockReadGuard<'a, T> {
+impl<T: ?Sized> LockReadGuard<'_, T> {
     /// Perform a closure on a mutable reference of the inner locked value.
     ///
     /// # Parameters
@@ -99,7 +99,7 @@ impl<'a, T: ?Sized> LockReadGuard<'a, T> {
     }
 }
 
-impl<'a, T: ?Sized> Deref for LockReadGuard<'a, T> {
+impl<T: ?Sized> Deref for LockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {

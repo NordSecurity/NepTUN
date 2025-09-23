@@ -17,7 +17,7 @@ use aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
-use ring::constant_time::verify_slices_are_equal;
+use subtle::ConstantTimeEq;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
@@ -31,6 +31,7 @@ type Cookie = [u8; COOKIE_SIZE];
 /// There are two places where WireGuard requires "randomness" for cookies
 /// * The 24 byte nonce in the cookie message - here the only goal is to avoid nonce reuse
 /// * A secret value that changes every two minutes
+///
 /// The main goal of the cookie is simply for a party to prove ownership of an IP address.
 /// In order to avoid calls to rand we derive pseudo random values using the AEAD and
 /// some counters.
@@ -48,7 +49,7 @@ pub struct RateLimiter {
     mac1_key: [u8; 32],
     cookie_key: Key,
     limit: u64,
-    /// The counter since last reset    
+    /// The counter since last reset
     count: Mutex<u64>,
     /// The time last reset was performed on this rate limiter
     last_reset: Mutex<Instant>,
@@ -89,9 +90,10 @@ impl RateLimiter {
     }
 
     /// Compute the correct cookie value based on the current secret value and the source IP
-    fn current_cookie(&self, addr: IpAddr) -> Cookie {
+    fn current_cookie(&self, addr: IpAddr) -> Result<Cookie, WireGuardError> {
         let mut addr_bytes = [0u8; 16];
 
+        #[allow(clippy::indexing_slicing)]
         match addr {
             IpAddr::V4(a) => addr_bytes[..4].copy_from_slice(&a.octets()[..]),
             IpAddr::V6(a) => addr_bytes[..].copy_from_slice(&a.octets()[..]),
@@ -105,7 +107,7 @@ impl RateLimiter {
         b2s_keyed_mac_16_2(&self.secret_key, &cur_counter.to_le_bytes(), &addr_bytes)
     }
 
-    fn nonce(&self) -> [u8; COOKIE_NONCE_SIZE] {
+    fn nonce(&self) -> Result<[u8; COOKIE_NONCE_SIZE], WireGuardError> {
         let old_val = {
             let mut lock = self.nonce_ctr.lock();
             let val = *lock;
@@ -127,6 +129,7 @@ impl RateLimiter {
         old_val >= self.limit
     }
 
+    #[allow(clippy::indexing_slicing)]
     pub(crate) fn format_cookie_reply<'a>(
         &self,
         idx: u32,
@@ -148,18 +151,19 @@ impl RateLimiter {
         message_type.copy_from_slice(&super::COOKIE_REPLY.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
-        nonce.copy_from_slice(&self.nonce()[..]);
+        nonce.copy_from_slice(&self.nonce()?[..]);
 
         let cipher = XChaCha20Poly1305::new(&self.cookie_key);
 
         let iv = GenericArray::from_slice(nonce);
 
-        encrypted_cookie[..16].copy_from_slice(&cookie);
+        let (encrypted_part, tag_part) = encrypted_cookie.split_at_mut(16);
+        encrypted_part.copy_from_slice(&cookie);
         let tag = cipher
-            .encrypt_in_place_detached(iv, mac1, &mut encrypted_cookie[..16])
+            .encrypt_in_place_detached(iv, mac1, encrypted_part)
             .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
 
-        encrypted_cookie[16..].copy_from_slice(&tag);
+        tag_part.copy_from_slice(&tag);
 
         Ok(&mut dst[..super::COOKIE_REPLY_SZ as usize])
     }
@@ -180,9 +184,15 @@ impl RateLimiter {
             let (msg, macs) = src.split_at(src.len() - 32);
             let (mac1, mac2) = macs.split_at(16);
 
-            let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg);
-            verify_slices_are_equal(&computed_mac1[..16], mac1)
-                .map_err(|_| TunnResult::Err(WireGuardError::InvalidMac))?;
+            let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, msg)?;
+            if computed_mac1
+                .get(..16)
+                .ok_or(WireGuardError::InvalidLength)?
+                .ct_ne(mac1)
+                .into()
+            {
+                return Err(TunnResult::Err(WireGuardError::InvalidMac));
+            }
 
             if self.is_under_load() {
                 let addr = match src_addr {
@@ -191,10 +201,15 @@ impl RateLimiter {
                 };
 
                 // Only given an address can we validate mac2
-                let cookie = self.current_cookie(addr);
-                let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
+                let cookie = self.current_cookie(addr)?;
+                let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1)?;
 
-                if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
+                if computed_mac2
+                    .get(..16)
+                    .ok_or(WireGuardError::InvalidLength)?
+                    .ct_ne(mac2)
+                    .into()
+                {
                     let cookie_packet = self
                         .format_cookie_reply(sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;

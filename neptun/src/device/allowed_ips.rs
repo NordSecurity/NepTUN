@@ -42,10 +42,8 @@ impl<D> AllowedIps<D> {
     pub fn insert(&mut self, key: IpAddr, cidr: u32, data: D) -> Option<D> {
         // These are networks, it doesn't make sense for host bits to be set, so
         // use new_truncate().
-        self.ips.insert(
-            IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length"),
-            data,
-        )
+        let ip_network = IpNetwork::new_truncate(key, cidr as u8).ok()?;
+        self.ips.insert(ip_network, data)
     }
 
     pub fn find(&self, key: IpAddr) -> Option<&D> {
@@ -56,7 +54,7 @@ impl<D> AllowedIps<D> {
         self.ips.retain(|_, v| !predicate(v));
     }
 
-    pub fn iter(&self) -> Iter<D> {
+    pub fn iter(&self) -> Iter<'_, D> {
         Iter(
             self.ips
                 .iter()

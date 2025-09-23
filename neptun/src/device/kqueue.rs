@@ -125,9 +125,10 @@ impl<H: Send + Sync> EventPoll<H> {
                 data: period
                     .as_secs()
                     .checked_mul(1_000_000_000)
-                    .unwrap()
+                    .ok_or(Error::InternalError("Integer overflow error".to_owned()))?
                     .checked_add(u64::from(period.subsec_nanos()))
-                    .unwrap() as _,
+                    .ok_or(Error::InternalError("Integer overflow error".to_owned()))?
+                    as _,
                 udata: null_mut(),
             },
             handler,
@@ -191,7 +192,12 @@ impl<H: Send + Sync> EventPoll<H> {
             return WaitResult::Error(io::Error::last_os_error().to_string());
         }
 
-        let event_data = unsafe { (event.udata as *mut Event<H>).as_ref().unwrap() };
+        let event_data = unsafe {
+            match (event.udata as *mut Event<H>).as_ref() {
+                Some(d) => d,
+                None => return WaitResult::Error("No event data available".to_owned()),
+            }
+        };
 
         let guard = EventGuard {
             kqueue: self.kqueue,
@@ -215,7 +221,7 @@ impl<H: Send + Sync> EventPoll<H> {
         };
 
         let (trigger, index) = match ev.kind {
-            EventKind::FD | EventKind::Signal => (ev.event.ident as RawFd, ev.event.ident as usize),
+            EventKind::FD | EventKind::Signal => (ev.event.ident as RawFd, ev.event.ident),
             EventKind::Timer | EventKind::Notifier => (-(events.len() as RawFd) - 1, events.len()), // Custom events get negative identifiers, hopefully we will never have more than 2^31 events of each type
         };
 
@@ -238,6 +244,7 @@ impl<H: Send + Sync> EventPoll<H> {
             return Err(Error::EventQueue(io::Error::last_os_error()));
         }
 
+        #[allow(clippy::indexing_slicing)]
         if let Some(mut event) = events[index].take() {
             // Properly remove any previous event first
             event.event.flags = EV_DELETE;
@@ -249,7 +256,10 @@ impl<H: Send + Sync> EventPoll<H> {
             unsafe { signal(trigger, SIG_IGN) };
         }
 
-        events[index] = Some(ev);
+        #[allow(clippy::indexing_slicing)]
+        {
+            events[index] = Some(ev);
+        }
 
         Ok(EventRef { trigger })
     }
@@ -258,11 +268,23 @@ impl<H: Send + Sync> EventPoll<H> {
         let events = self.custom.lock();
         let ev_index = -notification_event.trigger - 1; // Custom events have negative index from -1
 
-        let event_ref = &(*events)[ev_index as usize];
-        let event_data = event_ref.as_ref().expect("Expected an event");
+        let event_ref = match events.get(ev_index as usize) {
+            Some(event) => event,
+            None => {
+                tracing::error!("Event index out of bounds");
+                return;
+            }
+        };
+        let event_data = if let Some(e) = event_ref.as_ref() {
+            e
+        } else {
+            tracing::error!("Expected an event");
+            return;
+        };
 
         if event_data.kind != EventKind::Notifier {
-            panic!("Can only trigger a notification event");
+            tracing::error!("Can only trigger a notification event");
+            return;
         }
 
         let mut kev = event_data.event;
@@ -275,11 +297,23 @@ impl<H: Send + Sync> EventPoll<H> {
         let events = self.custom.lock();
         let ev_index = -notification_event.trigger - 1; // Custom events have negative index from -1
 
-        let event_ref = &(*events)[ev_index as usize];
-        let event_data = event_ref.as_ref().expect("Expected an event");
+        let event_ref = match events.get(ev_index as usize) {
+            Some(event) => event,
+            None => {
+                tracing::error!("Event index out of bounds");
+                return;
+            }
+        };
+        let event_data = if let Some(e) = event_ref.as_ref() {
+            e
+        } else {
+            tracing::error!("Expected an event");
+            return;
+        };
 
         if event_data.kind != EventKind::Notifier {
-            panic!("Can only stop a notification event");
+            tracing::error!("Can only stop a notification event");
+            return;
         }
 
         let mut kev = event_data.event;
@@ -291,7 +325,8 @@ impl<H: Send + Sync> EventPoll<H> {
 }
 
 impl<H> EventPoll<H> {
-    // This function is only safe to call when the event loop is not running
+    /// # Safety
+    /// This function is only safe to call when the event loop is not running,
     pub unsafe fn clear_event_by_fd(&self, index: RawFd) -> bool {
         let (mut events, index) = if index >= 0 {
             (self.events.lock(), index as usize)
@@ -299,6 +334,7 @@ impl<H> EventPoll<H> {
             (self.custom.lock(), (-index - 1) as usize)
         };
 
+        #[allow(clippy::indexing_slicing)]
         if let Some(mut event) = events[index].take() {
             // Properly remove any previous event first
             event.event.flags = EV_DELETE;
@@ -310,14 +346,14 @@ impl<H> EventPoll<H> {
     }
 }
 
-impl<'a, H> Deref for EventGuard<'a, H> {
+impl<H> Deref for EventGuard<'_, H> {
     type Target = H;
     fn deref(&self) -> &H {
         &self.event.handler
     }
 }
 
-impl<'a, H> Drop for EventGuard<'a, H> {
+impl<H> Drop for EventGuard<'_, H> {
     fn drop(&mut self) {
         unsafe {
             // Re-enable the event once EventGuard goes out of scope
@@ -326,7 +362,7 @@ impl<'a, H> Drop for EventGuard<'a, H> {
     }
 }
 
-impl<'a, H> EventGuard<'a, H> {
+impl<H> EventGuard<'_, H> {
     /// Cancel and remove the event represented by this guard
     pub fn cancel(self) {
         unsafe { self.poll.clear_event_by_fd(self.event.event.ident as RawFd) };

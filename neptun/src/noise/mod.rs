@@ -22,7 +22,7 @@ use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,7 +137,8 @@ impl Tunn {
     }
 
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    #[allow(clippy::indexing_slicing)]
+    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet<'_>, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -154,11 +155,10 @@ impl Tunn {
                     tracing::error!("Error getting HANDSHAKE_INIT sender_idx {}", e);
                     WireGuardError::InvalidPacket
                 })?),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                    .map_err(|e| {
-                        tracing::error!("Error getting HANDSHAKE_INIT unencrypted_ephemeral {}", e);
-                        WireGuardError::InvalidPacket
-                    })?,
+                unencrypted_ephemeral: src[8..40].try_into().map_err(|e| {
+                    tracing::error!("Error getting HANDSHAKE_INIT unencrypted_ephemeral {}", e);
+                    WireGuardError::InvalidPacket
+                })?,
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
@@ -171,11 +171,10 @@ impl Tunn {
                     tracing::error!("Error getting HANDSHAKE_RESP receiver_idx {}", e);
                     WireGuardError::InvalidPacket
                 })?),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .map_err(|e| {
-                        tracing::error!("Error getting HANDSHAKE_RESP unencrypted_ephemeral {}", e);
-                        WireGuardError::InvalidPacket
-                    })?,
+                unencrypted_ephemeral: src[12..44].try_into().map_err(|e| {
+                    tracing::error!("Error getting HANDSHAKE_RESP unencrypted_ephemeral {}", e);
+                    WireGuardError::InvalidPacket
+                })?,
                 encrypted_nothing: &src[44..60],
             }),
             (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
@@ -186,7 +185,7 @@ impl Tunn {
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
-            (DATA, DATA_OVERHEAD_SZ..=std::u64::MAX) => Packet::PacketData(PacketData {
+            (DATA, DATA_OVERHEAD_SZ..=u64::MAX) => Packet::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().map_err(|e| {
                     tracing::error!("Error getting DATA receiver_idx {}", e);
                     WireGuardError::InvalidPacket
@@ -206,21 +205,17 @@ impl Tunn {
     }
 
     pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
-        if packet.is_empty() {
-            return None;
-        }
-
-        match packet[0] >> 4 {
+        match packet.first()? >> 4 {
             4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    [IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ]
+                    .get(IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ)?
                     .try_into()
                     .ok()?;
                 Some(IpAddr::from(addr_bytes))
             }
             6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
                 let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    [IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ]
+                    .get(IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ)?
                     .try_into()
                     .ok()?;
                 Some(IpAddr::from(addr_bytes))
@@ -300,7 +295,10 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
-        dst[DATA_OFFSET..src.len() + DATA_OFFSET].copy_from_slice(src);
+        match dst.get_mut(DATA_OFFSET..src.len() + DATA_OFFSET) {
+            Some(d) => d.copy_from_slice(src),
+            None => return TunnResult::Err(WireGuardError::InvalidLength),
+        }
         self.encapsulate_in_place(src.len(), dst)
     }
 
@@ -310,6 +308,7 @@ impl Tunn {
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         let current = self.current;
+        #[allow(clippy::indexing_slicing)]
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
             let packet = match session.format_packet_data(src_len, dst) {
@@ -329,7 +328,11 @@ impl Tunn {
             // If there is no session, queue the packet for future retry,
             // except if it's keepalive packet, new keepalive packets will be sent when session is created.
             // This prevents double keepalive packets on initiation
-            self.queue_packet(&dst[DATA_OFFSET..src_len + DATA_OFFSET]);
+            if let Some(d) = dst.get(DATA_OFFSET..src_len + DATA_OFFSET) {
+                self.queue_packet(d);
+            } else {
+                return TunnResult::Err(WireGuardError::InvalidLength);
+            }
         }
 
         // Initiate a new handshake if none is in progress
@@ -360,9 +363,16 @@ impl Tunn {
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {
-                dst[..cookie.len()].copy_from_slice(cookie);
+                match dst.get_mut(..cookie.len()) {
+                    Some(d) => d.copy_from_slice(cookie),
+                    None => return TunnResult::Err(WireGuardError::InvalidLength),
+                }
                 self.tx_bytes += cookie.len() as u64;
-                return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
+                if let Some(d) = dst.get_mut(..cookie.len()) {
+                    return TunnResult::WriteToNetwork(d);
+                } else {
+                    return TunnResult::Err(WireGuardError::InvalidLength);
+                }
             }
             Err(TunnResult::Err(e)) => return TunnResult::Err(e),
             _ => unreachable!(),
@@ -380,7 +390,7 @@ impl Tunn {
         let packet = Tunn::parse_incoming_packet(datagram)?;
         match packet {
             Packet::PacketData(p) => {
-                let r_idx = p.receiver_idx as u32;
+                let r_idx = p.receiver_idx;
 
                 // Get the (probably) right session
                 let decapsulated_packet = {
@@ -440,7 +450,10 @@ impl Tunn {
 
         // Store new session in ring buffer
         let index = session.local_index();
-        self.sessions[index % N_SESSIONS] = Some(session);
+        #[allow(clippy::indexing_slicing)]
+        {
+            self.sessions[index % N_SESSIONS] = Some(session);
+        }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
@@ -473,8 +486,12 @@ impl Tunn {
         let keepalive_packet = session.format_packet_data(0, dst)?;
         // Store new session in ring buffer
         let l_idx = session.local_index();
-        let index = l_idx % N_SESSIONS;
-        self.sessions[index] = Some(session);
+        #[allow(clippy::indexing_slicing)]
+        let index = {
+            let idx = l_idx % N_SESSIONS;
+            self.sessions[idx] = Some(session);
+            idx
+        };
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick_session_established(true, index); // New session established, we are the initiator
@@ -499,7 +516,7 @@ impl Tunn {
 
         // We received a valid cookie reply
         // Increase the rx_bytes accordingly
-        self.rx_bytes += COOKIE_REPLY_SZ as u64;
+        self.rx_bytes += COOKIE_REPLY_SZ;
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeCookieReceived);
@@ -510,6 +527,7 @@ impl Tunn {
     }
 
     /// Update the index of the currently used session, if needed
+    #[allow(clippy::indexing_slicing)]
     fn set_current_session(&mut self, new_idx: usize) {
         let cur_idx = self.current;
         if cur_idx == new_idx {
@@ -535,6 +553,7 @@ impl Tunn {
         let idx = r_idx % N_SESSIONS;
 
         // Get the (probably) right session
+        #[allow(clippy::indexing_slicing)]
         let decapsulated_packet = {
             let session = self.sessions[idx].as_ref();
             let session = session.ok_or_else(|| {
@@ -592,6 +611,7 @@ impl Tunn {
                 self.rx_bytes += message_data_len(0) as u64;
                 return TunnResult::Done; // This is keepalive, and not an error
             }
+            #[allow(clippy::indexing_slicing)]
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] =
                     match packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].try_into() {
@@ -614,6 +634,7 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
+            #[allow(clippy::indexing_slicing)]
             _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
                 let len_bytes: [u8; IP_LEN_SZ] =
                     match packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ].try_into() {
@@ -639,14 +660,15 @@ impl Tunn {
             _ => return TunnResult::Err(WireGuardError::InvalidPacket),
         };
 
-        if computed_len > packet.len() {
-            return TunnResult::Err(WireGuardError::InvalidPacket);
-        }
+        let data = match packet.get_mut(..computed_len) {
+            Some(p) => p,
+            None => return TunnResult::Err(WireGuardError::InvalidPacket),
+        };
 
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes += message_data_len(computed_len) as u64;
 
-        TunnResult::WriteToTunnel(&mut packet[..computed_len], src_ip_address)
+        TunnResult::WriteToTunnel(data, src_ip_address)
     }
 
     /// Get a packet from the queue, and try to encapsulate it
@@ -691,6 +713,7 @@ impl Tunn {
         let mut total_weight = 0.0;
 
         for i in 0..N_SESSIONS {
+            #[allow(clippy::indexing_slicing)]
             if let Some(ref session) = self.sessions[(session_idx.wrapping_sub(i)) % N_SESSIONS] {
                 let (expected, received) = session.current_packet_cnt();
 

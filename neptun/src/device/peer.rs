@@ -47,7 +47,8 @@ impl FromStr for AllowedIP {
         if ip.len() != 2 {
             return Err("Invalid IP format".to_owned());
         }
-
+        // Due to above condition, this is index access is safe
+        #[allow(clippy::indexing_slicing)]
         let (addr, cidr) = (ip[0].parse::<IpAddr>(), ip[1].parse::<u8>());
         match (addr, cidr) {
             (Ok(addr @ IpAddr::V4(_)), Ok(cidr)) if cidr <= 32 => Ok(AllowedIP { addr, cidr }),
@@ -171,10 +172,7 @@ impl Peer {
         self.allowed_ips
             .read()
             .iter()
-            .map(|(_, ip, cidr)| AllowedIP {
-                addr: ip,
-                cidr: cidr,
-            })
+            .map(|(_, ip, cidr)| AllowedIP { addr: ip, cidr })
             .collect()
     }
 
@@ -191,7 +189,7 @@ impl Peer {
     }
 
     pub fn preshared_key(&self) -> Option<[u8; 32]> {
-        self.preshared_key.read().clone()
+        *self.preshared_key.read()
     }
 
     /// Be carefull using this one, as it locks tunnel
@@ -217,9 +215,9 @@ mod tests {
     // Introduced this test to prevent LLT-5351 recurring in the future:
     #[test]
     fn test_connect_endpoint() {
-        let a_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
+        let a_secret_key = StaticSecret::random_from_rng(rand::rngs::StdRng::from_entropy());
 
-        let b_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
+        let b_secret_key = StaticSecret::random_from_rng(rand::rngs::StdRng::from_entropy());
         let b_public_key = PublicKey::from(&b_secret_key);
 
         let tunnel = Tunn::new(a_secret_key, b_public_key, None, None, 0, None).unwrap();

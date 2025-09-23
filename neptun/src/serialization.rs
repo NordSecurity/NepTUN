@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub(crate) struct KeyBytes(pub [u8; 32]);
 
 impl std::str::FromStr for KeyBytes {
@@ -10,9 +11,13 @@ impl std::str::FromStr for KeyBytes {
         match s.len() {
             64 => {
                 // Try to parse as hex
-                for i in 0..32 {
-                    internal[i] = u8::from_str_radix(&s[i * 2..=i * 2 + 1], 16)
-                        .map_err(|_| "Illegal character in key")?;
+                for (i, element) in internal.iter_mut().enumerate() {
+                    *element = u8::from_str_radix(
+                        s.get(i * 2..=i * 2 + 1)
+                            .ok_or("String Index out of bounds")?,
+                        16,
+                    )
+                    .map_err(|_| "Illegal character in key")?;
                 }
             }
             43 | 44 => {

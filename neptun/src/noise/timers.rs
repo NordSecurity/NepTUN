@@ -114,6 +114,7 @@ impl Timers {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 impl Index<TimerName> for Timers {
     type Output = Duration;
     fn index(&self, index: TimerName) -> &Duration {
@@ -121,6 +122,7 @@ impl Index<TimerName> for Timers {
     }
 }
 
+#[allow(clippy::indexing_slicing)]
 impl IndexMut<TimerName> for Timers {
     fn index_mut(&mut self, index: TimerName) -> &mut Duration {
         &mut self.timers[index as usize]
@@ -128,6 +130,7 @@ impl IndexMut<TimerName> for Timers {
 }
 
 impl Tunn {
+    #[allow(clippy::indexing_slicing)]
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
         let time = self.timers[TimeCurrent];
         match timer_name {
@@ -159,8 +162,11 @@ impl Tunn {
         session_idx: usize,
     ) {
         self.timer_tick(TimeSessionEstablished);
-        self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
-            self.timers[TimeCurrent];
+        #[allow(clippy::indexing_slicing)]
+        {
+            self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
+                self.timers[TimeCurrent];
+        }
         self.timers.is_initiator = is_initiator;
     }
 
@@ -179,6 +185,7 @@ impl Tunn {
     fn update_session_timers(&mut self, time_now: Duration) {
         let timers = &mut self.timers;
 
+        #[allow(clippy::indexing_slicing)]
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
             if time_now - *t > REJECT_AFTER_TIME {
                 if let Some(session) = self.sessions[i].take() {
@@ -192,6 +199,7 @@ impl Tunn {
         }
     }
 
+    // #[allow(clippy::indexing_slicing)]
     pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
@@ -353,6 +361,7 @@ impl Tunn {
         TunnResult::Done
     }
 
+    #[allow(clippy::indexing_slicing)]
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
         let current_session = self.current;
         if self.sessions[current_session % super::N_SESSIONS].is_some() {
