@@ -80,6 +80,10 @@ fn main() {
                 .long("socket-buffer-size")
                 .value_parser(value_parser!(u32))
                 .help("Sets socket buffers to custom size"),
+            Arg::new("ipv6")
+                .long("ipv6")
+                .action(clap::ArgAction::SetTrue)
+                .help("Enable IPv6"),
             #[cfg(target_os = "linux")]
             Arg::new("disable-multi-queue")
                 .long("disable-multi-queue")
@@ -160,6 +164,7 @@ fn main() {
         skt_buffer_size,
         inter_thread_channel_size: None,
         max_inter_thread_batched_pkts: None,
+        enable_ipv6: !matches.get_flag("ipv6"),
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(&tun_name, config) {
