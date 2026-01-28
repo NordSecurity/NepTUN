@@ -144,7 +144,7 @@ pub struct DeviceConfig {
     pub open_uapi_socket: bool,
     pub protect: Arc<dyn MakeExternalNeptun>,
     pub firewall_process_inbound_callback:
-        Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
+        Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
     pub skt_buffer_size: Option<usize>,
@@ -1399,16 +1399,18 @@ fn write_to_socket_worker(
 fn write_to_tun_worker(
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
     close_chan: Receiver<()>,
-    firewall_process_inbound_callback: Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
+    firewall_process_inbound_callback: Option<
+        Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>,
+    >,
 ) {
     loop {
         crossbeam_channel::select! {
             recv(socket_to_tunnel_rx) -> batched_pkts => {
                 if let Ok(batched_pkts) = batched_pkts {
-                    for t in batched_pkts {
+                    for mut t in batched_pkts {
                         let peer = t.peer;
 
-                        let buffer = match t.buffer.get(..t.buf_len) {
+                        let buffer = match t.buffer.get_mut(..t.buf_len) {
                             Some(b) => b,
                             None => {tracing::warn!("Length is greater than buffer space"); continue},
                         };
