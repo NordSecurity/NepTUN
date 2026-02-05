@@ -253,10 +253,12 @@ fn api_set<R: Read>(reader: &mut BufReader<R>, d: &mut LockReadGuard<Device>) ->
                             Err(_) => return EINVAL,
                         },
                         "listen_port" => match val.parse::<u16>() {
-                            Ok(port) => match device.open_listen_socket(port) {
-                                Ok(()) => {}
-                                Err(_) => return EADDRINUSE,
-                            },
+                            Ok(port) => {
+                                match device.open_listen_socket(port, device.config.enable_ipv6) {
+                                    Ok(()) => {}
+                                    Err(_) => return EADDRINUSE,
+                                }
+                            }
                             Err(_) => return EINVAL,
                         },
                         "fwmark" =>
