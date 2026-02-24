@@ -183,6 +183,7 @@ pub struct Device {
 
     close_network_worker_tx: Option<Sender<()>>,
     close_tun_worker_tx: Option<Sender<()>>,
+    packet_worker_threads: Vec<thread::JoinHandle<()>>,
 
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
     tunnel_to_socket_tx: Sender<Vec<NetworkTaskData>>,
@@ -328,11 +329,18 @@ impl DeviceHandle {
                 tracing::error!("Unable to gracefully close thread. {:?}", e);
             }
         }
+
+        self.device
+            .read()
+            .try_writeable(|_| {}, |device| device.stop_packet_workers());
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     pub fn wait(&mut self) {
         self.threads.0.wait();
+        self.device
+            .read()
+            .try_writeable(|_| {}, |device| device.stop_packet_workers());
     }
 
     pub fn clean(&mut self) {
@@ -660,6 +668,7 @@ impl Device {
             socket_to_tunnel_tx,
             socket_to_tunnel_rx,
             close_tun_worker_tx: None,
+            packet_worker_threads: Vec::new(),
             update_seq: 0,
         };
 
@@ -693,18 +702,7 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
-                for _ in 0..num_cpus::get_physical() {
-                    if let Err(e) = close_network_worker_tx.try_send(()) {
-                        tracing::error!("Unable to close network thread {e}");
-                    }
-                }
-            }
-            if let Some(close_tun_worker_tx) = &self.close_tun_worker_tx {
-                if let Err(e) = close_tun_worker_tx.try_send(()) {
-                    tracing::error!("Unable to close tun thread {e}");
-                }
-            }
+            self.stop_packet_workers();
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -771,14 +769,17 @@ impl Device {
                 .firewall_process_outbound_callback
                 .as_ref()
                 .map(|f| f.clone());
-            thread::spawn(move || {
+            let handle = thread::spawn(move || {
                 write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
             });
+            self.packet_worker_threads.push(handle);
         }
 
         let rx_clone = self.socket_to_tunnel_rx.clone();
         let fw_callback = self.config.firewall_process_inbound_callback.clone();
-        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
+        self.packet_worker_threads.push(thread::spawn(move || {
+            write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback)
+        }));
 
         self.listen_port = port;
 
@@ -925,6 +926,17 @@ impl Device {
             std::time::Duration::from_millis(250),
         )?;
         Ok(())
+    }
+
+    fn stop_packet_workers(&mut self) {
+        self.close_network_worker_tx.take();
+        self.close_tun_worker_tx.take();
+
+        while let Some(thread) = self.packet_worker_threads.pop() {
+            if let Err(e) = thread.join() {
+                tracing::error!("Unable to gracefully close packet worker thread. {:?}", e);
+            }
+        }
     }
 
     pub fn trigger_yield(&self) {
