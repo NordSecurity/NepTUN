@@ -995,18 +995,40 @@ impl Device {
                             match rate_limiter.verify_packet(Some(sock.ip()), packet, &mut t.dst_buf) {
                                 Ok(packet) => packet,
                                 Err(TunnResult::WriteToNetwork(cookie)) => {
+                                    tracing::warn!(
+                                        message = "Packet sent but not accounted (device-level cookie reply)",
+                                        unaccounted_tx_bytes = cookie.len(),
+                                        unaccounted_rx_bytes = packet.len(),
+                                        dst = ?addr,
+                                    );
                                     if let Err(err) = udp.send_to(cookie, &addr) {
                                         tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
                                     }
                                     continue;
                                 }
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        message = "Packet received but not accounted (device-level rate limiter rejected)",
+                                        reason = ?e,
+                                        unaccounted_rx_bytes = packet.len(),
+                                        src = ?addr,
+                                    );
+                                    continue;
+                                }
                             }
                         },
                         None => {
                             match Tunn::parse_incoming_packet(packet) {
                                 Ok(packet) => packet,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        message = "Packet received but not accounted (unparseable packet)",
+                                        reason = ?e,
+                                        unaccounted_rx_bytes = packet.len(),
+                                        src = ?addr,
+                                    );
+                                    continue;
+                                }
                             }
                         }
                     };
@@ -1025,7 +1047,14 @@ impl Device {
                     };
 
                     let peer = match peer {
-                        None => continue,
+                        None => {
+                            tracing::warn!(
+                                message = "Packet received but not accounted (no matching peer)",
+                                unaccounted_rx_bytes = packet.len(),
+                                src = ?addr,
+                            );
+                            continue;
+                        }
                         Some(peer) => peer,
                     };
 

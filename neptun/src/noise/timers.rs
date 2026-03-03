@@ -46,7 +46,7 @@ const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 // Privacy-aware public key formatter. Aligns with libtelio approach of logging
 // the first and last 4 chars of the key for better diagnostics while
 // not revealing the full key.
-fn format_pubkey_short(&key: &PublicKey) -> String {
+pub(super) fn format_pubkey_short(&key: &PublicKey) -> String {
     let encoded = base64::encode(key);
     if encoded.len() <= 8 {
         encoded
