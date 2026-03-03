@@ -1143,7 +1143,7 @@ impl Device {
                 d.flow_tracker.drain_and_log();
                 Action::Continue
             }),
-            std::time::Duration::from_secs(1 * 60),
+            std::time::Duration::from_secs(15 * 60),
         )?;
 
         Ok(())
