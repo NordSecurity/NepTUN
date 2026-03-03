@@ -39,7 +39,7 @@ use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -53,8 +53,213 @@ use std::thread;
 use std::thread::JoinHandle;
 use tun::TunSocket;
 
+use std::sync::Mutex;
+
 use dev_lock::{Lock, LockReadGuard};
+use pnet_packet::ipv4::Ipv4Packet;
+use pnet_packet::ipv6::Ipv6Packet;
+use pnet_packet::tcp::TcpPacket;
+use pnet_packet::Packet as PnetPacket;
 use thiserror::Error;
+use tls_parser::{parse_tls_plaintext, TlsMessage, TlsMessageHandshake, parse_tls_client_hello_extensions, TlsExtension};
+use chrono::Utc;
+
+enum Direction {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct FlowKey {
+    local_ip: IpAddr,
+    remote_ip: IpAddr,
+    protocol: u8,
+}
+
+impl FlowKey {
+    fn from_packet(packet: &[u8], direction: &Direction) -> Option<FlowKey> {
+        if packet.is_empty() {
+            return None;
+        }
+        let version = packet[0] >> 4;
+        match version {
+            4 => {
+                let ipv4 = Ipv4Packet::new(packet)?;
+                let src = IpAddr::V4(ipv4.get_source());
+                let dst = IpAddr::V4(ipv4.get_destination());
+                let (local_ip, remote_ip) = match direction {
+                    Direction::Outbound => (src, dst),
+                    Direction::Inbound => (dst, src),
+                };
+                Some(FlowKey {
+                    local_ip,
+                    remote_ip,
+                    protocol: ipv4.get_next_level_protocol().0,
+                })
+            }
+            6 => {
+                let ipv6 = Ipv6Packet::new(packet)?;
+                let src = IpAddr::V6(ipv6.get_source());
+                let dst = IpAddr::V6(ipv6.get_destination());
+                let (local_ip, remote_ip) = match direction {
+                    Direction::Outbound => (src, dst),
+                    Direction::Inbound => (dst, src),
+                };
+                Some(FlowKey {
+                    local_ip,
+                    remote_ip,
+                    protocol: ipv6.get_next_header().0,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+struct FlowEntry {
+    rx_bytes: u64,
+    tx_bytes: u64,
+    domains: HashSet<String>,
+}
+
+struct FlowTracker {
+    flows: Mutex<HashMap<FlowKey, FlowEntry>>,
+    capture_start: Mutex<chrono::DateTime<Utc>>,
+}
+
+impl FlowTracker {
+    fn new() -> Self {
+        FlowTracker {
+            flows: Mutex::new(HashMap::new()),
+            capture_start: Mutex::new(Utc::now()),
+        }
+    }
+
+    fn record(&self, packet: &[u8], direction: Direction) {
+        if let Some(key) = FlowKey::from_packet(packet, &direction) {
+            if let Ok(mut flows) = self.flows.lock() {
+                let entry = flows.entry(key.clone()).or_insert(FlowEntry {
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    domains: HashSet::new(),
+                });
+                match direction {
+                    Direction::Inbound => entry.rx_bytes += packet.len() as u64,
+                    Direction::Outbound => entry.tx_bytes += packet.len() as u64,
+                }
+
+                if key.protocol == 6 {
+                    if let Some(tcp_payload) = Self::extract_tcp_payload(packet) {
+                        for domain in Self::extract_sni_from_tcp_payload(&tcp_payload) {
+                            entry.domains.insert(domain);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn extract_tcp_payload(packet: &[u8]) -> Option<Vec<u8>> {
+        if packet.is_empty() {
+            return None;
+        }
+        let version = packet[0] >> 4;
+        let ip_payload = match version {
+            4 => {
+                let ipv4 = Ipv4Packet::new(packet)?;
+                if ipv4.get_next_level_protocol().0 != 6 {
+                    return None;
+                }
+                ipv4.payload().to_vec()
+            }
+            6 => {
+                let ipv6 = Ipv6Packet::new(packet)?;
+                if ipv6.get_next_header().0 != 6 {
+                    return None;
+                }
+                ipv6.payload().to_vec()
+            }
+            _ => return None,
+        };
+        let tcp = TcpPacket::new(&ip_payload)?;
+        let payload = tcp.payload();
+        if payload.is_empty() {
+            None
+        } else {
+            Some(payload.to_vec())
+        }
+    }
+
+    fn extract_sni_from_tcp_payload(payload: &[u8]) -> Vec<String> {
+        let Ok((_, tls)) = parse_tls_plaintext(payload) else {
+            return Vec::new();
+        };
+
+        let mut domains = Vec::new();
+        for msg in &tls.msg {
+            let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(contents)) = msg else {
+                continue;
+            };
+            let Some(ext_data) = contents.ext else {
+                continue;
+            };
+            let Ok((_, extensions)) = parse_tls_client_hello_extensions(ext_data) else {
+                continue;
+            };
+            for ext in &extensions {
+                let TlsExtension::SNI(sni_list) = ext else {
+                    continue;
+                };
+                for (_, name_bytes) in sni_list {
+                    if let Ok(name) = std::str::from_utf8(name_bytes) {
+                        domains.push(name.to_string());
+                    }
+                }
+            }
+        }
+        domains
+    }
+
+    fn drain_and_log(&self) {
+        let (drained, since) = {
+            let mut flows = match self.flows.lock() {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let mut old = HashMap::new();
+            std::mem::swap(&mut *flows, &mut old);
+
+            let since = match self.capture_start.lock() {
+                Ok(mut start) => {
+                    let since = start.to_rfc3339();
+                    *start = Utc::now();
+                    since
+                }
+                Err(_) => return,
+            };
+
+            (old, since)
+        };
+
+        let mut entries: Vec<_> = drained.into_iter().collect();
+        entries.sort_by(|a, b| (b.1.rx_bytes + b.1.tx_bytes).cmp(&(a.1.rx_bytes + a.1.tx_bytes)));
+
+        tracing::info!(
+            since = %since,
+            "Dumping data usage statistics",
+        );
+        for (key, entry) in &entries {
+            tracing::info!(
+                local = ?key.local_ip,
+                remote = ?key.remote_ip,
+                proto = key.protocol,
+                rx_bytes = entry.rx_bytes,
+                tx_bytes = entry.tx_bytes,
+                domains = ?entry.domains,
+            );
+        }
+    }
+}
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
@@ -174,6 +379,8 @@ pub struct Device {
     next_index: IndexLfsr,
 
     config: DeviceConfig,
+
+    flow_tracker: Arc<FlowTracker>,
 
     cleanup_paths: Vec<String>,
 
@@ -651,6 +858,7 @@ impl Device {
             peers_by_ip: AllowedIps::new(),
             udp4: Default::default(),
             udp6: Default::default(),
+            flow_tracker: Arc::new(FlowTracker::new()),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -771,14 +979,25 @@ impl Device {
                 .firewall_process_outbound_callback
                 .as_ref()
                 .map(|f| f.clone());
+            let flow_tracker = self.flow_tracker.clone();
             thread::spawn(move || {
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+                write_to_socket_worker(
+                    rx_clone,
+                    close_chan_clone,
+                    udp4_c,
+                    udp6_c,
+                    fw_callback,
+                    flow_tracker,
+                )
             });
         }
 
         let rx_clone = self.socket_to_tunnel_rx.clone();
         let fw_callback = self.config.firewall_process_inbound_callback.clone();
-        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
+        let flow_tracker = self.flow_tracker.clone();
+        thread::spawn(move || {
+            write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback, flow_tracker)
+        });
 
         self.listen_port = port;
 
@@ -924,6 +1143,15 @@ impl Device {
             }),
             std::time::Duration::from_millis(250),
         )?;
+
+        self.queue.new_periodic_event(
+            Box::new(|d, _| {
+                d.flow_tracker.drain_and_log();
+                Action::Continue
+            }),
+            std::time::Duration::from_secs(15 * 60),
+        )?;
+
         Ok(())
     }
 
@@ -995,18 +1223,40 @@ impl Device {
                             match rate_limiter.verify_packet(Some(sock.ip()), packet, &mut t.dst_buf) {
                                 Ok(packet) => packet,
                                 Err(TunnResult::WriteToNetwork(cookie)) => {
+                                    tracing::warn!(
+                                        message = "Packet sent but not accounted (device-level cookie reply)",
+                                        unaccounted_tx_bytes = cookie.len(),
+                                        unaccounted_rx_bytes = packet.len(),
+                                        dst = ?addr,
+                                    );
                                     if let Err(err) = udp.send_to(cookie, &addr) {
                                         tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
                                     }
                                     continue;
                                 }
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        message = "Packet received but not accounted (device-level rate limiter rejected)",
+                                        reason = ?e,
+                                        unaccounted_rx_bytes = packet.len(),
+                                        src = ?addr,
+                                    );
+                                    continue;
+                                }
                             }
                         },
                         None => {
                             match Tunn::parse_incoming_packet(packet) {
                                 Ok(packet) => packet,
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        message = "Packet received but not accounted (unparseable packet)",
+                                        reason = ?e,
+                                        unaccounted_rx_bytes = packet.len(),
+                                        src = ?addr,
+                                    );
+                                    continue;
+                                }
                             }
                         }
                     };
@@ -1025,7 +1275,14 @@ impl Device {
                     };
 
                     let peer = match peer {
-                        None => continue,
+                        None => {
+                            tracing::warn!(
+                                message = "Packet received but not accounted (no matching peer)",
+                                unaccounted_rx_bytes = packet.len(),
+                                src = ?addr,
+                            );
+                            continue;
+                        }
                         Some(peer) => peer,
                     };
 
@@ -1047,6 +1304,7 @@ impl Device {
                             }
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
+                            d.flow_tracker.record(packet, Direction::Inbound);
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
                                 if !callback(&peer.public_key.0, packet) {
                                     continue;
@@ -1311,6 +1569,7 @@ fn write_to_socket_worker(
     firewall_process_outbound_callback: Option<
         Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
     >,
+    flow_tracker: Arc<FlowTracker>,
 ) {
     loop {
         crossbeam_channel::select! {
@@ -1327,6 +1586,10 @@ fn write_to_socket_worker(
                                 if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
                                     continue;
                                 }
+                        }
+
+                        if let Some(buffer) = element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                            flow_tracker.record(buffer, Direction::Outbound);
                         }
 
                         let res = {
@@ -1402,6 +1665,7 @@ fn write_to_tun_worker(
     firewall_process_inbound_callback: Option<
         Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>,
     >,
+    flow_tracker: Arc<FlowTracker>,
 ) {
     loop {
         crossbeam_channel::select! {
@@ -1419,6 +1683,7 @@ fn write_to_tun_worker(
                                 continue;
                             }
                         }
+                        flow_tracker.record(buffer, Direction::Inbound);
                         if peer.is_allowed_ip(t.addr) {
                             _ = t.iface.as_ref().write(buffer);
                             tracing::trace!(
