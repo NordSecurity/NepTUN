@@ -18,7 +18,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::session::message_data_len;
-use crate::noise::timers::{TimerName, Timers};
+use crate::noise::timers::{format_pubkey_short, TimerName, Timers};
 use crate::x25519;
 
 use std::collections::VecDeque;
@@ -364,7 +364,15 @@ impl Tunn {
                 self.tx_bytes += cookie.len() as u64;
                 return TunnResult::WriteToNetwork(&mut dst[..cookie.len()]);
             }
-            Err(TunnResult::Err(e)) => return TunnResult::Err(e),
+            Err(TunnResult::Err(e)) => {
+                tracing::warn!(
+                    message = "Packet received but not accounted (rate limiter rejected)",
+                    error = ?e,
+                    unaccounted_rx_bytes = datagram.len(),
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
+                return TunnResult::Err(e);
+            }
             _ => unreachable!(),
         };
 
@@ -432,7 +440,18 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
-        let (packet, session) = self.handshake.receive_handshake_initialization(p, dst)?;
+        let (packet, session) = self
+            .handshake
+            .receive_handshake_initialization(p, dst)
+            .map_err(|e| {
+                tracing::warn!(
+                    message = "Packet received but not accounted (handshake init failed)",
+                    error = ?e,
+                    unaccounted_rx_bytes = HANDSHAKE_INIT_SZ,
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
+                e
+            })?;
 
         // We received a valid handshake initialization
         // Increase the rx_bytes accordingly
@@ -465,7 +484,15 @@ impl Tunn {
             remote_idx = p.sender_idx
         );
 
-        let session = self.handshake.receive_handshake_response(p)?;
+        let session = self.handshake.receive_handshake_response(p).map_err(|e| {
+            tracing::warn!(
+                message = "Packet received but not accounted (handshake response failed)",
+                error = ?e,
+                unaccounted_rx_bytes = HANDSHAKE_RESP_SZ,
+                peer = format_pubkey_short(&self.peer_static_public)
+            );
+            e
+        })?;
         // We received a valid handshake response
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
@@ -495,7 +522,15 @@ impl Tunn {
             local_idx = p.receiver_idx
         );
 
-        self.handshake.receive_cookie_reply(p)?;
+        self.handshake.receive_cookie_reply(p).map_err(|e| {
+            tracing::warn!(
+                message = "Packet received but not accounted (cookie reply failed)",
+                error = ?e,
+                unaccounted_rx_bytes = COOKIE_REPLY_SZ,
+                peer = format_pubkey_short(&self.peer_static_public)
+            );
+            e
+        })?;
 
         // We received a valid cookie reply
         // Increase the rx_bytes accordingly
@@ -533,15 +568,29 @@ impl Tunn {
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
         let idx = r_idx % N_SESSIONS;
+        let datagram_len = session::DATA_OFFSET + packet.encrypted_encapsulated_packet.len();
 
         // Get the (probably) right session
         let decapsulated_packet = {
             let session = self.sessions[idx].as_ref();
             let session = session.ok_or_else(|| {
-                tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                tracing::warn!(
+                    message = "Packet received but not accounted (no current session)",
+                    remote_idx = r_idx,
+                    unaccounted_rx_bytes = datagram_len,
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
                 WireGuardError::NoCurrentSession
             })?;
-            session.receive_packet_data(packet, dst)?
+            session.receive_packet_data(packet, dst).map_err(|e| {
+                tracing::warn!(
+                    message = "Packet received but not accounted (decapsulation failed)",
+                    error = ?e,
+                    unaccounted_rx_bytes = datagram_len,
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
+                e
+            })?
         };
 
         self.set_current_session(r_idx);
@@ -597,7 +646,12 @@ impl Tunn {
                     match packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].try_into() {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!("Error getting IPV4 len_bytes {}", e);
+                            tracing::warn!(
+                                message = "Packet received but not accounted (invalid IPv4 header)",
+                                error = %e,
+                                unaccounted_rx_bytes = message_data_len(packet.len()),
+                                peer = format_pubkey_short(&self.peer_static_public)
+                            );
                             return TunnResult::Err(WireGuardError::InvalidPacket);
                         }
                     };
@@ -605,7 +659,12 @@ impl Tunn {
                     match packet[IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ].try_into() {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!("Error getting IPV4 addr_bytes {}", e);
+                            tracing::warn!(
+                                message = "Packet received but not accounted (invalid IPv4 header)",
+                                error = %e,
+                                unaccounted_rx_bytes = message_data_len(packet.len()),
+                                peer = format_pubkey_short(&self.peer_static_public)
+                            );
                             return TunnResult::Err(WireGuardError::InvalidPacket);
                         }
                     };
@@ -619,7 +678,12 @@ impl Tunn {
                     match packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ].try_into() {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!("Error getting IPV6 len_bytes {}", e);
+                            tracing::warn!(
+                                message = "Packet received but not accounted (invalid IPv6 header)",
+                                error = %e,
+                                unaccounted_rx_bytes = message_data_len(packet.len()),
+                                peer = format_pubkey_short(&self.peer_static_public)
+                            );
                             return TunnResult::Err(WireGuardError::InvalidPacket);
                         }
                     };
@@ -627,7 +691,12 @@ impl Tunn {
                     match packet[IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ].try_into() {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::error!("Error getting IPV6 addr_bytes {}", e);
+                            tracing::warn!(
+                                message = "Packet received but not accounted (invalid IPv6 header)",
+                                error = %e,
+                                unaccounted_rx_bytes = message_data_len(packet.len()),
+                                peer = format_pubkey_short(&self.peer_static_public)
+                            );
                             return TunnResult::Err(WireGuardError::InvalidPacket);
                         }
                     };
@@ -636,12 +705,28 @@ impl Tunn {
                     IpAddr::from(addr_bytes),
                 )
             }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
+            _ => {
+                tracing::warn!(
+                    message = "Packet received but not accounted (not IPv4 or IPv6)",
+                    unaccounted_rx_bytes = message_data_len(packet.len()),
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
+                return TunnResult::Err(WireGuardError::InvalidPacket);
+            }
         };
 
-        if computed_len > packet.len() {
-            return TunnResult::Err(WireGuardError::InvalidPacket);
-        }
+        let packet_len = packet.len();
+        let data = match packet.get_mut(..computed_len) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    message = "Packet received but not accounted (packet length mismatch)",
+                    unaccounted_rx_bytes = message_data_len(packet_len),
+                    peer = format_pubkey_short(&self.peer_static_public)
+                );
+                return TunnResult::Err(WireGuardError::InvalidPacket);
+            }
+        };
 
         self.timer_tick(TimerName::TimeLastDataPacketReceived);
         self.rx_bytes += message_data_len(computed_len) as u64;

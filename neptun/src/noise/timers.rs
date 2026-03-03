@@ -19,6 +19,8 @@ use mock_instant::Instant;
 )))]
 use crate::sleepyinstant::Instant;
 
+use x25519_dalek::PublicKey;
+
 #[cfg(all(
     not(feature = "mock-instant"),
     any(target_os = "android", target_os = "ios", target_os = "tvos")
@@ -41,6 +43,18 @@ pub(crate) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
+
+// Privacy-aware public key formatter. Aligns with libtelio approach of logging
+// the first and last 4 chars of the key for better diagnostics while
+// not revealing the full key.
+pub(super) fn format_pubkey_short(&key: &PublicKey) -> String {
+    let encoded = base64::encode(key);
+    if encoded.len() <= 8 {
+        encoded
+    } else {
+        format!("{}...{}", &encoded[..4], &encoded[encoded.len() - 4..])
+    }
+}
 
 #[derive(Debug)]
 pub enum TimerName {
