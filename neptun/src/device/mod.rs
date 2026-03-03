@@ -52,8 +52,137 @@ use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use tun::TunSocket;
 
+use std::sync::Mutex;
+
 use dev_lock::{Lock, LockReadGuard};
+use pnet_packet::ipv4::Ipv4Packet;
+use pnet_packet::ipv6::Ipv6Packet;
+use pnet_packet::tcp::TcpPacket;
+use pnet_packet::udp::UdpPacket;
+use pnet_packet::Packet as PnetPacket;
 use thiserror::Error;
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct FlowKey {
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+}
+
+impl FlowKey {
+    fn from_packet(packet: &[u8]) -> Option<FlowKey> {
+        if packet.is_empty() {
+            return None;
+        }
+        let version = packet[0] >> 4;
+        match version {
+            4 => {
+                let ipv4 = Ipv4Packet::new(packet)?;
+                let src_ip = IpAddr::V4(ipv4.get_source());
+                let dst_ip = IpAddr::V4(ipv4.get_destination());
+                let protocol = ipv4.get_next_level_protocol().0;
+                let payload = ipv4.payload();
+                let (src_port, dst_port) = Self::extract_ports(protocol, payload);
+                Some(FlowKey {
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    src_port,
+                    dst_port,
+                })
+            }
+            6 => {
+                let ipv6 = Ipv6Packet::new(packet)?;
+                let src_ip = IpAddr::V6(ipv6.get_source());
+                let dst_ip = IpAddr::V6(ipv6.get_destination());
+                let protocol = ipv6.get_next_header().0;
+                let payload = ipv6.payload();
+                let (src_port, dst_port) = Self::extract_ports(protocol, payload);
+                Some(FlowKey {
+                    src_ip,
+                    dst_ip,
+                    protocol,
+                    src_port,
+                    dst_port,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_ports(protocol: u8, payload: &[u8]) -> (u16, u16) {
+        match protocol {
+            6 => {
+                if let Some(tcp) = TcpPacket::new(payload) {
+                    (tcp.get_source(), tcp.get_destination())
+                } else {
+                    (0, 0)
+                }
+            }
+            17 => {
+                if let Some(udp) = UdpPacket::new(payload) {
+                    (udp.get_source(), udp.get_destination())
+                } else {
+                    (0, 0)
+                }
+            }
+            _ => (0, 0),
+        }
+    }
+}
+
+struct FlowEntry {
+    bytes: u64,
+}
+
+struct FlowTracker {
+    flows: Mutex<HashMap<FlowKey, FlowEntry>>,
+}
+
+impl FlowTracker {
+    fn new() -> Self {
+        FlowTracker {
+            flows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn record(&self, packet: &[u8]) {
+        if let Some(key) = FlowKey::from_packet(packet) {
+            if let Ok(mut flows) = self.flows.lock() {
+                let entry = flows.entry(key).or_insert(FlowEntry { bytes: 0 });
+                entry.bytes += packet.len() as u64;
+            }
+        }
+    }
+
+    fn drain_and_log(&self) {
+        let drained = {
+            let mut flows = match self.flows.lock() {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            let mut old = HashMap::new();
+            std::mem::swap(&mut *flows, &mut old);
+            old
+        };
+
+        let mut entries: Vec<_> = drained.into_iter().collect();
+        entries.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+
+        for (key, entry) in &entries {
+            tracing::info!(message = "Flow: ",
+                src = ?key.src_ip,
+                dst = ?key.dst_ip,
+                proto = key.protocol,
+                src_port = key.src_port,
+                dst_port = key.dst_port,
+                bytes = entry.bytes,
+            );
+        }
+    }
+}
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
@@ -173,6 +302,8 @@ pub struct Device {
     next_index: IndexLfsr,
 
     config: DeviceConfig,
+
+    flow_tracker: Arc<FlowTracker>,
 
     cleanup_paths: Vec<String>,
 
@@ -647,6 +778,7 @@ impl Device {
             peers_by_ip: AllowedIps::new(),
             udp4: Default::default(),
             udp6: Default::default(),
+            flow_tracker: Arc::new(FlowTracker::new()),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -755,19 +887,30 @@ impl Device {
             let close_chan_clone = close_network_worker_rx.clone();
             let udp4_c = udp4.clone();
             let udp6_c = udp6.clone();
-            let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
-                Some(f.clone())
-            } else {
-                None
-            };
+            let fw_callback = self
+                .config
+                .firewall_process_outbound_callback
+                .as_ref()
+                .map(|f| f.clone());
+            let flow_tracker = self.flow_tracker.clone();
             thread::spawn(move || {
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+                write_to_socket_worker(
+                    rx_clone,
+                    close_chan_clone,
+                    udp4_c,
+                    udp6_c,
+                    fw_callback,
+                    flow_tracker,
+                )
             });
         }
 
         let rx_clone = self.socket_to_tunnel_rx.clone();
         let fw_callback = self.config.firewall_process_inbound_callback.clone();
-        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
+        let flow_tracker = self.flow_tracker.clone();
+        thread::spawn(move || {
+            write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback, flow_tracker)
+        });
 
         self.listen_port = port;
 
@@ -918,6 +1061,15 @@ impl Device {
             }),
             std::time::Duration::from_millis(250),
         )?;
+
+        self.queue.new_periodic_event(
+            Box::new(|d, _| {
+                d.flow_tracker.drain_and_log();
+                Action::Continue
+            }),
+            std::time::Duration::from_secs(15 * 60),
+        )?;
+
         Ok(())
     }
 
@@ -1058,6 +1210,7 @@ impl Device {
                             }
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
+                            d.flow_tracker.record(packet);
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
                                 if !callback(&peer.public_key.0, packet) {
                                     continue;
@@ -1315,6 +1468,7 @@ fn write_to_socket_worker(
     firewall_process_outbound_callback: Option<
         Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
     >,
+    flow_tracker: Arc<FlowTracker>,
 ) {
     loop {
         crossbeam_channel::select! {
@@ -1327,6 +1481,10 @@ fn write_to_socket_worker(
                                 if !callback(&element.peer.public_key.0, &element.data[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET], &mut element.iface.as_ref()) {
                                     continue;
                                 }
+                        }
+
+                        if let Some(buffer) = element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                            flow_tracker.record(buffer);
                         }
 
                         let res = {
@@ -1397,6 +1555,7 @@ fn write_to_tun_worker(
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
     close_chan: Receiver<()>,
     firewall_process_inbound_callback: Option<Arc<dyn Fn(&[u8; 32], &[u8]) -> bool + Send + Sync>>,
+    flow_tracker: Arc<FlowTracker>,
 ) {
     loop {
         crossbeam_channel::select! {
@@ -1410,6 +1569,7 @@ fn write_to_tun_worker(
                                 continue;
                             }
                         }
+                        flow_tracker.record(&t.buffer[..t.buf_len]);
                         if peer.is_allowed_ip(t.addr) {
                             _ = t.iface.as_ref().write(&t.buffer[..t.buf_len]);
                             tracing::trace!(

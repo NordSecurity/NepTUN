@@ -867,6 +867,7 @@ dependencies = [
  "nix",
  "num_cpus",
  "parking_lot",
+ "pnet_packet",
  "rand",
  "rand_core",
  "ring",
