@@ -520,7 +520,7 @@ impl Device {
         update_only: bool,
         remove: bool,
         replace_ips: bool,
-        endpoint: Option<SocketAddr>,
+        endpoint: Option<(Option<String>, SocketAddr)>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
@@ -532,8 +532,8 @@ impl Device {
         }
 
         if let Some(peer) = self.peers.get(&pub_key) {
-            if let Some(endpoint) = endpoint {
-                peer.set_endpoint(endpoint);
+            if let Some((iface, addr)) = endpoint {
+                peer.set_endpoint_with_interface(iface, addr);
             }
 
             if replace_ips {
@@ -571,7 +571,7 @@ impl Device {
     fn new_peer(
         &mut self,
         pub_key: x25519_dalek::PublicKey,
-        endpoint: Option<SocketAddr>,
+        endpoint: Option<(Option<String>, SocketAddr)>,
         allowed_ips: &[AllowedIP],
         keepalive: Option<u16>,
         preshared_key: Option<[u8; 32]>,
@@ -829,8 +829,9 @@ impl Device {
 
         // Then on all currently connected sockets
         for peer in self.peers.values() {
-            if let Some(ref sock) = peer.endpoint().conn {
-                sock.set_mark(mark)?
+            let ep = peer.endpoint();
+            if let Some(ref sock) = ep.conn {
+                sock.set_mark(mark)?;
             }
         }
 
@@ -937,9 +938,7 @@ impl Device {
 
     pub(crate) fn drop_connected_sockets(&self) {
         for peer in self.peers.values() {
-            let endpoint = peer.endpoint();
-            if endpoint.conn.is_some() {
-                drop(endpoint);
+            if peer.endpoint().conn.is_some() {
                 peer.shutdown_endpoint();
             }
         }
@@ -1069,7 +1068,8 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for this peer
                     let addr = addr.as_socket().unwrap();
                     let ip_addr = addr.ip();
-                    peer.set_endpoint(addr);
+                    // Skip roaming: don't overwrite UAPI-configured endpoints on inbound packets
+                    // peer.set_endpoint(addr);
                     if d.config.use_connected_socket {
                         // No need for aditional checking, as from this point all packets will arive to connected socket handler
                         if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
@@ -1312,21 +1312,21 @@ fn write_to_socket_worker(
                                     public_key = element.peer.public_key.1)
                             }
                             TunnResult::WriteToNetwork(packet) => {
-                                let endpoint = element.peer.endpoint();
-                                if let Some(conn) = endpoint.conn.as_ref() {
+                                let ep = element.peer.endpoint();
+                                if let Some(conn) = ep.conn.as_ref() {
                                     // Prefer to send using the connected socket
                                     if let Err(err) = conn.send(packet) {
                                         tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                                        drop(endpoint);
+                                        drop(ep);
                                         element.peer.shutdown_endpoint();
                                     } else {
                                         tracing::trace!(
                                             "Pkt -> ConnSock ({:?}), len: {}",
-                                            endpoint.addr,
+                                            ep.addr,
                                             packet.len(),
                                         );
                                     }
-                                } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                                } else if let Some(addr @ SocketAddr::V4(_)) = ep.addr {
                                     if let Err(err) = udp4.send_to(packet, &addr.into()) {
                                         tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
                                     } else {
@@ -1337,7 +1337,7 @@ fn write_to_socket_worker(
                                             public_key = element.peer.public_key.1
                                         );
                                     }
-                                } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                                } else if let Some(addr @ SocketAddr::V6(_)) = ep.addr {
                                     if let Err(err) = udp6.send_to(packet, &addr.into()) {
                                         tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
                                     } else {
@@ -1349,7 +1349,7 @@ fn write_to_socket_worker(
                                         );
                                     }
                                 } else {
-                                    tracing::error!("No endpoint");
+                                    tracing::error!("No endpoint address");
                                 }
                             }
                             _ => panic!("Unexpected result from encapsulate"),

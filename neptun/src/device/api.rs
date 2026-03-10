@@ -171,8 +171,14 @@ fn api_get<R: Read, W: Write>(
             writeln!(writer, "persistent_keepalive_interval={}", keepalive);
         }
 
-        if let Some(ref addr) = peer.endpoint().addr {
-            writeln!(writer, "endpoint={}", addr);
+        {
+            let ep = peer.endpoint();
+            if let Some(ref addr) = ep.addr {
+                match &ep.bind_interface {
+                    Some(iface) => { writeln!(writer, "endpoint={}-{}", iface, addr); }
+                    None => { writeln!(writer, "endpoint={}", addr); }
+                };
+            }
         }
 
         for AllowedIP { addr, cidr } in peer.allowed_ips() {
@@ -305,7 +311,7 @@ fn api_set_peer<R: Read>(
     let mut update_only = false;
     let mut remove = false;
     let mut replace_ips = false;
-    let mut endpoint = None;
+    let mut endpoint: Option<(Option<String>, SocketAddr)> = None;
     let mut keepalive = None;
     let mut public_key = pub_key;
     let mut preshared_key = None;
@@ -318,7 +324,7 @@ fn api_set_peer<R: Read>(
                 update_only,
                 remove,
                 replace_ips,
-                endpoint,
+                endpoint.take(),
                 allowed_ips.as_slice(),
                 keepalive,
                 preshared_key,
@@ -345,10 +351,24 @@ fn api_set_peer<R: Read>(
                     Ok(key_bytes) => preshared_key = Some(key_bytes.0),
                     Err(_) => return EINVAL,
                 },
-                "endpoint" => match val.parse::<SocketAddr>() {
-                    Ok(addr) => endpoint = Some(addr),
-                    Err(_) => return EINVAL,
-                },
+                "endpoint" => {
+                    // Try parsing as plain SocketAddr first (backward compat)
+                    if let Ok(addr) = val.parse::<SocketAddr>() {
+                        endpoint = Some((None, addr));
+                    } else {
+                        // Try iface-addr format: "wlan0-1.2.3.4:51820"
+                        let parts: Vec<&str> = val.splitn(2, '-').collect();
+                        if parts.len() == 2 {
+                            if let Ok(addr) = parts[1].parse::<SocketAddr>() {
+                                endpoint = Some((Some(parts[0].to_string()), addr));
+                            } else {
+                                return EINVAL;
+                            }
+                        } else {
+                            return EINVAL;
+                        }
+                    }
+                }
                 "persistent_keepalive_interval" => match val.parse::<u16>() {
                     Ok(interval) => keepalive = Some(interval),
                     Err(_) => return EINVAL,
@@ -369,7 +389,7 @@ fn api_set_peer<R: Read>(
                         update_only,
                         remove,
                         replace_ips,
-                        endpoint,
+                        endpoint.take(),
                         allowed_ips.as_slice(),
                         keepalive,
                         preshared_key,
@@ -378,7 +398,6 @@ fn api_set_peer<R: Read>(
                         return EINVAL;
                     }
                     replace_ips = false;
-                    endpoint = None;
                     keepalive = None;
                     preshared_key = None;
                     remove = false;

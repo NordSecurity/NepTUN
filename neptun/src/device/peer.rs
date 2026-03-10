@@ -2,7 +2,7 @@
 // Copyright (c) 2019-2024 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -18,6 +18,7 @@ use std::os::fd::{AsFd, AsRawFd};
 pub struct Endpoint {
     pub addr: Option<SocketAddr>,
     pub conn: Option<socket2::Socket>,
+    pub bind_interface: Option<String>,
 }
 
 pub struct Peer {
@@ -61,7 +62,7 @@ impl Peer {
     pub fn new(
         tunnel: Tunn,
         index: u32,
-        endpoint: Option<SocketAddr>,
+        endpoint: Option<(Option<String>, SocketAddr)>,
         allowed_ips: &[AllowedIP],
         preshared_key: Option<[u8; 32]>,
         protect: Arc<dyn MakeExternalNeptun>,
@@ -73,26 +74,71 @@ impl Peer {
             public_key_hex.push_str(&pub_symbol);
         }
 
+        let ep = match endpoint {
+            Some((bind_interface, addr)) => Endpoint {
+                addr: Some(addr),
+                conn: None,
+                bind_interface,
+            },
+            None => Endpoint::default(),
+        };
+
         Peer {
             tunnel: Mutex::new(tunnel),
             public_key: (pub_key.to_bytes(), public_key_hex),
             index,
-            endpoint: RwLock::new(Endpoint {
-                addr: endpoint,
-                conn: None,
-            }),
+            endpoint: RwLock::new(ep),
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
         }
     }
 
-    pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
+    /// Returns a read guard over the endpoint.
+    pub fn endpoint(&self) -> RwLockReadGuard<'_, Endpoint> {
         self.endpoint.read()
     }
 
+    /// Sets the endpoint address, clears conn (keeps bind_interface). Used for roaming.
+    pub fn set_endpoint(&self, addr: SocketAddr) {
+        let mut ep = self.endpoint.write();
+        if ep.addr == Some(addr) {
+            return;
+        }
+        if let Some(conn) = ep.conn.take() {
+            if let Err(e) = conn.shutdown(Shutdown::Both) {
+                tracing::error!("Error in conn shutdown {}", e);
+            }
+        }
+        ep.addr = Some(addr);
+    }
+
+    /// Sets both endpoint address and bind_interface, clears conn.
+    pub fn set_endpoint_with_interface(&self, bind_interface: Option<String>, addr: SocketAddr) {
+        let mut ep = self.endpoint.write();
+        if let Some(conn) = ep.conn.take() {
+            if let Err(e) = conn.shutdown(Shutdown::Both) {
+                tracing::error!("Error in conn shutdown {}", e);
+            }
+        }
+        ep.addr = Some(addr);
+        ep.bind_interface = bind_interface;
+    }
+
+    /// Clears the endpoint address and connection.
+    pub fn clear_endpoint(&self) {
+        let mut ep = self.endpoint.write();
+        if let Some(conn) = ep.conn.take() {
+            if let Err(e) = conn.shutdown(Shutdown::Both) {
+                tracing::error!("Error in conn shutdown {}", e);
+            }
+        }
+        ep.addr = None;
+    }
+
     pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
+        let mut ep = self.endpoint.write();
+        if let Some(conn) = ep.conn.take() {
             tracing::info!("Disconnecting from endpoint");
             if let Err(e) = conn.shutdown(Shutdown::Both) {
                 tracing::error!("Error in conn shutdown {}", e);
@@ -100,38 +146,22 @@ impl Peer {
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
-        let mut endpoint = self.endpoint.write();
-        if endpoint.addr == Some(addr) {
-            return;
-        }
-        if let Some(conn) = endpoint.conn.take() {
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
-            }
-        }
-        endpoint.addr = Some(addr);
-    }
-
+    /// Connects the endpoint by creating a connected UDP socket.
     pub fn connect_endpoint(
         &self,
         port: u16,
         skt_buffer_size: Option<usize>,
     ) -> Result<socket2::Socket, Error> {
-        let mut endpoint = self.endpoint.write();
+        let mut ep = self.endpoint.write();
 
-        if endpoint.conn.is_some() {
+        if ep.conn.is_some() {
             return Err(Error::Connect("Connected".to_owned()));
         }
 
-        let addr = endpoint.addr.ok_or_else(||
-            {
-                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
-                Error::InternalError(
-                    "Peer endpoint was not specified".to_owned(),
-                )
-            }
-        )?;
+        let addr = ep.addr.ok_or_else(|| {
+            tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
+            Error::InternalError("Peer endpoint was not specified".to_owned())
+        })?;
 
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
@@ -154,7 +184,7 @@ impl Peer {
             endpoint=?addr
         );
 
-        endpoint.conn = Some(udp_conn.try_clone()?);
+        ep.conn = Some(udp_conn.try_clone()?);
 
         if let Some(buffer_size) = skt_buffer_size {
             modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
@@ -226,7 +256,7 @@ mod tests {
         let peer = Peer::new(
             tunnel,
             0,
-            Some(SocketAddr::new(IpAddr::from([1, 2, 3, 4]), 54321)),
+            Some((None, SocketAddr::new(IpAddr::from([1, 2, 3, 4]), 54321))),
             &[],
             None,
             Arc::new(crate::device::MakeExternalNeptunNoop),
