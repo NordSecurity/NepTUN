@@ -11,9 +11,16 @@ use std::iter::FromIterator;
 use std::net::IpAddr;
 
 /// A trie of IP/cidr addresses
-#[derive(Default)]
 pub struct AllowedIps<D> {
-    ips: IpNetworkTable<D>,
+    ips: IpNetworkTable<Vec<D>>,
+}
+
+impl<D> Default for AllowedIps<D> {
+    fn default() -> Self {
+        Self {
+            ips: IpNetworkTable::new(),
+        }
+    }
 }
 
 impl<'a, D> FromIterator<(&'a AllowedIP, D)> for AllowedIps<D> {
@@ -39,28 +46,39 @@ impl<D> AllowedIps<D> {
         self.ips = IpNetworkTable::new();
     }
 
-    pub fn insert(&mut self, key: IpAddr, cidr: u32, data: D) -> Option<D> {
+    pub fn insert(&mut self, key: IpAddr, cidr: u32, data: D) {
         // These are networks, it doesn't make sense for host bits to be set, so
         // use new_truncate().
-        self.ips.insert(
-            IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length"),
-            data,
-        )
+        let net = IpNetwork::new_truncate(key, cidr as u8).expect("cidr is valid length");
+        match self.ips.exact_match_mut(net) {
+            Some(vec) => vec.push(data),
+            None => {
+                self.ips.insert(net, vec![data]);
+            }
+        }
     }
 
-    pub fn find(&self, key: IpAddr) -> Option<&D> {
-        self.ips.longest_match(key).map(|(_net, data)| data)
+    pub fn find(&self, key: IpAddr) -> Option<&[D]> {
+        self.ips
+            .longest_match(key)
+            .map(|(_net, vec)| vec.as_slice())
     }
 
     pub fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
-        self.ips.retain(|_, v| !predicate(v));
+        self.ips.retain(|_, vec| {
+            vec.retain(|item| !predicate(item));
+            !vec.is_empty()
+        });
     }
 
     pub fn iter(&self) -> Iter<D> {
         Iter(
             self.ips
                 .iter()
-                .map(|(ipa, d)| (d, ipa.network_address(), ipa.netmask()))
+                .flat_map(|(ipa, vec)| {
+                    vec.iter()
+                        .map(move |d| (d, ipa.network_address(), ipa.netmask()))
+                })
                 .collect(),
         )
     }
@@ -94,22 +112,22 @@ mod tests {
     #[test]
     fn test_allowed_ips_insert_find() {
         let map = build_allowed_ips();
-        assert_eq!(map.find(IpAddr::from([127, 0, 0, 1])), Some(&'1'));
-        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&'2'));
+        assert_eq!(map.find(IpAddr::from([127, 0, 0, 1])), Some(&['1'][..]));
+        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&['2'][..]));
         assert_eq!(map.find(IpAddr::from([127, 1, 255, 255])), None);
-        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&'2'));
-        assert_eq!(map.find(IpAddr::from([127, 1, 15, 255])), Some(&'3'));
-        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&'2'));
-        assert_eq!(map.find(IpAddr::from([127, 1, 15, 255])), Some(&'3'));
-        assert_eq!(map.find(IpAddr::from([255, 1, 15, 2])), Some(&'4'));
-        assert_eq!(map.find(IpAddr::from([60, 25, 15, 1])), Some(&'5'));
+        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&['2'][..]));
+        assert_eq!(map.find(IpAddr::from([127, 1, 15, 255])), Some(&['3'][..]));
+        assert_eq!(map.find(IpAddr::from([127, 0, 255, 255])), Some(&['2'][..]));
+        assert_eq!(map.find(IpAddr::from([127, 1, 15, 255])), Some(&['3'][..]));
+        assert_eq!(map.find(IpAddr::from([255, 1, 15, 2])), Some(&['4'][..]));
+        assert_eq!(map.find(IpAddr::from([60, 25, 15, 1])), Some(&['5'][..]));
         assert_eq!(map.find(IpAddr::from([20, 0, 0, 100])), None);
         assert_eq!(
             map.find(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0])),
-            Some(&'7')
+            Some(&['7'][..])
         );
         assert_eq!(map.find(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 1])), None);
-        assert_eq!(map.find(IpAddr::from([45, 25, 15, 1])), Some(&'6'));
+        assert_eq!(map.find(IpAddr::from([45, 25, 15, 1])), Some(&['6'][..]));
     }
 
     #[test]
@@ -181,6 +199,7 @@ mod tests {
         map.insert(IpAddr::from([192, 168, 4, 4]), 32, 'b');
         map.insert(IpAddr::from([192, 168, 0, 0]), 16, 'c');
         map.insert(IpAddr::from([192, 95, 5, 64]), 27, 'd');
+        // 192.95.5.65/27 truncates to 192.95.5.64/27, so 'c' appends to existing vec ['d']
         map.insert(IpAddr::from([192, 95, 5, 65]), 27, 'c');
         map.insert(IpAddr::from([0, 0, 0, 0]), 0, 'e');
         map.insert(IpAddr::from([64, 15, 112, 0]), 20, 'g');
@@ -192,14 +211,15 @@ mod tests {
         map.insert(IpAddr::from([10, 1, 0, 8]), 29, 'c');
         map.insert(IpAddr::from([10, 1, 0, 16]), 29, 'd');
 
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([192, 168, 4, 20])));
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([192, 168, 4, 0])));
-        assert_eq!(Some(&'b'), map.find(IpAddr::from([192, 168, 4, 4])));
-        assert_eq!(Some(&'c'), map.find(IpAddr::from([192, 168, 200, 182])));
-        assert_eq!(Some(&'c'), map.find(IpAddr::from([192, 95, 5, 68])));
-        assert_eq!(Some(&'e'), map.find(IpAddr::from([192, 95, 5, 96])));
-        assert_eq!(Some(&'g'), map.find(IpAddr::from([64, 15, 116, 26])));
-        assert_eq!(Some(&'g'), map.find(IpAddr::from([64, 15, 127, 3])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([192, 168, 4, 20])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([192, 168, 4, 0])));
+        assert_eq!(Some(&['b'][..]), map.find(IpAddr::from([192, 168, 4, 4])));
+        assert_eq!(Some(&['c'][..]), map.find(IpAddr::from([192, 168, 200, 182])));
+        // 192.95.5.64/27 now has both 'd' and 'c'
+        assert_eq!(Some(&['d', 'c'][..]), map.find(IpAddr::from([192, 95, 5, 68])));
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([192, 95, 5, 96])));
+        assert_eq!(Some(&['g'][..]), map.find(IpAddr::from([64, 15, 116, 26])));
+        assert_eq!(Some(&['g'][..]), map.find(IpAddr::from([64, 15, 127, 3])));
 
         map.insert(IpAddr::from([1, 0, 0, 0]), 32, 'a');
         map.insert(IpAddr::from([64, 0, 0, 0]), 32, 'a');
@@ -207,19 +227,20 @@ mod tests {
         map.insert(IpAddr::from([192, 0, 0, 0]), 32, 'a');
         map.insert(IpAddr::from([255, 0, 0, 0]), 32, 'a');
 
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([1, 0, 0, 0])));
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([64, 0, 0, 0])));
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([128, 0, 0, 0])));
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([192, 0, 0, 0])));
-        assert_eq!(Some(&'a'), map.find(IpAddr::from([255, 0, 0, 0])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([1, 0, 0, 0])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([64, 0, 0, 0])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([128, 0, 0, 0])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([192, 0, 0, 0])));
+        assert_eq!(Some(&['a'][..]), map.find(IpAddr::from([255, 0, 0, 0])));
 
         map.remove(&|c| *c == 'a');
 
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([1, 0, 0, 0])));
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([64, 0, 0, 0])));
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([128, 0, 0, 0])));
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([192, 0, 0, 0])));
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([255, 0, 0, 0])));
+        // After removing 'a', /32 entries are gone; all fall back to 0.0.0.0/0 which has 'e'
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([1, 0, 0, 0])));
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([64, 0, 0, 0])));
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([128, 0, 0, 0])));
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([192, 0, 0, 0])));
+        assert_eq!(Some(&['e'][..]), map.find(IpAddr::from([255, 0, 0, 0])));
 
         map.clear();
 
@@ -228,7 +249,7 @@ mod tests {
 
         map.remove(&|c| *c == 'a');
 
-        assert_ne!(Some(&'a'), map.find(IpAddr::from([192, 168, 0, 1])));
+        assert!(map.find(IpAddr::from([192, 168, 0, 1])).is_none());
     }
 
     #[test]
@@ -301,63 +322,64 @@ mod tests {
         );
 
         assert_eq!(
-            Some(&'d'),
+            Some(&['d'][..]),
             map.find(IpAddr::from([
                 0x2607, 0x5300, 0x6000, 0x6b00, 0x0000, 0x0000, 0xc05f, 0x0543
             ]))
         );
         assert_eq!(
-            Some(&'c'),
+            Some(&['c'][..]),
             map.find(IpAddr::from([
                 0x2607, 0x5300, 0x6000, 0x6b00, 0, 0, 0xc02e, 0x01ee
             ]))
         );
+        // ::/0 now has both 'e' and 'f' (append, not overwrite)
         assert_eq!(
-            Some(&'f'),
+            Some(&['e', 'f'][..]),
             map.find(IpAddr::from([0x2607, 0x5300, 0x6000, 0x6b01, 0, 0, 0, 0]))
         );
         assert_eq!(
-            Some(&'g'),
+            Some(&['g'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6800, 0x4004, 0x0806, 0, 0, 0, 0x1006
             ]))
         );
         assert_eq!(
-            Some(&'g'),
+            Some(&['g'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6800, 0x4004, 0x0806, 0, 0x1234, 0, 0x5678
             ]))
         );
         assert_eq!(
-            Some(&'f'),
+            Some(&['e', 'f'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x67ff, 0x4004, 0x0806, 0, 0x1234, 0, 0x5678
             ]))
         );
         assert_eq!(
-            Some(&'f'),
+            Some(&['e', 'f'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6801, 0x4004, 0x0806, 0, 0x1234, 0, 0x5678
             ]))
         );
         assert_eq!(
-            Some(&'h'),
+            Some(&['h'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6800, 0x4004, 0x0800, 0, 0x1234, 0, 0x5678
             ]))
         );
         assert_eq!(
-            Some(&'h'),
+            Some(&['h'][..]),
             map.find(IpAddr::from([0x2404, 0x6800, 0x4004, 0x0800, 0, 0, 0, 0]))
         );
         assert_eq!(
-            Some(&'h'),
+            Some(&['h'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6800, 0x4004, 0x0800, 0x1010, 0x1010, 0x1010, 0x1010
             ]))
         );
         assert_eq!(
-            Some(&'a'),
+            Some(&['a'][..]),
             map.find(IpAddr::from([
                 0x2404, 0x6800, 0x4004, 0x0800, 0xdead, 0xbeef, 0xdead, 0xbeef
             ]))

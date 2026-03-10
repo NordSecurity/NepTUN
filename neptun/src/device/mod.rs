@@ -190,6 +190,10 @@ pub struct Device {
     // [thread boundary] -> socket_to_tunnel_rx -> -> write to tunnel
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
     socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
+
+    /// Tracks flow hashes already logged for multipath peer selection,
+    /// shared across all iface handler instances to avoid duplicate log lines.
+    seen_flows: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
 }
 
 struct ThreadData {
@@ -494,6 +498,112 @@ fn modify_skt_buffer_size(socket: BorrowedFd<'_>, buffer_size: usize) {
     set_sock_opt(socket, NixSocket::sockopt::SndBuf, buffer_size, "SndBuf");
 }
 
+struct FlowInfo {
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    hash: u64,
+}
+
+/// Extracts the 5-tuple (src IP, dst IP, protocol, src port, dst port) from a
+/// raw IP packet and produces a hash, used for flow-based peer selection when
+/// multiple peers share the same AllowedIPs prefix.
+fn packet_flow_hash(packet: &[u8]) -> Option<FlowInfo> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::convert::TryFrom;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    if packet.is_empty() {
+        return None;
+    }
+
+    match packet[0] >> 4 {
+        4 if packet.len() >= 20 => {
+            let src_ip = IpAddr::from(<[u8; 4]>::try_from(&packet[12..16]).unwrap());
+            let dst_ip = IpAddr::from(<[u8; 4]>::try_from(&packet[16..20]).unwrap());
+            let protocol = packet[9];
+            packet[12..20].hash(&mut hasher);
+            protocol.hash(&mut hasher);
+
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            let (src_port, dst_port) = if (protocol == 6 || protocol == 17)
+                && packet.len() >= ihl + 4
+            {
+                // TCP or UDP
+                packet[ihl..ihl + 4].hash(&mut hasher);
+                (
+                    u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+                    u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
+                )
+            } else if protocol == 1 && packet.len() >= ihl + 6 {
+                // ICMPv4: use identifier for Echo, Timestamp types
+                let icmp_type = packet[ihl];
+                if matches!(icmp_type, 0 | 8 | 13 | 14) {
+                    packet[ihl + 4..ihl + 6].hash(&mut hasher);
+                    let id = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]);
+                    (id, 0)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
+
+            Some(FlowInfo {
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                hash: hasher.finish(),
+            })
+        }
+        6 if packet.len() >= 40 => {
+            let src_ip = IpAddr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap());
+            let dst_ip = IpAddr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap());
+            let protocol = packet[6];
+            packet[8..40].hash(&mut hasher);
+            protocol.hash(&mut hasher);
+
+            let (src_port, dst_port) =
+                if (protocol == 6 || protocol == 17) && packet.len() >= 44 {
+                    // TCP or UDP
+                    packet[40..44].hash(&mut hasher);
+                    (
+                        u16::from_be_bytes([packet[40], packet[41]]),
+                        u16::from_be_bytes([packet[42], packet[43]]),
+                    )
+                } else if protocol == 58 && packet.len() >= 46 {
+                    // ICMPv6: use identifier for Echo Request/Reply
+                    let icmp_type = packet[40];
+                    if matches!(icmp_type, 128 | 129) {
+                        packet[44..46].hash(&mut hasher);
+                        let id = u16::from_be_bytes([packet[44], packet[45]]);
+                        (id, 0)
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
+            Some(FlowInfo {
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+                hash: hasher.finish(),
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Device {
     fn next_index(&mut self) -> u32 {
         self.next_index.next()
@@ -657,6 +767,7 @@ impl Device {
             socket_to_tunnel_rx,
             close_tun_worker_tx: None,
             update_seq: 0,
+            seen_flows: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
         };
 
         if device.config.open_uapi_socket {
@@ -1196,6 +1307,7 @@ impl Device {
     }
 
     fn register_read_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
+        let seen_flows = Arc::clone(&self.seen_flows);
         self.queue.new_event(
             iface.as_raw_fd(),
             Box::new(move |d, _t| {
@@ -1249,10 +1361,38 @@ impl Device {
                             None => continue,
                         };
 
-                        let peer = match peers.find(dst_addr) {
-                            Some(peer) => peer,
-                            None => continue,
+                        let peer_group = match peers.find(dst_addr) {
+                            Some(peers) if !peers.is_empty() => peers,
+                            _ => continue,
                         };
+
+                        let packet_data =
+                            &buffer[WG_HEADER_OFFSET..len + WG_HEADER_OFFSET];
+                        let peer = if peer_group.len() == 1 {
+                            &peer_group[0]
+                        } else {
+                            let flow = packet_flow_hash(packet_data);
+                            let hash = flow.as_ref().map_or(0, |f| f.hash);
+                            let idx = hash as usize % peer_group.len();
+                            if let Some(ref f) = flow {
+                                if seen_flows.lock().insert(f.hash) {
+                                    tracing::debug!(
+                                        message = "Multipath peer selection (new flow)",
+                                        src_ip = %f.src_ip,
+                                        dst_ip = %f.dst_ip,
+                                        protocol = f.protocol,
+                                        src_port = f.src_port,
+                                        dst_port = f.dst_port,
+                                        flow_hash = f.hash,
+                                        selected_index = idx,
+                                        peer_count = peer_group.len(),
+                                        public_key = peer_group[idx].public_key.1,
+                                    );
+                                }
+                            }
+                            &peer_group[idx]
+                        };
+
                         batched_pkts.push(NetworkTaskData {
                             data: buffer,
                             buf_len: len,
