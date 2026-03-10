@@ -194,6 +194,11 @@ pub struct Device {
     /// Tracks flow hashes already logged for multipath peer selection,
     /// shared across all iface handler instances to avoid duplicate log lines.
     seen_flows: Arc<parking_lot::Mutex<std::collections::HashSet<u64>>>,
+
+    /// Map of interface name -> (v4_socket, v6_socket) bound via SO_BINDTODEVICE.
+    /// Key `""` (empty string) represents the default unbound socket pair (same as udp4/udp6).
+    /// Used for outbound sends so traffic leaves via the correct interface.
+    iface_sockets: Arc<parking_lot::RwLock<HashMap<String, (Arc<socket2::Socket>, Arc<socket2::Socket>)>>>,
 }
 
 struct ThreadData {
@@ -604,9 +609,95 @@ fn packet_flow_hash(packet: &[u8]) -> Option<FlowInfo> {
     }
 }
 
+/// Creates a v4+v6 UDP socket pair, optionally bound to a network interface
+/// via `SO_BINDTODEVICE`. Used for outbound sends so traffic leaves via the
+/// correct interface in multipath setups.
+fn create_udp_socket_pair(
+    port: u16,
+    bind_interface: Option<&str>,
+    fwmark: Option<u32>,
+    protect: &dyn MakeExternalNeptun,
+    skt_buffer_size: Option<usize>,
+) -> Result<(Arc<socket2::Socket>, Arc<socket2::Socket>), Error> {
+    // Bind to the same port as the listener so that the server's response
+    // (sent to our source port) can be received. With SO_BINDTODEVICE set,
+    // the kernel distinguishes these sockets by device, so there's no
+    // conflict with the unbound listener socket.
+    let udp4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    udp4.set_reuse_address(true)?;
+    udp4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+
+    let udp6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+    udp6.set_reuse_address(true)?;
+    udp6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+
+    if let Some(iface) = bind_interface {
+        udp4.bind_device(Some(iface.as_bytes()))
+            .map_err(|e| Error::SetSockOpt(format!("SO_BINDTODEVICE v4 {iface}: {e}")))?;
+        udp6.bind_device(Some(iface.as_bytes()))
+            .map_err(|e| Error::SetSockOpt(format!("SO_BINDTODEVICE v6 {iface}: {e}")))?;
+        tracing::info!("Bound outbound socket pair to interface {iface}");
+    }
+
+    udp4.set_nonblocking(true)?;
+    udp6.set_nonblocking(true)?;
+
+    protect.make_external(udp4.as_raw_fd());
+    protect.make_external(udp6.as_raw_fd());
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    if let Some(mark) = fwmark {
+        udp4.set_mark(mark)?;
+        udp6.set_mark(mark)?;
+    }
+
+    if let Some(buffer_size) = skt_buffer_size {
+        modify_skt_buffer_size(udp4.as_fd(), buffer_size);
+        modify_skt_buffer_size(udp6.as_fd(), buffer_size);
+    }
+
+    Ok((Arc::new(udp4), Arc::new(udp6)))
+}
+
 impl Device {
     fn next_index(&mut self) -> u32 {
         self.next_index.next()
+    }
+
+    /// Ensures that an outbound socket pair exists for the given interface name.
+    /// If the interface is not yet in `iface_sockets`, creates a new bound pair.
+    fn ensure_iface_socket(&self, iface: &str) {
+        if iface.is_empty() {
+            return;
+        }
+        {
+            let sockets = self.iface_sockets.read();
+            if sockets.contains_key(iface) {
+                return;
+            }
+        }
+        // Need to create a new pair
+        match create_udp_socket_pair(
+            self.listen_port,
+            Some(iface),
+            self.fwmark,
+            self.config.protect.as_ref(),
+            self.config.skt_buffer_size,
+        ) {
+            Ok((v4, v6)) => {
+                // Register with epoll so responses on this socket are processed
+                if let Err(e) = self.register_udp_handler((*v4).try_clone().unwrap()) {
+                    tracing::error!("Failed to register v4 udp handler for {iface}: {e}");
+                }
+                if let Err(e) = self.register_udp_handler((*v6).try_clone().unwrap()) {
+                    tracing::error!("Failed to register v6 udp handler for {iface}: {e}");
+                }
+                self.iface_sockets.write().insert(iface.to_string(), (v4, v6));
+            }
+            Err(e) => {
+                tracing::error!("Failed to create socket pair for interface {iface}: {e}");
+            }
+        }
     }
 
     fn remove_peer(&mut self, pub_key: &x25519::PublicKey) {
@@ -642,8 +733,11 @@ impl Device {
         }
 
         if let Some(peer) = self.peers.get(&pub_key) {
-            if let Some((iface, addr)) = endpoint {
-                peer.set_endpoint_with_interface(iface, addr);
+            if let Some((ref iface, addr)) = endpoint {
+                if let Some(ref iface_name) = iface {
+                    self.ensure_iface_socket(iface_name);
+                }
+                peer.set_endpoint_with_interface(iface.clone(), addr);
             }
 
             if replace_ips {
@@ -704,6 +798,13 @@ impl Device {
             tracing::error!("Failed to create state for peer {}", e);
             Error::InternalError(format!("Failed to create state for peer {}", e))
         })?;
+
+        // Ensure outbound socket exists for this peer's interface
+        if let Some((ref iface, _)) = endpoint {
+            if let Some(ref iface_name) = iface {
+                self.ensure_iface_socket(iface_name);
+            }
+        }
 
         let peer = Arc::new(Peer::new(
             tunn,
@@ -768,6 +869,7 @@ impl Device {
             close_tun_worker_tx: None,
             update_seq: 0,
             seen_flows: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+            iface_sockets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         };
 
         if device.config.open_uapi_socket {
@@ -853,6 +955,50 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
+        // Build the interface socket map for outbound sends
+        {
+            let mut sockets = self.iface_sockets.write();
+            sockets.clear();
+            // Default (unbound) pair uses the listener sockets
+            sockets.insert(String::new(), (udp4.clone(), udp6.clone()));
+
+            // Create bound socket pairs for each unique bind_interface
+            let ifaces: std::collections::HashSet<String> = self
+                .peers
+                .values()
+                .filter_map(|p| {
+                    let ep = p.endpoint();
+                    ep.bind_interface.clone()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            for iface in ifaces {
+                match create_udp_socket_pair(
+                    port,
+                    Some(&iface),
+                    self.fwmark,
+                    self.config.protect.as_ref(),
+                    self.config.skt_buffer_size,
+                ) {
+                    Ok((v4, v6)) => {
+                        // Register with epoll so handshake responses arriving
+                        // on device-bound sockets are processed
+                        if let Err(e) = self.register_udp_handler((*v4).try_clone().unwrap()) {
+                            tracing::error!("Failed to register v4 udp handler for {iface}: {e}");
+                        }
+                        if let Err(e) = self.register_udp_handler((*v6).try_clone().unwrap()) {
+                            tracing::error!("Failed to register v6 udp handler for {iface}: {e}");
+                        }
+                        sockets.insert(iface, (v4, v6));
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to create socket pair for interface {}: {e}", iface);
+                    }
+                }
+            }
+        }
+
         // Construct a different closing channel per thread
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical() * 5);
@@ -864,15 +1010,14 @@ impl Device {
         for _ in 0..num_cpus::get_physical() {
             let rx_clone = self.tunnel_to_socket_rx.clone();
             let close_chan_clone = close_network_worker_rx.clone();
-            let udp4_c = udp4.clone();
-            let udp6_c = udp6.clone();
+            let iface_sockets_c = self.iface_sockets.clone();
             let fw_callback = if let Some(f) = &self.config.firewall_process_outbound_callback {
                 Some(f.clone())
             } else {
                 None
             };
             thread::spawn(move || {
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+                write_to_socket_worker(rx_clone, close_chan_clone, iface_sockets_c, fw_callback)
             });
         }
 
@@ -929,11 +1074,17 @@ impl Device {
     fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
         self.fwmark = Some(mark);
 
-        // First set fwmark on listeners
+        // Set fwmark on all interface sockets (includes the default/listener pair)
+        for (_, (v4, v6)) in self.iface_sockets.read().iter() {
+            v4.set_mark(mark)?;
+            v6.set_mark(mark)?;
+        }
+
+        // Also set on the listener sockets if they aren't in the map yet
+        // (e.g., if iface_sockets hasn't been populated)
         if let Some(ref sock) = self.udp4 {
             sock.set_mark(mark)?;
         }
-
         if let Some(ref sock) = self.udp6 {
             sock.set_mark(mark)?;
         }
@@ -987,17 +1138,15 @@ impl Device {
             Box::new(|d, t| {
                 let peer_map = &d.peers;
 
-                let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                    (Some(udp4), Some(udp6)) => (udp4, udp6),
-                    _ => return Action::Continue,
-                };
-
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
-                    let endpoint_addr = match peer.endpoint().addr {
+                    let ep = peer.endpoint();
+                    let endpoint_addr = match ep.addr {
                         Some(addr) => addr,
                         None => continue,
                     };
+                    let iface_key = ep.bind_interface.as_deref().unwrap_or("").to_string();
+                    drop(ep);
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
@@ -1010,17 +1159,22 @@ impl Device {
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
-                            let res = match endpoint_addr {
-                                SocketAddr::V4(_) => {
-                                    udp4.send_to(packet, &endpoint_addr.into())
-                                }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into())
-                                }
-                            };
+                            let sockets = d.iface_sockets.read();
+                            let socket_pair = sockets.get(iface_key.as_str())
+                                .or_else(|| sockets.get(""));
+                            if let Some((v4, v6)) = socket_pair {
+                                let res = match endpoint_addr {
+                                    SocketAddr::V4(_) => {
+                                        v4.send_to(packet, &endpoint_addr.into())
+                                    }
+                                    SocketAddr::V6(_) => {
+                                        v6.send_to(packet, &endpoint_addr.into())
+                                    }
+                                };
 
-                            if let Err(err) = res {
-                                tracing::warn!(message = "Failed to send timers request", error = ?err, dst = ?endpoint_addr);
+                                if let Err(err) = res {
+                                    tracing::warn!(message = "Failed to send timers request", error = ?err, dst = ?endpoint_addr);
+                                }
                             }
                         }
                         _ => panic!("Unexpected result from update_timers"),
@@ -1373,7 +1527,9 @@ impl Device {
                         } else {
                             let flow = packet_flow_hash(packet_data);
                             let hash = flow.as_ref().map_or(0, |f| f.hash);
+
                             let idx = hash as usize % peer_group.len();
+
                             if let Some(ref f) = flow {
                                 if seen_flows.lock().insert(f.hash) {
                                     tracing::debug!(
@@ -1421,8 +1577,7 @@ impl Device {
 fn write_to_socket_worker(
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
     close_chan: Receiver<()>,
-    udp4: Arc<socket2::Socket>,
-    udp6: Arc<socket2::Socket>,
+    iface_sockets: Arc<parking_lot::RwLock<HashMap<String, (Arc<socket2::Socket>, Arc<socket2::Socket>)>>>,
     firewall_process_outbound_callback: Option<
         Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
     >,
@@ -1466,27 +1621,34 @@ fn write_to_socket_worker(
                                             packet.len(),
                                         );
                                     }
-                                } else if let Some(addr @ SocketAddr::V4(_)) = ep.addr {
-                                    if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                                        tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+                                } else if let Some(addr) = ep.addr {
+                                    let iface_key = ep.bind_interface.as_deref().unwrap_or("");
+                                    let sockets = iface_sockets.read();
+                                    let socket_pair = sockets.get(iface_key)
+                                        .or_else(|| sockets.get(""));
+                                    if let Some((v4, v6)) = socket_pair {
+                                        let sock = match addr {
+                                            SocketAddr::V4(_) => v4,
+                                            SocketAddr::V6(_) => v6,
+                                        };
+                                        if let Err(err) = sock.send_to(packet, &addr.into()) {
+                                            tracing::warn!(
+                                                message = "Failed to write packet to network",
+                                                error = ?err,
+                                                dst = ?addr,
+                                                interface = iface_key,
+                                            );
+                                        } else {
+                                            tracing::trace!(
+                                                message = "Writing packet to network",
+                                                packet_length = packet.len(),
+                                                dst_addr = ?addr,
+                                                interface = iface_key,
+                                                public_key = element.peer.public_key.1,
+                                            );
+                                        }
                                     } else {
-                                        tracing::trace!(
-                                            message = "Writing packet to network v4",
-                                            packet_length = packet.len(),
-                                            src_addr = ?addr,
-                                            public_key = element.peer.public_key.1
-                                        );
-                                    }
-                                } else if let Some(addr @ SocketAddr::V6(_)) = ep.addr {
-                                    if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                                        tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                                    } else {
-                                        tracing::trace!(
-                                            message = "Writing packet to network v6",
-                                            packet_length = packet.len(),
-                                            src_addr = ?addr,
-                                            public_key = element.peer.public_key.1
-                                        );
+                                        tracing::error!("No socket available for interface {:?}", iface_key);
                                     }
                                 } else {
                                     tracing::error!("No endpoint address");
