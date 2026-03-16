@@ -78,7 +78,7 @@ fn main() {
                 .help("Disable connected UDP sockets to each peer"),
             Arg::new("skt-buff-size")
                 .long("socket-buffer-size")
-                .value_parser(value_parser!(u32))
+                .value_parser(value_parser!(usize))
                 .help("Sets socket buffers to custom size"),
             #[cfg(target_os = "linux")]
             Arg::new("disable-multi-queue")
