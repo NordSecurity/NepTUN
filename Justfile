@@ -40,7 +40,7 @@ _udeps-install: _nightly-install
     cargo +{{ nightly }} install cargo-udeps@0.1.55 --locked
 
 _deny-install:
-    cargo install --locked cargo-deny@0.15.1
+    cargo install --locked cargo-deny@0.18.9
 
 _nightly-install:
     rustup toolchain add {{ nightly }}
