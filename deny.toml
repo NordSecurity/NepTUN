@@ -1,21 +1,24 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
 yanked = "warn"
-notice = "warn"
+ignore = [
+    "RUSTSEC-2025-0069", # `daemonize` is Unmaintained
+]
 
 [licenses]
 allow = [
-    "Apache-2.0",
-    "0BSD",
     "BSD-2-Clause",
-    "BSD-3-Clause",
-    "ISC",
-    "MIT",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "OpenSSL",
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "BSD-3-Clause",
+    "Zlib"
 ]
 
 [[licenses.clarify]]
