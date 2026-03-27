@@ -7,7 +7,7 @@
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use crate::device::tun::TunSocket;
-    use crate::device::{DeviceConfig, DeviceHandle};
+    use crate::device::{Device, DeviceConfig, DeviceHandle};
     use crate::x25519::{PublicKey, StaticSecret};
     use base64::encode as base64encode;
     use hex::encode;
@@ -275,6 +275,7 @@ mod tests {
                     skt_buffer_size: None,
                     inter_thread_channel_size: None,
                     max_inter_thread_batched_pkts: None,
+                    enable_ipv6: true,
                 },
             )
         }
@@ -567,6 +568,7 @@ mod tests {
                 skt_buffer_size: None,
                 inter_thread_channel_size: None,
                 max_inter_thread_batched_pkts: None,
+                enable_ipv6: true,
             },
         );
 
@@ -858,6 +860,7 @@ mod tests {
                 skt_buffer_size: None,
                 inter_thread_channel_size: None,
                 max_inter_thread_batched_pkts: None,
+                enable_ipv6: true,
             },
         );
 
@@ -935,6 +938,22 @@ mod tests {
 
         for t in threads {
             t.join().unwrap();
+        }
+    }
+
+    /// Test ipv6 enabled/disabled
+    #[test]
+    #[ignore]
+    fn test_device_creation_with_ipv6_enabled() {
+        for ipv6 in [true, false] {
+            let config = DeviceConfig {
+                enable_ipv6: ipv6,
+                ..Default::default()
+            };
+
+            let device = Device::new_with_tun(TunSocket::new("test_tun").unwrap(), config);
+
+            assert!(device.is_ok());
         }
     }
 

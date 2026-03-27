@@ -150,6 +150,7 @@ pub struct DeviceConfig {
     pub skt_buffer_size: Option<usize>,
     pub inter_thread_channel_size: Option<usize>,
     pub max_inter_thread_batched_pkts: Option<usize>,
+    pub enable_ipv6: bool,
 }
 
 pub struct Device {
@@ -234,8 +235,9 @@ impl DeviceHandle {
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let n_threads = config.n_threads;
+        let ipv6_enabled = config.enable_ipv6;
         let mut wg_interface = Device::new_with_tun(tun, config)?;
-        wg_interface.open_listen_socket(0)?; // Start listening on a random port
+        wg_interface.open_listen_socket(0, ipv6_enabled)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
@@ -649,8 +651,8 @@ impl Device {
             peers: Default::default(),
             peers_by_idx: Default::default(),
             peers_by_ip: AllowedIps::new(),
-            udp4: Default::default(),
-            udp6: Default::default(),
+            udp4: None,
+            udp6: None,
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -689,7 +691,7 @@ impl Device {
         Ok(device)
     }
 
-    fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
+    fn open_listen_socket(&mut self, mut port: u16, ipv6_enabled: bool) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
@@ -733,25 +735,37 @@ impl Device {
             }
         }
 
-        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock6.set_reuse_address(true)?;
-        udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-        udp_sock6.set_nonblocking(true)?;
-        self.config.protect.make_external(udp_sock6.as_raw_fd());
-
         if let Some(buffer_size) = self.config.skt_buffer_size {
-            // Modify IPv4 IPv6 snd and recv buffers
+            // Modify IPv4 snd and recv buffers
             modify_skt_buffer_size(udp_sock4.as_fd(), buffer_size);
-            modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
         self.register_udp_handler(udp_sock4.try_clone()?)?;
-        self.register_udp_handler(udp_sock6.try_clone()?)?;
-
         let udp4 = Arc::new(udp_sock4);
-        let udp6 = Arc::new(udp_sock6);
+
+        let udp6 = {
+            if ipv6_enabled {
+                let udp_sock6 =
+                    socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+                udp_sock6.set_reuse_address(true)?;
+                udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+                udp_sock6.set_nonblocking(true)?;
+                self.config.protect.make_external(udp_sock6.as_raw_fd());
+
+                if let Some(buffer_size) = self.config.skt_buffer_size {
+                    // Modify IPv4 snd and recv buffers
+                    modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
+                }
+
+                self.register_udp_handler(udp_sock6.try_clone()?)?;
+                Some(Arc::new(udp_sock6))
+            } else {
+                None
+            }
+        };
+
         self.udp4 = Some(udp4.clone());
-        self.udp6 = Some(udp6.clone());
+        self.udp6 = udp6.clone();
 
         // Construct a different closing channel per thread
         let (close_network_worker_tx, close_network_worker_rx) =
@@ -1307,7 +1321,7 @@ fn write_to_socket_worker(
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
     close_chan: Receiver<()>,
     udp4: Arc<socket2::Socket>,
-    udp6: Arc<socket2::Socket>,
+    maybe_udp6: Option<Arc<socket2::Socket>>,
     firewall_process_outbound_callback: Option<
         Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
     >,
@@ -1366,7 +1380,7 @@ fn write_to_socket_worker(
                                             public_key = element.peer.public_key.1
                                         );
                                     }
-                                } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                                } else if let (Some(addr @ SocketAddr::V6(_)), Some(udp6))= (endpoint.addr, maybe_udp6.clone()) {
                                     if let Err(err) = udp6.send_to(packet, &addr.into()) {
                                         tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
                                     } else {
@@ -1491,6 +1505,25 @@ impl Default for IndexLfsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Default for DeviceConfig {
+        fn default() -> Self {
+            DeviceConfig {
+                n_threads: 1,
+                use_connected_socket: true,
+                #[cfg(target_os = "linux")]
+                use_multi_queue: true,
+                open_uapi_socket: true,
+                protect: Arc::new(crate::device::MakeExternalNeptunNoop),
+                firewall_process_inbound_callback: None,
+                firewall_process_outbound_callback: None,
+                skt_buffer_size: None,
+                inter_thread_channel_size: None,
+                max_inter_thread_batched_pkts: None,
+                enable_ipv6: true,
+            }
+        }
+    }
 
     #[test]
     fn test_setting_skt_buffers() {
