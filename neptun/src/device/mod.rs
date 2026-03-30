@@ -760,7 +760,27 @@ impl Device {
         self.close_network_worker_tx = Some(close_network_worker_tx);
         self.close_tun_worker_tx = Some(close_tun_worker_tx);
 
-        // Process packet in a seperate thread
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            let rx_clone = self.tunnel_to_socket_rx.clone();
+            let close_chan_clone = close_network_worker_rx.clone();
+            let udp4_c = udp4.clone();
+            let udp6_c = udp6.clone();
+            let fw_callback = self
+                .config
+                .firewall_process_outbound_callback
+                .as_ref()
+                .map(|f| f.clone());
+            let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
+            let group = dispatch::Group::create();
+            queue.exec_async(move || {
+                group.enter();
+                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
+            });
+        }
+
+        // Process packet in a seperate thread for non-Apple platforms
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         for _ in 0..num_cpus::get_physical() {
             let rx_clone = self.tunnel_to_socket_rx.clone();
             let close_chan_clone = close_network_worker_rx.clone();
