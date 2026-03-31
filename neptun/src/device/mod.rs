@@ -33,7 +33,9 @@ use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use nix::sys::socket as NixSocket;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use num_cpus;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
@@ -43,14 +45,15 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::os::fd::{AsFd, BorrowedFd, RawFd};
+use std::os::fd::RawFd;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use tun::TunSocket;
 
 use dev_lock::{Lock, LockReadGuard};
@@ -181,10 +184,13 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     close_network_worker_tx: Option<Sender<()>>,
     close_tun_worker_tx: Option<Sender<()>>,
 
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     tunnel_to_socket_tx: Sender<Vec<NetworkTaskData>>,
 
     // UDP socket -> processing -> socket_to_tunnel_tx ->
@@ -200,6 +206,7 @@ struct ThreadData {
     update_seq: u32,
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 struct NetworkTaskData {
     data: [u8; MAX_PKT_SIZE],
     buf_len: usize,
@@ -482,6 +489,7 @@ impl Drop for DeviceHandle {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 fn set_sock_opt<T: NixSocket::SetSockOpt<Val = usize>>(
     socket: BorrowedFd<'_>,
     buffer: T,
@@ -494,6 +502,7 @@ fn set_sock_opt<T: NixSocket::SetSockOpt<Val = usize>>(
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 fn modify_skt_buffer_size(socket: BorrowedFd<'_>, buffer_size: usize) {
     set_sock_opt(socket, NixSocket::sockopt::RcvBuf, buffer_size, "RcvBuf");
     set_sock_opt(socket, NixSocket::sockopt::SndBuf, buffer_size, "SndBuf");
@@ -632,6 +641,7 @@ impl Device {
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
         let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
 
@@ -654,8 +664,11 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             tunnel_to_socket_tx,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             tunnel_to_socket_rx,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             close_network_worker_tx: None,
             socket_to_tunnel_tx,
             socket_to_tunnel_rx,
@@ -693,6 +706,7 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
                 for _ in 0..num_cpus::get_physical() {
                     if let Err(e) = close_network_worker_tx.try_send(()) {
@@ -739,6 +753,7 @@ impl Device {
         udp_sock6.set_nonblocking(true)?;
         self.config.protect.make_external(udp_sock6.as_raw_fd());
 
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = self.config.skt_buffer_size {
             // Modify IPv4 IPv6 snd and recv buffers
             modify_skt_buffer_size(udp_sock4.as_fd(), buffer_size);
@@ -754,32 +769,18 @@ impl Device {
         self.udp6 = Some(udp6.clone());
 
         // Construct a different closing channel per thread
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical() * 5);
-        let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
-        self.close_network_worker_tx = Some(close_network_worker_tx);
-        self.close_tun_worker_tx = Some(close_tun_worker_tx);
-
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
-            let rx_clone = self.tunnel_to_socket_rx.clone();
-            let close_chan_clone = close_network_worker_rx.clone();
-            let udp4_c = udp4.clone();
-            let udp6_c = udp6.clone();
-            let fw_callback = self
-                .config
-                .firewall_process_outbound_callback
-                .as_ref()
-                .map(|f| f.clone());
-            let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
-            let group = dispatch::Group::create();
-            queue.exec_async(move || {
-                group.enter();
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
-            });
+            self.close_network_worker_tx = Some(close_network_worker_tx);
         }
 
-        // Process packet in a seperate thread for non-Apple platforms
+        let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
+        self.close_tun_worker_tx = Some(close_tun_worker_tx);
+
+        // Process packet in a separate thread for non-Apple platforms
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         for _ in 0..num_cpus::get_physical() {
             let rx_clone = self.tunnel_to_socket_rx.clone();
@@ -798,6 +799,18 @@ impl Device {
 
         let rx_clone = self.socket_to_tunnel_rx.clone();
         let fw_callback = self.config.firewall_process_inbound_callback.clone();
+
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
+            let group = dispatch::Group::create();
+            queue.exec_async(move || {
+                group.enter();
+                write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback)
+            });
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
 
         self.listen_port = port;
@@ -1233,6 +1246,133 @@ impl Device {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn register_read_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
+        self.queue.new_event(
+            iface.as_raw_fd(),
+            Box::new(move |d, t| {
+                let mtu = d.mtu.load(Ordering::Relaxed);
+
+                let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
+                    (Some(u4), Some(u6)) => (u4, u6),
+                    _ => {
+                        tracing::error!("Not connected");
+                        return Action::Exit;
+                    }
+                };
+
+                if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
+                    tracing::error!("Insufficient packet buffer size");
+                    return Action::Exit;
+                }
+
+                let peers = &d.peers_by_ip;
+
+                for _ in 0..MAX_ITR {
+                    #[allow(clippy::indexing_slicing)] // Size already checked above
+                    let src = match iface.read(&mut t.dst_buf[WG_HEADER_OFFSET..mtu + WG_HEADER_OFFSET]) {
+                        Ok(src) => src,
+                        Err(Error::IfaceRead(e)) => {
+                            let ek = e.kind();
+                            if ek == io::ErrorKind::Interrupted || ek == io::ErrorKind::WouldBlock {
+                                break;
+                            }
+                            tracing::error!(
+                                message = "Fatal read error on tun interface: errno", error = ?e
+                            );
+                            return Action::Exit;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                message = "Unexpected error on tun interface", error = ?e
+                            );
+                            return Action::Exit;
+                        }
+                    };
+
+                    let dst_addr = match Tunn::dst_address(src) {
+                        Some(addr) => addr,
+                        None => continue,
+                    };
+
+                    let peer = match peers.find(dst_addr) {
+                        Some(peer) => peer,
+                        None => continue,
+                    };
+
+                    if let Some(callback) = &d.config.firewall_process_outbound_callback {
+                        if !callback(&peer.public_key.0, src, &mut t.iface.as_ref()) {
+                            continue;
+                        }
+                    }
+
+                    let len = src.len();
+
+                    let res = {
+                        let mut tun = peer.tunnel.lock();
+                        tun.encapsulate_in_place(len, &mut t.dst_buf[..])
+                    };
+
+                    match res {
+                        TunnResult::Done => {}
+                        TunnResult::Err(e) => {
+                            tracing::error!(message = "Encapsulate error",
+                                error = ?e,
+                                public_key = peer.public_key.1)
+                        }
+                        TunnResult::WriteToNetwork(packet) => {
+                            let endpoint = peer.endpoint();
+                            if let Some(conn) = endpoint.conn.as_ref() {
+                                if let Err(err) = conn.send(packet) {
+                                    tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                                    drop(endpoint);
+                                    peer.shutdown_endpoint();
+                                } else {
+                                    tracing::trace!(
+                                        "Pkt -> ConnSock ({:?}), len: {}",
+                                        endpoint.addr,
+                                        packet.len(),
+                                    );
+                                }
+                            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+                                if let Err(err) = udp4.send_to(packet, &addr.into()) {
+                                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+                                } else {
+                                    tracing::trace!(
+                                        message = "Writing packet to network v4",
+                                        packet_length = packet.len(),
+                                        src_addr = ?addr,
+                                        public_key = peer.public_key.1
+                                    );
+                                }
+                            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+                                if let Err(err) = udp6.send_to(packet, &addr.into()) {
+                                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
+                                } else {
+                                    tracing::trace!(
+                                        message = "Writing packet to network v6",
+                                        packet_length = packet.len(),
+                                        src_addr = ?addr,
+                                        public_key = peer.public_key.1
+                                    );
+                                }
+                            } else {
+                                tracing::error!("No endpoint");
+                            }
+                        }
+                        _ => {
+                            tracing::error!("Unexpected result from encapsulate");
+                            return Action::Exit;
+                        }
+                    }
+                }
+                Action::Continue
+            }),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     fn register_read_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
         self.queue.new_event(
             iface.as_raw_fd(),
@@ -1323,6 +1463,7 @@ impl Device {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 fn write_to_socket_worker(
     tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
     close_chan: Receiver<()>,
@@ -1340,13 +1481,13 @@ fn write_to_socket_worker(
                         let len = element.buf_len;
 
                         if let Some(callback) = &firewall_process_outbound_callback {
-                                let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
-                                    Some(b) => b,
-                                    None => continue,
-                                };
-                                if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
-                                    continue;
-                                }
+                            let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
+                                continue;
+                            }
                         }
 
                         let res = {
