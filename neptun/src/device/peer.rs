@@ -118,7 +118,8 @@ impl Peer {
         endpoint.addr = Some(addr);
     }
 
-    /// On Apple platforms, setting `skt_buffer_size` won't have any effect whatsoever.
+    /// On Apple platforms, it is optimal to rely on the kernel autotuning of the socket size.
+    /// Hence, setting `skt_buffer_size` won't have any effect for Apple platforms.
     pub fn connect_endpoint(
         &self,
         port: u16,
