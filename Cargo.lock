@@ -1990,7 +1990,6 @@ dependencies = [
  "neptun",
  "pcap",
  "pnet",
- "rand",
  "rand_core 0.6.4",
  "serde",
  "thiserror",
