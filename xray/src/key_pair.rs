@@ -2,7 +2,7 @@ use std::{fs::File, io::Write};
 
 use base64::prelude::*;
 use neptun::x25519::{PublicKey, StaticSecret};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 
 use crate::types::XRayResult;
 

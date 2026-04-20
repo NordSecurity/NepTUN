@@ -209,15 +209,14 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     // Introduced this test to prevent LLT-5351 recurring in the future:
     #[test]
     fn test_connect_endpoint() {
-        let a_secret_key = StaticSecret::random_from_rng(rand::rngs::StdRng::from_entropy());
+        let a_secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
 
-        let b_secret_key = StaticSecret::random_from_rng(rand::rngs::StdRng::from_entropy());
+        let b_secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
         let b_public_key = PublicKey::from(&b_secret_key);
 
         let tunnel = Tunn::new(a_secret_key, b_public_key, None, None, 0, None).unwrap();

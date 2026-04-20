@@ -3,7 +3,6 @@
 
 mod tests {
     use parking_lot::Mutex;
-    use rand::prelude::*;
     use std::{net::SocketAddr, str::FromStr, sync::Arc};
     use tokio::net::UdpSocket;
     use x25519_dalek::{PublicKey, StaticSecret};
@@ -54,10 +53,10 @@ mod tests {
     }
 
     async fn setup() -> (WGClient, WGClient) {
-        let a_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
+        let a_secret_key = StaticSecret::random_from_rng(&mut rand_core::OsRng);
         let a_public_key = PublicKey::from(&a_secret_key);
 
-        let b_secret_key = StaticSecret::random_from_rng(&mut rand::rngs::StdRng::from_entropy());
+        let b_secret_key = StaticSecret::random_from_rng(&mut rand_core::OsRng);
         let b_public_key = PublicKey::from(&b_secret_key);
 
         let a = WGClient::new(a_secret_key, b_public_key).await;
