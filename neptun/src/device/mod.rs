@@ -32,6 +32,7 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crossbeam_channel::{Receiver, Sender};
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use nix::sys::socket as NixSocket;
@@ -44,7 +45,9 @@ use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::net::IpAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::{AsFd, BorrowedFd};
@@ -65,8 +68,10 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 // used in wild networks.
 const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
-const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+const CHANNEL_SIZE: usize = 500;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
@@ -141,6 +146,8 @@ pub struct DeviceHandle {
 #[derive(Clone)]
 pub struct DeviceConfig {
     pub n_threads: usize,
+    /// On Apple platform, packets are always handled through an anonymous UDP socket.
+    /// Hence, setting this value has no effect when used on Apple platform.
     pub use_connected_socket: bool,
     #[cfg(target_os = "linux")]
     pub use_multi_queue: bool,
@@ -186,6 +193,7 @@ pub struct Device {
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     close_network_worker_tx: Option<Sender<()>>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     close_tun_worker_tx: Option<Sender<()>>,
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -195,7 +203,9 @@ pub struct Device {
 
     // UDP socket -> processing -> socket_to_tunnel_tx ->
     // [thread boundary] -> socket_to_tunnel_rx -> -> write to tunnel
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
 }
 
@@ -214,6 +224,7 @@ struct NetworkTaskData {
     iface: Arc<TunSocket>,
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 struct TunnelWorkerData {
     buffer: [u8; MAX_PKT_SIZE],
     peer: Arc<Peer>,
@@ -235,8 +246,6 @@ enum BatchResult {
     Exhausted,
     Fatal,
 }
-
-struct UnexpectedEncapsulationResult;
 
 struct CheckedMtu(usize);
 
@@ -673,9 +682,11 @@ impl Device {
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
 
         let mut device = Device {
@@ -703,8 +714,11 @@ impl Device {
             tunnel_to_socket_rx,
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             close_network_worker_tx: None,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             socket_to_tunnel_tx,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             socket_to_tunnel_rx,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             close_tun_worker_tx: None,
             update_seq: 0,
         };
@@ -740,16 +754,18 @@ impl Device {
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
-                for _ in 0..num_cpus::get_physical() {
-                    if let Err(e) = close_network_worker_tx.try_send(()) {
-                        tracing::error!("Unable to close network thread {e}");
+            {
+                if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
+                    for _ in 0..num_cpus::get_physical() {
+                        if let Err(e) = close_network_worker_tx.try_send(()) {
+                            tracing::error!("Unable to close network thread {e}");
+                        }
                     }
                 }
-            }
-            if let Some(close_tun_worker_tx) = &self.close_tun_worker_tx {
-                if let Err(e) = close_tun_worker_tx.try_send(()) {
-                    tracing::error!("Unable to close tun thread {e}");
+                if let Some(close_tun_worker_tx) = &self.close_tun_worker_tx {
+                    if let Err(e) = close_tun_worker_tx.try_send(()) {
+                        tracing::error!("Unable to close tun thread {e}");
+                    }
                 }
             }
             unsafe {
@@ -801,50 +817,45 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
-        // Construct a different closing channel per thread
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let (close_network_worker_tx, close_network_worker_rx) =
-            crossbeam_channel::bounded(num_cpus::get_physical() * 5);
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        {
-            self.close_network_worker_tx = Some(close_network_worker_tx);
-        }
-
-        let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
-        self.close_tun_worker_tx = Some(close_tun_worker_tx);
-
         // Process packet in a separate thread for non-Apple platforms
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        for _ in 0..num_cpus::get_physical() {
-            let rx_clone = self.tunnel_to_socket_rx.clone();
-            let close_chan_clone = close_network_worker_rx.clone();
-            let udp4_c = udp4.clone();
-            let udp6_c = udp6.clone();
-            let fw_callback = self
-                .config
-                .firewall_process_outbound_callback
-                .as_ref()
-                .map(|f| f.clone());
-            thread::spawn(move || {
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
-            });
-        }
-
-        let rx_clone = self.socket_to_tunnel_rx.clone();
-        let fw_callback = self.config.firewall_process_inbound_callback.clone();
-
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         {
-            let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
-            let group = dispatch::Group::create();
-            queue.exec_async(move || {
-                group.enter();
-                write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback)
+            // Construct a different closing channel per thread
+            let (close_network_worker_tx, close_network_worker_rx) =
+                crossbeam_channel::bounded(num_cpus::get_physical() * 5);
+            let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
+
+            self.close_network_worker_tx = Some(close_network_worker_tx);
+            self.close_tun_worker_tx = Some(close_tun_worker_tx);
+
+            for _ in 0..num_cpus::get_physical() {
+                let tunnel_to_socket_rx = self.tunnel_to_socket_rx.clone();
+                let close_chan_clone = close_network_worker_rx.clone();
+                let udp4_c = udp4.clone();
+                let udp6_c = udp6.clone();
+                let fw_callback = self
+                    .config
+                    .firewall_process_outbound_callback
+                    .as_ref()
+                    .map(|f| f.clone());
+                thread::spawn(move || {
+                    write_to_socket_worker(
+                        tunnel_to_socket_rx,
+                        close_chan_clone,
+                        udp4_c,
+                        udp6_c,
+                        fw_callback,
+                    )
+                });
+            }
+
+            let socket_to_tunnel_rx = self.socket_to_tunnel_rx.clone();
+            let fw_callback = self.config.firewall_process_inbound_callback.clone();
+
+            thread::spawn(move || {
+                write_to_tun_worker(socket_to_tunnel_rx, close_tun_worker_rx, fw_callback)
             });
         }
-
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
 
         self.listen_port = port;
 
@@ -1151,14 +1162,17 @@ impl Device {
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = sock.ip();
-                    peer.set_endpoint(sock);
-                    if d.config.use_connected_socket {
-                        // No need for aditional checking, as from this point all packets will arive to connected socket handler
-                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                            if let Err(e) = d.register_read_conn_skt_handler(Arc::clone(peer), sock, ip_addr) {
-                                tracing::error!("Failed to register connected socket handler {}", e);
-                                peer.shutdown_endpoint();
+                    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+                    {
+                        let ip_addr = sock.ip();
+                        peer.set_endpoint(sock);
+                        if d.config.use_connected_socket {
+                            // No need for aditional checking, as from this point all packets will arive to connected socket handler
+                            if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
+                                if let Err(e) = d.register_read_conn_skt_handler(Arc::clone(peer), sock, ip_addr) {
+                                    tracing::error!("Failed to register connected socket handler {}", e);
+                                    peer.shutdown_endpoint();
+                                }
                             }
                         }
                     }
@@ -1174,6 +1188,7 @@ impl Device {
         Ok(())
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     fn register_read_conn_skt_handler(
         &self,
         peer: Arc<Peer>,
@@ -1305,7 +1320,7 @@ impl Device {
                         (Some(udp4), Some(udp6)) => (udp4, udp6),
                         _ => {
                             tracing::error!("Not connected");
-                            return Action::Exit;
+                            return Action::Continue;
                         }
                     };
                     handle_packet_in_place(d, t, &iface, &mtu, peers, udp4, udp6)
@@ -1373,11 +1388,7 @@ fn handle_packet_in_place(
                 }
 
                 let len = payload.len();
-                if encapsulate_and_send(&peer, &mut thread_data.dst_buf[..], len, udp4, udp6)
-                    .is_err()
-                {
-                    return Action::Exit;
-                }
+                encapsulate_and_send(&peer, &mut thread_data.dst_buf[..], len, udp4, udp6);
             }
         }
     }
@@ -1452,19 +1463,18 @@ fn encapsulate_and_send(
     payload_len: usize,
     udp4: &socket2::Socket,
     udp6: &socket2::Socket,
-) -> Result<(), UnexpectedEncapsulationResult> {
+) {
     let res = {
         let mut tun = peer.tunnel.lock();
         tun.encapsulate_in_place(payload_len, buf)
     };
 
     match res {
-        TunnResult::Done => Ok(()),
+        TunnResult::Done => {}
         TunnResult::Err(e) => {
             tracing::error!(message = "Encapsulate error",
                 error = ?e,
                 public_key = peer.public_key.1);
-            Ok(())
         }
         TunnResult::WriteToNetwork(packet) => {
             let endpoint = peer.endpoint();
@@ -1495,11 +1505,9 @@ fn encapsulate_and_send(
             } else {
                 tracing::error!("No endpoint");
             }
-            Ok(())
         }
         _ => {
             tracing::error!("Unexpected result from encapsulate");
-            Err(UnexpectedEncapsulationResult)
         }
     }
 }
@@ -1531,9 +1539,7 @@ fn write_to_socket_worker(
                             }
                         }
 
-                        if encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6).is_err() {
-                            tracing::error!("Unexpected result from encapsulate");
-                        }
+                        encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6);
                     }
                 }
             }
@@ -1544,6 +1550,7 @@ fn write_to_socket_worker(
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 fn write_to_tun_worker(
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
     close_chan: Receiver<()>,
