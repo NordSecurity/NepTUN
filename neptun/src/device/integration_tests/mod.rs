@@ -295,66 +295,6 @@ mod tests {
             }
         }
 
-        #[cfg(target_os = "macos")]
-        /// Starts the tunnel
-        fn start(&mut self) {
-            // Assign the ipv4 address to the interface
-            Command::new("ifconfig")
-                .args(&[
-                    &self.name,
-                    &self.addr_v4.to_string(),
-                    &self.addr_v4.to_string(),
-                    "alias",
-                ])
-                .status()
-                .expect("failed to assign ip to tunnel");
-
-            // Assign the ipv6 address to the interface
-            Command::new("ifconfig")
-                .args(&[
-                    &self.name,
-                    "inet6",
-                    &self.addr_v6.to_string(),
-                    "prefixlen",
-                    "128",
-                    "alias",
-                ])
-                .status()
-                .expect("failed to assign ipv6 to tunnel");
-
-            // Start the tunnel
-            Command::new("ifconfig")
-                .args(&[&self.name, "up"])
-                .status()
-                .expect("failed to start the tunnel");
-
-            self.started = true;
-
-            // Add each peer to the routing table
-            for p in &self.peers {
-                for r in &p.allowed_ips {
-                    let inet_flag = match r.ip {
-                        IpAddr::V4(_) => "-inet",
-                        IpAddr::V6(_) => "-inet6",
-                    };
-
-                    Command::new("route")
-                        .args(&[
-                            "-q",
-                            "-n",
-                            "add",
-                            inet_flag,
-                            &format!("{}/{}", r.ip, r.cidr),
-                            "-interface",
-                            &self.name,
-                        ])
-                        .status()
-                        .expect("failed to add route");
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
         /// Starts the tunnel
         fn start(&mut self) {
             configure_utun(&self.name, self.addr_v4, self.addr_v6, &self.peers);
@@ -442,7 +382,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    /// Test that send_uapi_cmd interface works corretly
+    /// Test that send_uapi_cmd interface works correctly
     fn test_wireguard_get_on_device() {
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
         let response = wg.wg_uapi_device_cmd("get=1\n\n");
@@ -451,6 +391,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[cfg(not(target_os = "macos"))] // macOS implementation does not support UAPI command chaining within a single connection
     fn test_wireguard_uapi_chaining() {
         let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
 
@@ -677,8 +618,15 @@ mod tests {
         wg.name = new_name;
         wg.device.set_iface(new_iface).unwrap();
 
+        #[cfg(target_os = "linux")]
         Command::new("ip")
             .args(["link", "delete", &old_name])
+            .status()
+            .expect("failed to delete old interface");
+
+        #[cfg(target_os = "macos")]
+        Command::new("ifconfig")
+            .args([&old_name, "down"])
             .status()
             .expect("failed to delete old interface");
 
@@ -702,8 +650,15 @@ mod tests {
         wg.name = new_name;
         wg.device.set_iface(new_iface).unwrap();
 
+        #[cfg(target_os = "linux")]
         Command::new("ip")
             .args(["link", "delete", &old_name])
+            .status()
+            .expect("failed to delete old interface");
+
+        #[cfg(target_os = "macos")]
+        Command::new("ifconfig")
+            .args([&old_name, "down"])
             .status()
             .expect("failed to delete old interface");
 
@@ -988,6 +943,7 @@ mod tests {
             t.join().unwrap();
         }
     }
+
     #[cfg(target_os = "linux")]
     fn remove_routing(name: &str, peers: &[Arc<Peer>]) {
         for p in peers {
@@ -1002,6 +958,30 @@ mod tests {
                     ])
                     .status()
                     .expect("failed to add route");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn remove_routing(name: &str, peers: &[Arc<Peer>]) {
+        for p in peers {
+            for r in &p.allowed_ips {
+                let inet_flag = match r.ip {
+                    IpAddr::V4(_) => "-inet",
+                    IpAddr::V6(_) => "-inet6",
+                };
+                Command::new("route")
+                    .args([
+                        "-q",
+                        "-n",
+                        "delete",
+                        inet_flag,
+                        &format!("{}/{}", r.ip, r.cidr),
+                        "-interface",
+                        name,
+                    ])
+                    .status()
+                    .expect("failed to delete route");
             }
         }
     }
@@ -1033,6 +1013,56 @@ mod tests {
                         &format!("{}/{}", r.ip, r.cidr),
                         "dev",
                         &name,
+                    ])
+                    .status()
+                    .expect("failed to add route");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn configure_utun(name: &str, addr_v4: IpAddr, addr_v6: IpAddr, peers: &[Arc<Peer>]) {
+        Command::new("ifconfig")
+            .args([name, &addr_v4.to_string(), &addr_v4.to_string(), "alias"])
+            .status()
+            .expect("failed to assign ip to tunnel");
+
+        // Assign the ipv6 address to the interface
+        Command::new("ifconfig")
+            .args([
+                name,
+                "inet6",
+                &addr_v6.to_string(),
+                "prefixlen",
+                "128",
+                "alias",
+            ])
+            .status()
+            .expect("failed to assign ipv6 to tunnel");
+
+        // Set MTU and bring up the interface
+        Command::new("ifconfig")
+            .args([name, "mtu", "1400", "up"])
+            .status()
+            .expect("failed to start the tunnel");
+
+        // Add routes for each peer's allowed IPs
+        for p in peers {
+            for r in &p.allowed_ips {
+                let inet_flag = match r.ip {
+                    IpAddr::V4(_) => "-inet",
+                    IpAddr::V6(_) => "-inet6",
+                };
+
+                Command::new("route")
+                    .args([
+                        "-q",
+                        "-n",
+                        "add",
+                        inet_flag,
+                        &format!("{}/{}", r.ip, r.cidr),
+                        "-interface",
+                        name,
                     ])
                     .status()
                     .expect("failed to add route");
