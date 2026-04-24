@@ -9,10 +9,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, S
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::device::{modify_skt_buffer_size, AllowedIps, Error, MakeExternalNeptun};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::device::modify_skt_buffer_size;
+use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 
-use std::os::fd::{AsFd, AsRawFd};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -114,9 +118,15 @@ impl Peer {
         endpoint.addr = Some(addr);
     }
 
+    /// On Apple platforms, it is optimal to rely on the kernel autotuning of the socket size.
+    /// Hence, setting `skt_buffer_size` won't have any effect for Apple platforms.
     pub fn connect_endpoint(
         &self,
         port: u16,
+        #[cfg_attr(
+            any(target_os = "macos", target_os = "ios", target_os = "tvos"),
+            allow(unused_variables)
+        )]
         skt_buffer_size: Option<usize>,
     ) -> Result<socket2::Socket, Error> {
         let mut endpoint = self.endpoint.write();
@@ -157,6 +167,7 @@ impl Peer {
 
         endpoint.conn = Some(udp_conn.try_clone()?);
 
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = skt_buffer_size {
             modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
         }
