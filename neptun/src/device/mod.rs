@@ -26,18 +26,16 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+mod packet_workers;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crossbeam_channel::{Receiver, Sender};
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use nix::sys::socket as NixSocket;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use num_cpus;
+use dev_lock::{Lock, LockReadGuard};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
@@ -45,22 +43,23 @@ use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::mem::{swap, MaybeUninit};
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::{self, JoinHandle};
+use thiserror::Error;
 use tun::TunSocket;
 
-use dev_lock::{Lock, LockReadGuard};
-use thiserror::Error;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use {
+    nix::sys::socket as NixSocket,
+    packet_workers::{PacketWorkers, TunnelWorkerData},
+    std::net::IpAddr,
+    std::os::fd::{AsFd, BorrowedFd},
+    std::thread::{self, JoinHandle},
+};
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
@@ -69,10 +68,6 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
 const WG_HEADER_OFFSET: usize = 16;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-const CHANNEL_SIZE: usize = 500;
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -192,21 +187,7 @@ pub struct Device {
     rate_limiter: Option<Arc<RateLimiter>>,
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    close_network_worker_tx: Option<Sender<()>>,
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    close_tun_worker_tx: Option<Sender<()>>,
-
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    tunnel_to_socket_tx: Sender<Vec<NetworkTaskData>>,
-
-    // UDP socket -> processing -> socket_to_tunnel_tx ->
-    // [thread boundary] -> socket_to_tunnel_rx -> -> write to tunnel
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
+    workers: PacketWorkers,
 }
 
 struct ThreadData {
@@ -216,35 +197,11 @@ struct ThreadData {
     update_seq: u32,
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-struct NetworkTaskData {
-    data: [u8; MAX_PKT_SIZE],
-    buf_len: usize,
-    peer: Arc<Peer>,
-    iface: Arc<TunSocket>,
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-struct TunnelWorkerData {
-    buffer: [u8; MAX_PKT_SIZE],
-    peer: Arc<Peer>,
-    iface: Arc<TunSocket>,
-    addr: IpAddr,
-    buf_len: usize,
-}
-
 enum IfaceReadResult<'a> {
     Packet { payload: &'a [u8], peer: Arc<Peer> },
     Exhausted,
     Fatal,
     Skip,
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-enum BatchResult {
-    Continue,
-    Exhausted,
-    Fatal,
 }
 
 struct CheckedMtu(usize);
@@ -683,11 +640,7 @@ impl Device {
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
+        let workers = PacketWorkers::new(&config);
 
         let mut device = Device {
             queue: Arc::new(poll),
@@ -708,19 +661,9 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            tunnel_to_socket_tx,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            tunnel_to_socket_rx,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            close_network_worker_tx: None,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            socket_to_tunnel_tx,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            socket_to_tunnel_rx,
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            close_tun_worker_tx: None,
             update_seq: 0,
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+            workers,
         };
 
         if device.config.open_uapi_socket {
@@ -754,20 +697,7 @@ impl Device {
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            {
-                if let Some(close_network_worker_tx) = &self.close_network_worker_tx {
-                    for _ in 0..num_cpus::get_physical() {
-                        if let Err(e) = close_network_worker_tx.try_send(()) {
-                            tracing::error!("Unable to close network thread {e}");
-                        }
-                    }
-                }
-                if let Some(close_tun_worker_tx) = &self.close_tun_worker_tx {
-                    if let Err(e) = close_tun_worker_tx.try_send(()) {
-                        tracing::error!("Unable to close tun thread {e}");
-                    }
-                }
-            }
+            self.workers.shutdown();
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -819,43 +749,7 @@ impl Device {
 
         // Process packet in a separate thread for non-Apple platforms
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        {
-            // Construct a different closing channel per thread
-            let (close_network_worker_tx, close_network_worker_rx) =
-                crossbeam_channel::bounded(num_cpus::get_physical() * 5);
-            let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
-
-            self.close_network_worker_tx = Some(close_network_worker_tx);
-            self.close_tun_worker_tx = Some(close_tun_worker_tx);
-
-            for _ in 0..num_cpus::get_physical() {
-                let tunnel_to_socket_rx = self.tunnel_to_socket_rx.clone();
-                let close_chan_clone = close_network_worker_rx.clone();
-                let udp4_c = udp4.clone();
-                let udp6_c = udp6.clone();
-                let fw_callback = self
-                    .config
-                    .firewall_process_outbound_callback
-                    .as_ref()
-                    .map(|f| f.clone());
-                thread::spawn(move || {
-                    write_to_socket_worker(
-                        tunnel_to_socket_rx,
-                        close_chan_clone,
-                        udp4_c,
-                        udp6_c,
-                        fw_callback,
-                    )
-                });
-            }
-
-            let socket_to_tunnel_rx = self.socket_to_tunnel_rx.clone();
-            let fw_callback = self.config.firewall_process_inbound_callback.clone();
-
-            thread::spawn(move || {
-                write_to_tun_worker(socket_to_tunnel_rx, close_tun_worker_rx, fw_callback)
-            });
-        }
+        self.workers.start(udp4, udp6, &self.config);
 
         self.listen_port = port;
 
@@ -1082,8 +976,8 @@ impl Device {
                         },
                         None => {
                             match Tunn::parse_incoming_packet(packet) {
-                                Ok(packet) => packet,
-                                Err(_) => continue,
+                            Ok(packet) => packet,
+                            Err(_) => continue,
                             }
                         }
                     };
@@ -1161,13 +1055,13 @@ impl Device {
                         }
                     }
 
-                    // This packet was OK, that means we want to create a connected socket for this peer
                     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
                     {
+                        // This packet was OK, that means we want to create a connected socket for this peer
                         let ip_addr = sock.ip();
                         peer.set_endpoint(sock);
                         if d.config.use_connected_socket {
-                            // No need for aditional checking, as from this point all packets will arive to connected socket handler
+                            // No need for additional checking, as from this point all packets will arrive to connected socket handler
                             if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
                                 if let Err(e) = d.register_read_conn_skt_handler(Arc::clone(peer), sock, ip_addr) {
                                     tracing::error!("Failed to register connected socket handler {}", e);
@@ -1201,7 +1095,7 @@ impl Device {
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
-                let max_batched_pkts = d.config.max_inter_thread_batched_pkts.unwrap_or(MAX_INTERTHREAD_BATCHED_PKTS);
+                let max_batched_pkts = d.workers.max_batched_pkts;
                 loop {
                     let mut batched_pkts = Vec::with_capacity(max_batched_pkts);
                     let mut socket_buffer_exhausted = false;
@@ -1236,8 +1130,8 @@ impl Device {
                                     }
                                     _ => {
                                         tracing::error!(message="Decapsulate error",
-                                            error=?e,
-                                            public_key = peer.public_key.1)
+                                        error=?e,
+                                        public_key = peer.public_key.1)
                                     }
                                 },
                                 TunnResult::WriteToNetwork(packet) => {
@@ -1281,9 +1175,9 @@ impl Device {
                             break;
                         }
                     }
-                    if let Err(e) = d.socket_to_tunnel_tx.send(batched_pkts) {
-                        tracing::warn!("Unable to forward data onto tunnel worker {e}");
-                    }
+
+                    d.workers.submit_inbound(batched_pkts);
+
                     if socket_buffer_exhausted {
                         break;
                     }
@@ -1315,45 +1209,13 @@ impl Device {
                 // On Apple platforms, process the packets inline
                 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
                 {
-                    let t = _t;
-                    let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                        (Some(udp4), Some(udp6)) => (udp4, udp6),
-                        _ => {
-                            tracing::error!("Not connected");
-                            return Action::Continue;
-                        }
-                    };
-                    handle_packet_in_place(d, t, &iface, &mtu, peers, udp4, udp6)
+                    process_iface_inline(d, _t, &iface, &mtu, peers)
                 }
 
                 // On non-Apple platforms, batch packets and send them to a worker thread for processing
                 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
                 {
-                    let max_batched_pkts = d
-                        .config
-                        .max_inter_thread_batched_pkts
-                        .unwrap_or(MAX_INTERTHREAD_BATCHED_PKTS);
-
-                    loop {
-                        let (batched_pkts, result) =
-                            handle_packet_queued(&iface, &mtu, peers, max_batched_pkts);
-
-                        match result {
-                            BatchResult::Fatal => return Action::Exit,
-                            BatchResult::Continue | BatchResult::Exhausted => {
-                                if let Err(e) = d.tunnel_to_socket_tx.send(batched_pkts) {
-                                    tracing::warn!(
-                                        "Unable to forward data onto network worker {e}"
-                                    );
-                                }
-                                if matches!(result, BatchResult::Exhausted) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    Action::Continue
+                    d.workers.dispatch_iface_read(&iface, &mtu, peers)
                 }
             }),
         )?;
@@ -1366,15 +1228,21 @@ impl Device {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-fn handle_packet_in_place(
-    device: &LockReadGuard<Device>,
+fn process_iface_inline(
+    device: &Device,
     thread_data: &mut ThreadData,
     iface: &Arc<TunSocket>,
     mtu: &CheckedMtu,
     peers: &AllowedIps<Arc<Peer>>,
-    udp4: &socket2::Socket,
-    udp6: &socket2::Socket,
 ) -> Action {
+    let (udp4, udp6) = match (device.udp4.as_ref(), device.udp6.as_ref()) {
+        (Some(udp4), Some(udp6)) => (udp4, udp6),
+        _ => {
+            tracing::error!("Not connected");
+            return Action::Continue;
+        }
+    };
+
     for _ in 0..MAX_ITR {
         match read_packet(iface, &mut thread_data.dst_buf, mtu, peers) {
             IfaceReadResult::Exhausted => break,
@@ -1393,36 +1261,6 @@ fn handle_packet_in_place(
         }
     }
     Action::Continue
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-fn handle_packet_queued(
-    iface: &Arc<TunSocket>,
-    mtu: &CheckedMtu,
-    peers: &AllowedIps<Arc<Peer>>,
-    max_batched_pkts: usize,
-) -> (Vec<NetworkTaskData>, BatchResult) {
-    let mut batched_pkts = Vec::with_capacity(max_batched_pkts);
-
-    for _ in 0..batched_pkts.capacity() {
-        let mut buffer = [0u8; MAX_PKT_SIZE];
-        match read_packet(iface, &mut buffer, mtu, peers) {
-            IfaceReadResult::Exhausted => return (batched_pkts, BatchResult::Exhausted),
-            IfaceReadResult::Fatal => return (batched_pkts, BatchResult::Fatal),
-            IfaceReadResult::Skip => continue,
-            IfaceReadResult::Packet { payload, peer } => {
-                let len = payload.len();
-                batched_pkts.push(NetworkTaskData {
-                    data: buffer,
-                    buf_len: len,
-                    peer,
-                    iface: iface.clone(),
-                });
-            }
-        }
-    }
-
-    (batched_pkts, BatchResult::Continue)
 }
 
 fn read_packet<'a>(
@@ -1508,87 +1346,6 @@ fn encapsulate_and_send(
         }
         _ => {
             tracing::error!("Unexpected result from encapsulate");
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-fn write_to_socket_worker(
-    tunnel_to_socket_rx: Receiver<Vec<NetworkTaskData>>,
-    close_chan: Receiver<()>,
-    udp4: Arc<socket2::Socket>,
-    udp6: Arc<socket2::Socket>,
-    firewall_process_outbound_callback: Option<
-        Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
-    >,
-) {
-    loop {
-        crossbeam_channel::select! {
-            recv(tunnel_to_socket_rx) -> element => {
-                if let Ok(mut batched_pkts) = element {
-                    for element in batched_pkts.iter_mut() {
-                        let len = element.buf_len;
-
-                        if let Some(callback) = &firewall_process_outbound_callback {
-                            let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
-                                continue;
-                            }
-                        }
-
-                        encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6);
-                    }
-                }
-            }
-            recv(close_chan) -> _n => {
-                break;
-            }
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-fn write_to_tun_worker(
-    socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
-    close_chan: Receiver<()>,
-    firewall_process_inbound_callback: Option<
-        Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>,
-    >,
-) {
-    loop {
-        crossbeam_channel::select! {
-            recv(socket_to_tunnel_rx) -> batched_pkts => {
-                if let Ok(batched_pkts) = batched_pkts {
-                    for mut t in batched_pkts {
-                        let peer = t.peer;
-
-                        let buffer = match t.buffer.get_mut(..t.buf_len) {
-                            Some(b) => b,
-                            None => {tracing::warn!("Length is greater than buffer space"); continue},
-                        };
-                        if let Some(callback) = &firewall_process_inbound_callback {
-                            if !callback(&peer.public_key.0, buffer) {
-                                continue;
-                            }
-                        }
-                        if peer.is_allowed_ip(t.addr) {
-                            _ = t.iface.as_ref().write(buffer);
-                            tracing::trace!(
-                                message = "Writing packet to tunnel",
-                                packet_length = t.buf_len,
-                                src_addr = ?t.addr,
-                                public_key = peer.public_key.1
-                            );
-                        }
-                    }
-                }
-            }
-            recv(close_chan) -> _n => {
-                break;
-            }
         }
     }
 }
