@@ -1317,16 +1317,22 @@ fn encapsulate_and_send(
         TunnResult::WriteToNetwork(packet) => {
             let endpoint = peer.endpoint();
             if let Some(conn) = endpoint.conn.as_ref() {
-                if let Err(err) = conn.send(packet) {
-                    tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                    drop(endpoint);
-                    peer.shutdown_endpoint();
-                } else {
-                    tracing::trace!(
-                        "Pkt -> ConnSock ({:?}), len: {}",
-                        endpoint.addr,
-                        packet.len()
-                    );
+                match conn.send(packet) {
+                    Ok(_) => {
+                        tracing::trace!(
+                            "Pkt -> ConnSock ({:?}), len: {}",
+                            endpoint.addr,
+                            packet.len()
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
+                    }
+                    Err(err) => {
+                        tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                        drop(endpoint);
+                        peer.shutdown_endpoint();
+                    }
                 }
             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
                 if let Err(err) = udp4.send_to(packet, &addr.into()) {
