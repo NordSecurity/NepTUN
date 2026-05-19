@@ -126,12 +126,6 @@ dependencies = [
 
 [[package]]
 name = "base64"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -936,7 +930,7 @@ name = "neptun"
 version = "2.2.3"
 dependencies = [
  "aead",
- "base64 0.13.1",
+ "base64",
  "blake2",
  "chacha20poly1305",
  "criterion",
@@ -964,6 +958,7 @@ dependencies = [
  "tracing-subscriber",
  "untrusted",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -2175,7 +2170,7 @@ dependencies = [
 name = "xray"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "clap",
  "color-eyre",
  "csv",
@@ -2217,9 +2212,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ced3678a2879b30306d323f4542626697a464a97c0a07c9aebf7ebca65cd4dde"
+checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
  "zeroize_derive",
 ]
