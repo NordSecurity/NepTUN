@@ -3,8 +3,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // This module contains some integration tests for neptun
-// Those tests require docker and sudo privileges to run
-
+//
+// # Prerequisites
+// - sudo privileges
+// - Docker
+//
+// # Supported platforms
+// - Linux
+// - macOS (local only, CI lacks Docker support on Apple Silicon runners)
+//
+// # Running
+// Executing these tests with direct `cargo test` invocation requires several additional params.
+// Use xtask convenience wrapper instead:
+//     cargo xtask test               # runs tests for all features, including docker-tests
+//     cargo xtask test docker-tests  # runs tests from this module only
 #![cfg(all(unix, feature = "device"))]
 
 use base64::encode as base64encode;
