@@ -27,10 +27,40 @@ It is also possible to use with [wg-quick](https://git.zx2c4.com/WireGuard/about
 
 ### Testing
 
-Testing this project has a few requirements:
+The project uses Cargo features to gate tests by their requirements.
 
-- `sudo`: required to create tunnels. When you run `cargo test` you'll be prompted for your password.
+#### Prerequisites
+
+Running `device` module integration tests specifically needs:
+- `sudo`: required to create tunnels.
 - Docker: you can install it [here](https://www.docker.com/get-started). If you are on Ubuntu/Debian you can run `apt-get install docker.io`.
+
+#### Default tests with no prerequisites
+
+Runs all tests with the default feature set:
+
+    cargo test
+
+#### Full test suite — requires sudo + Docker
+
+Runs the complete test suite with all features enabled. Handles platform-specific sudo configuration automatically.
+Shortcut for `cargo xtask test all-features`. When run, you'll be prompted for your password.
+
+    cargo xtask test
+
+#### Targeted test subsets
+
+Default tests plus timer-behavior unit tests using a mock clock:
+
+    cargo xtask test mock-instant
+
+Device module integration tests (requires sudo + Docker):
+
+    cargo xtask test docker-tests
+
+Explicit invocation for a full test suite with all features (requires sudo + Docker, same as `cargo xtask test`):
+
+    cargo xtask test all-features
 
 ## Supported platforms
 
