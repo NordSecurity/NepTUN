@@ -1,13 +1,13 @@
 // Copyright (c) 2024 Nord Security. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-mod tests {
+mod noise {
     use parking_lot::Mutex;
     use std::{net::SocketAddr, str::FromStr, sync::Arc};
     use tokio::net::UdpSocket;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    use crate::noise::{Tunn, TunnResult, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ};
+    use neptun::noise::{Tunn, TunnResult, HANDSHAKE_INIT_SZ, HANDSHAKE_RESP_SZ};
 
     const MAX_PACKET: usize = 2048;
 
