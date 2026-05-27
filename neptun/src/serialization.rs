@@ -35,14 +35,6 @@ impl std::str::FromStr for KeyBytes {
                     .map_err(|_| "Illegal character in key")?;
                 }
             }
-            43 => {
-                // Try to parse as unpadded base64
-                match general_purpose::STANDARD_NO_PAD.decode_slice(s, &mut *internal) {
-                    Ok(len) if len == internal.len() => {}
-                    Ok(_) => return Err("Decoded key has wrong length"),
-                    Err(_) => return Err("Failed to decode base64"),
-                }
-            }
             44 => {
                 // Try to parse as padded base64
                 match general_purpose::STANDARD.decode_slice(s, &mut *internal) {
@@ -176,13 +168,10 @@ mod tests {
     }
 
     #[test]
-    fn unpadded_base64_43_chars_is_accepted() {
+    fn unpadded_base64_43_chars_is_rejected() {
         let unpadded = general_purpose::STANDARD_NO_PAD.encode([0u8; 32]);
         assert_eq!(unpadded.len(), 43);
-
-        let result = KeyBytes::from_str(&unpadded);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().get_bytes(), &[0u8; 32]);
+        assert!(KeyBytes::from_str(&unpadded).is_err());
     }
 
     #[test]
