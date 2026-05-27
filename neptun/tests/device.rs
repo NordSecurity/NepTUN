@@ -5,10 +5,10 @@
 // This module contains some integration tests for neptun
 // Those tests require docker and sudo privileges to run
 #[cfg(all(test, not(target_os = "macos")))]
-mod tests {
-    use crate::device::tun::TunSocket;
-    use crate::device::{DeviceConfig, DeviceHandle};
-    use crate::x25519::{PublicKey, StaticSecret};
+mod device {
+    use neptun::device::tun::TunSocket;
+    use neptun::device::{DeviceConfig, DeviceHandle};
+    use neptun::x25519::{PublicKey, StaticSecret};
     use base64::encode as base64encode;
     use hex::encode;
     use rand_core::OsRng;
@@ -269,7 +269,7 @@ mod tests {
                     #[cfg(target_os = "linux")]
                     use_multi_queue: true,
                     open_uapi_socket: true,
-                    protect: Arc::new(crate::device::MakeExternalNeptunNoop),
+                    protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
                     firewall_process_inbound_callback: None,
                     firewall_process_outbound_callback: None,
                     skt_buffer_size: None,
@@ -502,7 +502,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 use_multi_queue: true,
                 open_uapi_socket: true,
-                protect: Arc::new(crate::device::MakeExternalNeptunNoop),
+                protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
                 skt_buffer_size: None,
@@ -807,7 +807,7 @@ mod tests {
                 #[cfg(target_os = "linux")]
                 use_multi_queue: true,
                 open_uapi_socket: true,
-                protect: Arc::new(crate::device::MakeExternalNeptunNoop),
+                protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
                 skt_buffer_size: None,
