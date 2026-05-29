@@ -151,7 +151,7 @@ pub struct DeviceConfig {
     pub firewall_process_inbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
-        Option<Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
+        Option<Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
     pub skt_buffer_size: Option<usize>,
     pub inter_thread_channel_size: Option<usize>,
     pub max_inter_thread_batched_pkts: Option<usize>,
@@ -1249,13 +1249,18 @@ fn process_iface_inline(
             IfaceReadResult::Fatal => return Action::Exit,
             IfaceReadResult::Skip => continue,
             IfaceReadResult::Packet { payload, peer } => {
+                let len = payload.len();
+
                 if let Some(callback) = &device.config.firewall_process_outbound_callback {
-                    if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
+                    if !callback(
+                        &peer.public_key.0,
+                        &mut thread_data.dst_buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + len],
+                        &mut thread_data.iface.as_ref(),
+                    ) {
                         continue;
                     }
                 }
 
-                let len = payload.len();
                 encapsulate_and_send(&peer, &mut thread_data.dst_buf[..], len, udp4, udp6);
             }
         }
