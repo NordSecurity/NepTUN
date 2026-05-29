@@ -210,7 +210,7 @@ fn write_to_socket_worker(
     udp4: Arc<socket2::Socket>,
     udp6: Arc<socket2::Socket>,
     firewall_process_outbound_callback: Option<
-        Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
+        Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
     >,
 ) {
     loop {
@@ -221,7 +221,7 @@ fn write_to_socket_worker(
                         let len = element.buf_len;
 
                         if let Some(callback) = &firewall_process_outbound_callback {
-                            let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                            let buffer = match element.data.get_mut(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
                                 Some(b) => b,
                                 None => continue,
                             };
