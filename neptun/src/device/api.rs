@@ -248,7 +248,7 @@ fn api_set<R: Read>(reader: &mut BufReader<R>, d: &mut LockReadGuard<Device>) ->
                     match key {
                         "private_key" => match val.parse::<KeyBytes>() {
                             Ok(key_bytes) => {
-                                device.set_key(x25519::StaticSecret::from(key_bytes.0))
+                                device.set_key(x25519::StaticSecret::from(*key_bytes.get_bytes()))
                             }
                             Err(_) => return EINVAL,
                         },
@@ -285,7 +285,7 @@ fn api_set<R: Read>(reader: &mut BufReader<R>, d: &mut LockReadGuard<Device>) ->
                                 return api_set_peer(
                                     reader,
                                     device,
-                                    x25519::PublicKey::from(key_bytes.0),
+                                    x25519::PublicKey::from(*key_bytes.get_bytes()),
                                 )
                             }
                             Err(_) => return EINVAL,
@@ -351,7 +351,7 @@ fn api_set_peer<R: Read>(
                     Err(_) => return EINVAL,
                 },
                 "preshared_key" => match val.parse::<KeyBytes>() {
-                    Ok(key_bytes) => preshared_key = Some(key_bytes.0),
+                    Ok(key_bytes) => preshared_key = Some(*key_bytes.get_bytes()),
                     Err(_) => return EINVAL,
                 },
                 "endpoint" => match val.parse::<SocketAddr>() {
@@ -394,7 +394,7 @@ fn api_set_peer<R: Read>(
                     update_only = false; // Reset update only
                     allowed_ips.clear(); //clear the vector content after update
                     match val.parse::<KeyBytes>() {
-                        Ok(key_bytes) => public_key = key_bytes.0.into(),
+                        Ok(key_bytes) => public_key = (*key_bytes.get_bytes()).into(),
                         Err(_) => return EINVAL,
                     }
                 }

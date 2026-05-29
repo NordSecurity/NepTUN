@@ -8,6 +8,7 @@ use std::mem;
 use std::ops::{Index, IndexMut};
 use std::time::SystemTime;
 
+use base64::{engine::general_purpose, Engine};
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
 use x25519_dalek::PublicKey;
@@ -47,7 +48,7 @@ const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 // the first and last 4 chars of the key for better diagnostics while
 // not revealing the full key.
 fn format_pubkey_short(&key: &PublicKey) -> String {
-    let encoded = base64::encode(key);
+    let encoded = general_purpose::STANDARD.encode(key);
     if encoded.len() <= 8 {
         encoded
     } else {

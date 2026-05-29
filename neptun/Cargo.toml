@@ -19,7 +19,8 @@ mock-instant = ["mock_instant"]
 xray = []
 
 [dependencies]
-base64 = "0.13"
+base64 = "0.22.1"
+zeroize = { version = "1.8.2", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 hex = { version = "0.4" }
 untrusted = "0.9.0"
