@@ -151,7 +151,7 @@ pub struct DeviceConfig {
     pub firewall_process_inbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
     pub firewall_process_outbound_callback:
-        Option<Arc<dyn Fn(&[u8; 32], &[u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
+        Option<Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
     pub skt_buffer_size: Option<usize>,
     pub inter_thread_channel_size: Option<usize>,
     pub max_inter_thread_batched_pkts: Option<usize>,
@@ -198,7 +198,10 @@ struct ThreadData {
 }
 
 enum IfaceReadResult<'a> {
-    Packet { payload: &'a [u8], peer: Arc<Peer> },
+    Packet {
+        payload: &'a mut [u8],
+        peer: Arc<Peer>,
+    },
     Exhausted,
     Fatal,
     Skip,
