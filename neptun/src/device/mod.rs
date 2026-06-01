@@ -198,7 +198,10 @@ struct ThreadData {
 }
 
 enum IfaceReadResult<'a> {
-    Packet { payload: &'a [u8], peer: Arc<Peer> },
+    Packet {
+        payload: &'a mut [u8],
+        peer: Arc<Peer>,
+    },
     Exhausted,
     Fatal,
     Skip,
@@ -1252,11 +1255,7 @@ fn process_iface_inline(
                 let len = payload.len();
 
                 if let Some(callback) = &device.config.firewall_process_outbound_callback {
-                    if !callback(
-                        &peer.public_key.0,
-                        &mut thread_data.dst_buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + len],
-                        &mut thread_data.iface.as_ref(),
-                    ) {
+                    if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
                         continue;
                     }
                 }
