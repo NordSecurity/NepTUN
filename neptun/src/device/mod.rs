@@ -1266,11 +1266,12 @@ fn process_iface_inline(
 
 fn read_packet<'a>(
     iface: &Arc<TunSocket>,
-    buf: &'a mut [u8],
+    buf: &'a mut [u8; MAX_PKT_SIZE],
     mtu: &CheckedMtu,
     peers: &AllowedIps<Arc<Peer>>,
 ) -> IfaceReadResult<'a> {
-    #[allow(clippy::indexing_slicing)] // Correct size guaranteed by the CheckedMtu type
+    // buf is [u8; MAX_PKT_SIZE] and CheckedMtu guarantees mtu + WG_HEADER_OFFSET <= MAX_PKT_SIZE
+    #[allow(clippy::indexing_slicing)]
     match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu.get()]) {
         Ok(payload) => match Tunn::dst_address(payload) {
             None => IfaceReadResult::Skip,
