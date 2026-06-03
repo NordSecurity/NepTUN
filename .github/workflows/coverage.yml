@@ -1,0 +1,47 @@
+name: Coverage
+on: [workflow_call]
+permissions: {}
+
+jobs:
+  coverage-linux:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Generate code coverage
+      run: |
+        sudo apt-get install -y libpcap-dev
+        cargo xtask code-coverage clean
+        cargo xtask code-coverage mock-instant
+        cargo xtask code-coverage docker-tests
+        cargo xtask code-coverage report-lcov
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: linux
+        files: target/lcov.info
+        fail_ci_if_error: true
+
+  coverage-macos:
+    runs-on: macos-14
+    steps:
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Install cargo-llvm-cov
+      uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Generate code coverage
+      run: |
+        cargo xtask code-coverage clean
+        cargo xtask code-coverage mock-instant
+        # Docker not available in GitHub runners for Apple Silicon
+        cargo xtask code-coverage report-lcov
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        flags: macos
+        files: target/lcov.info
+        fail_ci_if_error: true

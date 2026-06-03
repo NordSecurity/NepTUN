@@ -7,8 +7,6 @@ pub mod handshake;
 pub mod rate_limiter;
 pub mod safe_duration;
 
-#[cfg(test)]
-mod integration_tests;
 mod session;
 mod timers;
 
@@ -87,8 +85,8 @@ const HANDSHAKE_RESP: MessageType = 2;
 const COOKIE_REPLY: MessageType = 3;
 const DATA: MessageType = 4;
 
-const HANDSHAKE_INIT_SZ: u64 = 148;
-const HANDSHAKE_RESP_SZ: u64 = 92;
+pub const HANDSHAKE_INIT_SZ: u64 = 148;
+pub const HANDSHAKE_RESP_SZ: u64 = 92;
 const COOKIE_REPLY_SZ: u64 = 64;
 const DATA_OVERHEAD_SZ: u64 = 32;
 

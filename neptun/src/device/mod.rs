@@ -6,8 +6,6 @@ pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
-#[cfg(test)]
-mod integration_tests;
 pub mod peer;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]

@@ -17,6 +17,7 @@ device = ["socket2", "thiserror"]
 # mocks std::time::Instant with mock_instant
 mock-instant = ["mock_instant"]
 xray = []
+docker-tests = []
 
 [dependencies]
 base64 = "0.22.1"
@@ -67,3 +68,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bench]]
 name = "crypto_benches"
 harness = false
+
+[[test]]
+name = "device"
+path = "tests/device.rs"
+required-features = ["device", "docker-tests"]
