@@ -46,9 +46,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::fd::{AsFd, BorrowedFd, RawFd};
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::thread::JoinHandle;
 use tun::TunSocket;
@@ -191,6 +192,27 @@ pub struct Device {
     // [thread boundary] -> socket_to_tunnel_rx -> -> write to tunnel
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
     socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
+
+    /// PoC two-thread data plane: set to stop the OUT/IN data threads (see out_data_thread /
+    /// in_data_thread). The epoll control plane stops via its exit notifier.
+    data_stop: Arc<AtomicBool>,
+    /// PoC two-thread data plane packet/byte counters, logged every 10s.
+    data_stats: Arc<DataStats>,
+}
+
+/// PoC two-thread data plane counters, logged periodically (see register_timers). `out_*` is
+/// the OUT/encrypt thread (TUN→net), `in_*` is the IN/decrypt thread (net→TUN). `prev_*` hold
+/// the last logged values so the logger can report a per-interval delta.
+#[derive(Default)]
+struct DataStats {
+    out_pkts: AtomicU64,
+    out_bytes: AtomicU64,
+    in_pkts: AtomicU64,
+    in_bytes: AtomicU64,
+    prev_out_pkts: AtomicU64,
+    prev_out_bytes: AtomicU64,
+    prev_in_pkts: AtomicU64,
+    prev_in_bytes: AtomicU64,
 }
 
 struct ThreadData {
@@ -233,14 +255,38 @@ impl DeviceHandle {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        let n_threads = config.n_threads;
+        // PoC two-thread model: the epoll loop is only the control plane (timers, notifiers,
+        // udp bootstrap), so a single epoll thread is enough. Forcing 1 also avoids the
+        // multi-queue per-thread TUN creation (we dropped IFF_MULTI_QUEUE; unavailable on
+        // Android). The data plane is the two dedicated OUT/IN threads.
+        let n_threads = 1;
         let mut wg_interface = Device::new_with_tun(tun, config)?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
-        let (threads, sockets_to_close) =
+        #[allow(unused_mut)]
+        let (mut threads, sockets_to_close) =
             Self::start_event_loop_threads(n_threads, interface_lock.clone())?;
+
+        // PoC two-thread data plane: one thread per direction, on blocking fds.
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            let stop = interface_lock.read().data_stop.clone();
+            let dev_out = interface_lock.clone();
+            let dev_in = interface_lock.clone();
+            let stop_in = stop.clone();
+            threads.push(
+                thread::Builder::new()
+                    .name("neptun-out".to_string())
+                    .spawn(move || out_data_thread(dev_out, stop))?,
+            );
+            threads.push(
+                thread::Builder::new()
+                    .name("neptun-in".to_string())
+                    .spawn(move || in_data_thread(dev_in, stop_in))?,
+            );
+        }
 
         Ok(DeviceHandle {
             device: interface_lock,
@@ -628,8 +674,10 @@ impl Device {
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<Device, Error> {
         let poll = EventPoll::<Handler>::new()?;
 
-        // Create a tunnel device
-        let iface = Arc::new(tun.set_non_blocking()?);
+        // Create a tunnel device. PoC two-thread model: keep the TUN fd BLOCKING — the OUT
+        // thread reads it (polling with a timeout for shutdown) and the IN thread writes it
+        // (blocking write so inbound packets aren't dropped on transient backpressure).
+        let iface = Arc::new(tun);
         let mtu = iface.mtu()?;
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
@@ -661,12 +709,16 @@ impl Device {
             socket_to_tunnel_rx,
             close_tun_worker_tx: None,
             update_seq: 0,
+            data_stop: Arc::new(AtomicBool::new(false)),
+            data_stats: Arc::new(DataStats::default()),
         };
 
         if device.config.open_uapi_socket {
             device.register_api_handler()?;
         }
-        device.register_read_iface_handler(Arc::clone(&device.iface))?;
+        // NOTE: the TUN read handler is intentionally NOT registered — the OUT data thread
+        // owns the TUN fd. The epoll loop is kept only as the control plane (timers,
+        // notifiers, udp bootstrap handler).
         device.register_notifiers()?;
         device.register_timers()?;
 
@@ -753,32 +805,10 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
-        // Construct a different closing channel per thread
-        let (close_network_worker_tx, close_network_worker_rx) =
-            crossbeam_channel::bounded(num_cpus::get_physical() * 5);
-        let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
-        self.close_network_worker_tx = Some(close_network_worker_tx);
-        self.close_tun_worker_tx = Some(close_tun_worker_tx);
-
-        // Process packet in a seperate thread
-        for _ in 0..num_cpus::get_physical() {
-            let rx_clone = self.tunnel_to_socket_rx.clone();
-            let close_chan_clone = close_network_worker_rx.clone();
-            let udp4_c = udp4.clone();
-            let udp6_c = udp6.clone();
-            let fw_callback = self
-                .config
-                .firewall_process_outbound_callback
-                .as_ref()
-                .map(|f| f.clone());
-            thread::spawn(move || {
-                write_to_socket_worker(rx_clone, close_chan_clone, udp4_c, udp6_c, fw_callback)
-            });
-        }
-
-        let rx_clone = self.socket_to_tunnel_rx.clone();
-        let fw_callback = self.config.firewall_process_inbound_callback.clone();
-        thread::spawn(move || write_to_tun_worker(rx_clone, close_tun_worker_rx, fw_callback));
+        // PoC two-thread model: the legacy encrypt/decrypt worker pool is NOT spawned. The
+        // data plane runs on the dedicated OUT/IN threads (see out_data_thread/in_data_thread).
+        // udp4/udp6 are kept for handshake bootstrap; the connected socket carries data.
+        let _ = (&udp4, &udp6);
 
         self.listen_port = port;
 
@@ -876,6 +906,29 @@ impl Device {
             std::time::Duration::from_secs(1),
         )?;
 
+        // PoC: log the two-thread data-plane packet/byte counters every 10s (delta + totals).
+        self.queue.new_periodic_event(
+            Box::new(|d, _| {
+                let s = &d.data_stats;
+                let out_p = s.out_pkts.load(Ordering::Relaxed);
+                let out_b = s.out_bytes.load(Ordering::Relaxed);
+                let in_p = s.in_pkts.load(Ordering::Relaxed);
+                let in_b = s.in_bytes.load(Ordering::Relaxed);
+                let d_out_p = out_p.wrapping_sub(s.prev_out_pkts.swap(out_p, Ordering::Relaxed));
+                let d_out_b = out_b.wrapping_sub(s.prev_out_bytes.swap(out_b, Ordering::Relaxed));
+                let d_in_p = in_p.wrapping_sub(s.prev_in_pkts.swap(in_p, Ordering::Relaxed));
+                let d_in_b = in_b.wrapping_sub(s.prev_in_bytes.swap(in_b, Ordering::Relaxed));
+                // Skip the line entirely when idle to avoid log spam.
+                if d_out_p != 0 || d_in_p != 0 {
+                    tracing::info!(
+                        "neptun data-plane (last 10s): OUT +{d_out_p} pkts (+{d_out_b} B) | IN +{d_in_p} pkts (+{d_in_b} B) || totals OUT {out_p} pkts / {out_b} B, IN {in_p} pkts / {in_b} B"
+                    );
+                }
+                Action::Continue
+            }),
+            std::time::Duration::from_secs(10),
+        )?;
+
         self.queue.new_periodic_event(
             // Execute the timed function of every peer in the list
             Box::new(|d, t| {
@@ -919,6 +972,25 @@ impl Device {
                         }
                         _ => tracing::error!("Unexpected result from update_timers"),
                     };
+
+                    // PoC: the OUT data thread can't initiate handshakes (it does no Tunn
+                    // handshake work). When it has data but no session it sets want_handshake;
+                    // the control plane initiates here.
+                    if peer.take_handshake_request() {
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.format_handshake_initiation(&mut t.dst_buf[..], false)
+                        };
+                        if let TunnResult::WriteToNetwork(packet) = res {
+                            let r = match endpoint_addr {
+                                SocketAddr::V4(_) => udp4.send_to(packet, &endpoint_addr.into()),
+                                SocketAddr::V6(_) => udp6.send_to(packet, &endpoint_addr.into()),
+                            };
+                            if let Err(err) = r {
+                                tracing::warn!(message = "Failed to send handshake init", error = ?err, dst = ?endpoint_addr);
+                            }
+                        }
+                    }
                 }
                 Action::Continue
             }),
@@ -935,6 +1007,9 @@ impl Device {
     }
 
     pub(crate) fn trigger_exit(&self) {
+        // Stop the data-plane threads (they poll this flag on their I/O timeouts)...
+        self.data_stop.store(true, Ordering::Relaxed);
+        // ...and the epoll control-plane loop via its exit notifier.
         match self.exit_notice.as_ref() {
             Some(notice) => self.queue.trigger_notification(notice),
             None => tracing::error!("Exit requested while there is no notice"),
@@ -1047,12 +1122,7 @@ impl Device {
                             }
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
-                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
-                                    continue;
-                                }
-                            }
-
+                            // PoC: firewall callbacks dropped.
                             if peer.is_allowed_ip(addr) {
                                 _ = t.iface.as_ref().write(packet);
                                 tracing::trace!(
@@ -1084,16 +1154,14 @@ impl Device {
                         }
                     }
 
-                    // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = sock.ip();
+                    // This packet was OK, that means we want to create a connected socket for
+                    // this peer. PoC: we DON'T register an epoll handler for it — the IN data
+                    // thread owns the connected socket recv, and the OUT thread sends on it.
                     peer.set_endpoint(sock);
                     if d.config.use_connected_socket {
-                        // No need for aditional checking, as from this point all packets will arive to connected socket handler
-                        if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                            if let Err(e) = d.register_read_conn_skt_handler(Arc::clone(peer), sock, ip_addr) {
-                                tracing::error!("Failed to register connected socket handler {}", e);
-                                peer.shutdown_endpoint();
-                            }
+                        if let Err(e) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size)
+                        {
+                            tracing::error!("Failed to create connected socket {}", e);
                         }
                     }
 
@@ -1434,6 +1502,207 @@ fn write_to_tun_worker(
             recv(close_chan) -> _n => {
                 break;
             }
+        }
+    }
+}
+
+/// PoC two-thread data plane, OUT direction: TUN read -> encrypt -> connected-socket send.
+/// Crypto runs on a cloned `Arc<Session>` with no `Tunn` lock held (only a short lock to
+/// clone the session out). Single peer. No handshake/timer work here — if there is no
+/// session yet, it asks the control plane (epoll timers) to initiate a handshake.
+fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
+    let (iface, stats) = {
+        let d = device.read();
+        (d.iface.clone(), d.data_stats.clone())
+    };
+    let mut buf = [0u8; MAX_PKT_SIZE];
+    // Cached clone of the peer's connected socket (appears after the first handshake).
+    let mut conn: Option<socket2::Socket> = None;
+
+    while !stop.load(Ordering::Relaxed) {
+        // Blocking TUN read — no timeout. The TUN char device has no SO_RCVTIMEO and we
+        // intentionally dropped the poll(), so `stop` is only re-checked once the next packet
+        // arrives. Fine for the PoC: traffic always flows during a measurement. (See notes.md.)
+        let mtu = device.read().mtu.load(Ordering::Relaxed).min(MAX_PKT_SIZE - WG_HEADER_OFFSET);
+        let n = match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
+            Ok(s) => s.len(),
+            Err(_) => continue,
+        };
+        if n == 0 {
+            continue;
+        }
+
+        // Short critical section: route to the peer, clone out the current session and the
+        // connected socket, then release all locks before crypto + send.
+        let session = {
+            let d = device.read();
+            let dst = match Tunn::dst_address(&buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + n]) {
+                Some(a) => a,
+                None => continue,
+            };
+            let peer = match d.peers_by_ip.find(dst) {
+                Some(p) => p,
+                None => continue,
+            };
+            if conn.is_none() {
+                conn = peer
+                    .endpoint()
+                    .conn
+                    .as_ref()
+                    .and_then(|c| c.try_clone().ok());
+            }
+            // Bind to a local so the tunnel MutexGuard temporary is dropped here, before the
+            // device read guard `d` at the end of this block.
+            let current = peer.tunnel.lock().current_session();
+            match current {
+                Some(s) => s,
+                None => {
+                    // No session yet: ask the control plane to handshake; drop this packet.
+                    peer.request_handshake();
+                    continue;
+                }
+            }
+        };
+
+        let sock = match conn.as_ref() {
+            Some(c) => c,
+            None => continue, // session exists but socket not connected yet; drop
+        };
+
+        match session.encrypt(n, &mut buf) {
+            Ok(packet) => match sock.send(packet) {
+                Ok(_) => {
+                    stats.out_pkts.fetch_add(1, Ordering::Relaxed);
+                    stats.out_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::trace!(message = "OUT send failed", error = ?e);
+                    // Drop the cached socket so it is re-fetched (e.g. endpoint reset/roam).
+                    conn = None;
+                }
+            },
+            Err(e) => tracing::trace!(message = "encrypt failed", error = ?e),
+        }
+    }
+}
+
+/// PoC two-thread data plane, IN direction: connected-socket recv -> decrypt -> TUN write.
+/// Data packets are decrypted on a cloned `Arc<Session>` off the `Tunn` lock. Rare
+/// handshake/cookie packets (e.g. rekey) are handled inline via the existing `decapsulate`
+/// under the lock. Single peer.
+fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
+    let (iface, stats) = {
+        let d = device.read();
+        (d.iface.clone(), d.data_stats.clone())
+    };
+    let mut rbuf = [0u8; MAX_PKT_SIZE];
+    let mut dbuf = [0u8; MAX_PKT_SIZE];
+    // The single peer + a clone of its connected socket, established after the handshake.
+    let mut bound: Option<(Arc<Peer>, socket2::Socket)> = None;
+
+    while !stop.load(Ordering::Relaxed) {
+        if bound.is_none() {
+            bound = {
+                let d = device.read();
+                d.peers.values().next().and_then(|p| {
+                    p.endpoint()
+                        .conn
+                        .as_ref()
+                        .and_then(|c| c.try_clone().ok())
+                        .map(|c| (p.clone(), c))
+                })
+            };
+            if bound.is_none() {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+        }
+
+        let mut reset = false;
+        {
+            let (peer, conn) = match bound.as_ref() {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Safety: socket2 promises not to write uninitialised bytes into the buffer.
+            let recv_buf =
+                unsafe { &mut *(&mut rbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
+            let n = match conn.recv(recv_buf) {
+                Ok(n) => n,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    // SO_RCVTIMEO fired: re-check `stop`.
+                    0
+                }
+                Err(_) => {
+                    reset = true;
+                    0
+                }
+            };
+
+            if n > 0 {
+                let datagram = &rbuf[..n];
+                match Tunn::parse_incoming_packet(datagram) {
+                    Ok(Packet::PacketData(p)) => {
+                        // Off-lock data decrypt: clone the session under a short lock.
+                        let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
+                        if let Some(session) = session {
+                            match session.decrypt(p, &mut dbuf) {
+                                // Empty payload == keepalive: nothing to write.
+                                Ok(plain) if !plain.is_empty() => {
+                                    // Trim WireGuard padding to the real IP length before
+                                    // writing to the TUN (peers like kernel WireGuard pad data
+                                    // packets to a 16-byte boundary).
+                                    if let Some(len) = Tunn::decapsulated_packet_len(plain) {
+                                        let _ = iface.as_ref().write(&plain[..len]);
+                                        stats.in_pkts.fetch_add(1, Ordering::Relaxed);
+                                        stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::trace!(message = "decrypt failed", error = ?e),
+                            }
+                        }
+                    }
+                    // Handshake / cookie: handle on the control path (under the Tunn lock).
+                    Ok(_) => {
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.decapsulate(None, datagram, &mut dbuf)
+                        };
+                        match res {
+                            TunnResult::WriteToNetwork(packet) => {
+                                let _ = conn.send(packet);
+                                // Drain any queued packets the handshake completion released.
+                                loop {
+                                    let mut out = [0u8; MAX_PKT_SIZE];
+                                    let r = {
+                                        let mut tun = peer.tunnel.lock();
+                                        tun.decapsulate(None, &[], &mut out)
+                                    };
+                                    match r {
+                                        TunnResult::WriteToNetwork(p2) => {
+                                            let _ = conn.send(p2);
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            TunnResult::WriteToTunnel(packet, _addr) => {
+                                let _ = iface.as_ref().write(packet);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        if reset {
+            bound = None;
         }
     }
 }

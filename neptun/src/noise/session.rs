@@ -301,6 +301,27 @@ impl Session {
         Ok(ret)
     }
 
+    /// Encrypt a data packet (off-lock data path). The plaintext payload must already be
+    /// at `packet_buffer[DATA_OFFSET..DATA_OFFSET + payload_len]`; returns the full WireGuard
+    /// data packet. Takes `&self` so it can run on a shared `Arc<Session>` without the Tunn lock.
+    pub fn encrypt<'a>(
+        &self,
+        payload_len: usize,
+        packet_buffer: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.format_packet_data(payload_len, packet_buffer)
+    }
+
+    /// Decrypt a parsed data packet (off-lock data path). Takes `&self` so it can run on a
+    /// shared `Arc<Session>` without the Tunn lock.
+    pub fn decrypt<'a>(
+        &self,
+        packet: PacketData,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.receive_packet_data(packet, dst)
+    }
+
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
         let counter_validator = self.receiving_key_counter.lock();
