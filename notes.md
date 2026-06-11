@@ -48,12 +48,19 @@ and triggers the epoll exit notifier; `DeviceHandle::wait` joins all three threa
   which is fine for short measurement runs.
 - **No inbound allowed-IPs check** on the off-lock data path (the AEAD tag authenticates the
   peer). Acceptable for the single-peer PoC.
-- **OUT thread shutdown needs a TUN packet.** The OUT (encrypt) thread does a plain **blocking
-  `read()` on the TUN fd with no timeout** (the TUN char device has no `SO_RCVTIMEO`, and the
-  `poll()` was removed for simplicity). It therefore only notices the `stop` flag *after the next
-  packet arrives* from the TUN — so `DeviceHandle::wait` can hang on the OUT thread if the
-  tunnel is fully idle at shutdown. Acceptable for the PoC since traffic always flows during a
-  measurement. (The IN thread is unaffected — its UDP socket uses `SO_RCVTIMEO ~250ms`.)
+- **TUN readiness via `poll()`.** The TUN char device has no `SO_RCVTIMEO`, so the OUT
+  (encrypt) thread `poll()`s the (non-blocking) TUN fd with a ~250 ms timeout, then `read()`s.
+  The timeout lets it re-check the `stop` flag for clean shutdown. (The IN thread uses
+  `SO_RCVTIMEO ~250ms` on its UDP socket for the same purpose.)
+- **Roaming is disabled.** The udp4/udp6 handler no longer updates the peer endpoint from
+  incoming packet source addresses — it only *learns* the endpoint once (if it was never
+  configured). The data plane uses a per-peer **connected** UDP socket (`Endpoint.conn`) bound
+  + connected once; if roaming moved the endpoint, `conn` would desync and the peer would see
+  the phone at two different source ports (udp4 vs conn), flip-flopping its replies between the
+  epoll handler and the IN thread. So the PoC assumes a single, stable peer endpoint. `conn`
+  itself never roams (only the udp4/udp6 handler ever called `set_endpoint`; the IN/OUT data
+  threads do not). `connect_endpoint` logs a warning if the connected socket's local port does
+  not match `listen_port` (= udp4's port).
 - **`set_iface` (tun reset) is not supported** in the two-thread model — it would re-register the
   epoll TUN handler and not respawn the data threads. The measurement path uses
   `DeviceHandle::new_with_tun` once; libtelio's `set_tun` is not exercised.

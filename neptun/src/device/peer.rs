@@ -182,6 +182,27 @@ impl Peer {
 
         endpoint.conn = Some(udp_conn.try_clone()?);
 
+        // Log exactly which local (bound) and remote (connected) addresses/ports the data
+        // socket uses, plus udp4's listen_port for comparison. If the bound port != listen_port,
+        // the peer sees the phone at two source ports (udp4 vs conn) and roams between them.
+        let local = udp_conn.local_addr().ok().and_then(|a| a.as_socket());
+        let remote = udp_conn.peer_addr().ok().and_then(|a| a.as_socket());
+        tracing::info!(
+            message = "connected data socket addresses",
+            bound = ?local,
+            connected_to = ?remote,
+            bound_port = local.map(|a| a.port()),
+            listen_port = port,
+            port_matches_udp4 = local.map(|a| a.port()) == Some(port),
+        );
+        if local.map(|a| a.port()) != Some(port) {
+            tracing::warn!(
+                message = "PORT MISMATCH: connected data socket local port != udp4/listen_port",
+                bound = ?local,
+                listen_port = port,
+            );
+        }
+
         if let Some(buffer_size) = skt_buffer_size {
             modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
         }

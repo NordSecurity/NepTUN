@@ -674,9 +674,9 @@ impl Device {
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<Device, Error> {
         let poll = EventPoll::<Handler>::new()?;
 
-        // Create a tunnel device. PoC two-thread model: keep the TUN fd BLOCKING — the OUT
-        // thread reads it (polling with a timeout for shutdown) and the IN thread writes it
-        // (blocking write so inbound packets aren't dropped on transient backpressure).
+        // Create a tunnel device. PoC two-thread model: the OUT thread waits for TUN
+        // readiness with poll() (timeout) and then read()s, so the fd is left in its inherited
+        // (non-blocking, on Android VpnService) state — poll handles the wait + stop-check.
         let iface = Arc::new(tun);
         let mtu = iface.mtu()?;
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
@@ -1157,7 +1157,15 @@ impl Device {
                     // This packet was OK, that means we want to create a connected socket for
                     // this peer. PoC: we DON'T register an epoll handler for it — the IN data
                     // thread owns the connected socket recv, and the OUT thread sends on it.
-                    peer.set_endpoint(sock);
+                    //
+                    // PoC: roaming DISABLED on udp4/udp6. We only *learn* the endpoint once (if
+                    // it was never configured); we never update it from a packet's source
+                    // address. Roaming could move the peer endpoint and desync it from the
+                    // connected data socket (`conn` is bound + connected once), making the peer
+                    // flip between source ports. (See NepTUN/notes.md.)
+                    if peer.endpoint().addr.is_none() {
+                        peer.set_endpoint(sock);
+                    }
                     if d.config.use_connected_socket {
                         if let Err(e) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size)
                         {
@@ -1515,22 +1523,37 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
         let d = device.read();
         (d.iface.clone(), d.data_stats.clone())
     };
+    let tun_fd = iface.as_raw_fd();
     let mut buf = [0u8; MAX_PKT_SIZE];
     // Cached clone of the peer's connected socket (appears after the first handshake).
     let mut conn: Option<socket2::Socket> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        // Blocking TUN read — no timeout. The TUN char device has no SO_RCVTIMEO and we
-        // intentionally dropped the poll(), so `stop` is only re-checked once the next packet
-        // arrives. Fine for the PoC: traffic always flows during a measurement. (See notes.md.)
+        // Wait for TUN readiness with a timeout so we periodically re-check `stop` (the TUN
+        // char device has no SO_RCVTIMEO). The fd is non-blocking, so a read after a spurious
+        // wake / stolen packet returns EAGAIN instead of blocking.
+        let mut pfd = libc::pollfd {
+            fd: tun_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let pr = unsafe { libc::poll(&mut pfd, 1, 250) };
+        if pr <= 0 {
+            continue; // timeout (re-check stop) or error
+        }
+
         let mtu = device.read().mtu.load(Ordering::Relaxed).min(MAX_PKT_SIZE - WG_HEADER_OFFSET);
         let n = match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
             Ok(s) => s.len(),
-            Err(_) => continue,
+            Err(e) => {
+                tracing::info!(message = "OUT: tun read error", error = ?e);
+                continue;
+            }
         };
         if n == 0 {
             continue;
         }
+        // tracing::info!(message = "OUT: read from tun", len = n); // per-packet: off for perf
 
         // Short critical section: route to the peer, clone out the current session and the
         // connected socket, then release all locks before crypto + send.
@@ -1538,11 +1561,17 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
             let d = device.read();
             let dst = match Tunn::dst_address(&buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + n]) {
                 Some(a) => a,
-                None => continue,
+                None => {
+                    tracing::info!("OUT: could not parse dst address; dropping");
+                    continue;
+                }
             };
             let peer = match d.peers_by_ip.find(dst) {
                 Some(p) => p,
-                None => continue,
+                None => {
+                    tracing::info!(message = "OUT: no peer for dst (peers_by_ip miss)", ?dst);
+                    continue;
+                }
             };
             if conn.is_none() {
                 conn = peer
@@ -1550,6 +1579,7 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                     .conn
                     .as_ref()
                     .and_then(|c| c.try_clone().ok());
+                tracing::info!(message = "OUT: connected-socket fetch", acquired = conn.is_some());
             }
             // Bind to a local so the tunnel MutexGuard temporary is dropped here, before the
             // device read guard `d` at the end of this block.
@@ -1558,6 +1588,7 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                 Some(s) => s,
                 None => {
                     // No session yet: ask the control plane to handshake; drop this packet.
+                    tracing::info!(message = "OUT: no current session; requesting handshake, dropping", ?dst);
                     peer.request_handshake();
                     continue;
                 }
@@ -1566,22 +1597,26 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
 
         let sock = match conn.as_ref() {
             Some(c) => c,
-            None => continue, // session exists but socket not connected yet; drop
+            None => {
+                tracing::info!("OUT: have session but no connected socket yet; dropping");
+                continue; // session exists but socket not connected yet; drop
+            }
         };
 
         match session.encrypt(n, &mut buf) {
             Ok(packet) => match sock.send(packet) {
-                Ok(_) => {
+                Ok(_sent) => {
+                    // tracing::info!(message = "OUT: sent via connected socket", len = _sent); // per-packet: off for perf
                     stats.out_pkts.fetch_add(1, Ordering::Relaxed);
                     stats.out_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    tracing::trace!(message = "OUT send failed", error = ?e);
+                    tracing::warn!(message = "OUT: conn.send failed", error = ?e);
                     // Drop the cached socket so it is re-fetched (e.g. endpoint reset/roam).
                     conn = None;
                 }
             },
-            Err(e) => tracing::trace!(message = "encrypt failed", error = ?e),
+            Err(e) => tracing::warn!(message = "OUT: encrypt failed", error = ?e),
         }
     }
 }
@@ -1616,6 +1651,7 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                 thread::sleep(Duration::from_millis(50));
                 continue;
             }
+            tracing::info!("IN: acquired peer + connected socket; starting recv loop");
         }
 
         let mut reset = false;
@@ -1637,20 +1673,23 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                     // SO_RCVTIMEO fired: re-check `stop`.
                     0
                 }
-                Err(_) => {
+                Err(e) => {
+                    tracing::warn!(message = "IN: conn.recv error; re-acquiring socket", error = ?e);
                     reset = true;
                     0
                 }
             };
 
             if n > 0 {
+                // tracing::info!(message = "IN: recv from connected socket", len = n); // per-packet: off for perf
                 let datagram = &rbuf[..n];
                 match Tunn::parse_incoming_packet(datagram) {
                     Ok(Packet::PacketData(p)) => {
+                        let r_idx = p.receiver_idx;
                         // Off-lock data decrypt: clone the session under a short lock.
-                        let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
-                        if let Some(session) = session {
-                            match session.decrypt(p, &mut dbuf) {
+                        let session = peer.tunnel.lock().session_for_index(r_idx);
+                        match session {
+                            Some(session) => match session.decrypt(p, &mut dbuf) {
                                 // Empty payload == keepalive: nothing to write.
                                 Ok(plain) if !plain.is_empty() => {
                                     // Trim WireGuard padding to the real IP length before
@@ -1658,23 +1697,29 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                                     // packets to a 16-byte boundary).
                                     if let Some(len) = Tunn::decapsulated_packet_len(plain) {
                                         let _ = iface.as_ref().write(&plain[..len]);
+                                        // tracing::info!(message = "IN: decrypted + wrote to tun", receiver_idx = r_idx, len); // per-packet: off for perf
                                         stats.in_pkts.fetch_add(1, Ordering::Relaxed);
                                         stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                    } else {
+                                        tracing::info!("IN: decrypted packet has unrecognised IP header; dropped");
                                     }
                                 }
-                                Ok(_) => {}
-                                Err(e) => tracing::trace!(message = "decrypt failed", error = ?e),
-                            }
+                                Ok(_) => tracing::info!("IN: decrypted keepalive (empty); not written"),
+                                Err(e) => tracing::warn!(message = "IN: decrypt failed", error = ?e),
+                            },
+                            None => tracing::info!(message = "IN: no session for receiver_idx", receiver_idx = r_idx),
                         }
                     }
                     // Handshake / cookie: handle on the control path (under the Tunn lock).
                     Ok(_) => {
+                        tracing::info!("IN: non-data (handshake/cookie) packet -> decapsulate");
                         let res = {
                             let mut tun = peer.tunnel.lock();
                             tun.decapsulate(None, datagram, &mut dbuf)
                         };
                         match res {
                             TunnResult::WriteToNetwork(packet) => {
+                                tracing::info!(message = "IN: handshake reply -> send on conn", len = packet.len());
                                 let _ = conn.send(packet);
                                 // Drain any queued packets the handshake completion released.
                                 loop {
@@ -1692,12 +1737,15 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                                 }
                             }
                             TunnResult::WriteToTunnel(packet, _addr) => {
+                                tracing::info!(message = "IN: control path produced tun packet", len = packet.len());
                                 let _ = iface.as_ref().write(packet);
                             }
-                            _ => {}
+                            other => {
+                                tracing::info!(message = "IN: control path result", result = ?std::mem::discriminant(&other));
+                            }
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => tracing::info!(message = "IN: parse_incoming_packet failed", error = ?e),
                 }
             }
         }
