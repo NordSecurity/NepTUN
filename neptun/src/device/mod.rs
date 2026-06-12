@@ -272,10 +272,8 @@ impl DeviceHandle {
                     sockets_to_close
                         .read()
                         .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                    let group_clone = group.clone();
                     let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
-                    queue.exec_async(move || {
-                        group_clone.enter();
+                    group.exec_async(&queue, move || {
                         DeviceHandle::event_loop(thread_local, &dev)
                     });
                     queue
@@ -335,6 +333,11 @@ impl DeviceHandle {
                 tracing::error!("Unable to gracefully close thread. {:?}", e);
             }
         }
+    }
+
+    #[cfg(all(feature = "docker-tests", target_os = "macos"))]
+    pub fn is_event_loop_active(&self) -> bool {
+        !self.threads.0.is_empty()
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
