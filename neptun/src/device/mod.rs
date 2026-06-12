@@ -67,6 +67,33 @@ const CHANNEL_SIZE: usize = 500;
 const WG_HEADER_OFFSET: usize = 16;
 const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
 
+// PoC Step 2: number of datagrams a single recvmmsg/sendmmsg syscall handles. The OUT thread
+// drains the TUN fd up to this many packets (or until EWOULDBLOCK) before one sendmmsg; the IN
+// thread receives up to this many datagrams per recvmmsg. Tunable after profiling.
+const MMSG_BATCH: usize = 16;
+
+/// `AtomicU64::fetch_min` is unstable on the pinned toolchain, so do a CAS loop.
+fn atomic_min(a: &AtomicU64, v: u64) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while v < cur {
+        match a.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
+}
+
+/// `AtomicU64::fetch_max` counterpart of [`atomic_min`].
+fn atomic_max(a: &AtomicU64, v: u64) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while v > cur {
+        match a.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("i/o error: {0}")]
@@ -203,7 +230,11 @@ pub struct Device {
 /// PoC two-thread data plane counters, logged periodically (see register_timers). `out_*` is
 /// the OUT/encrypt thread (TUN→net), `in_*` is the IN/decrypt thread (net→TUN). `prev_*` hold
 /// the last logged values so the logger can report a per-interval delta.
-#[derive(Default)]
+///
+/// Step 2 adds per-direction batch stats: `*_batches` counts recvmmsg/sendmmsg calls that moved
+/// ≥1 packet (monotonic, delta'd against `prev_*_batches` for a per-interval average), and
+/// `*_batch_min`/`*_batch_max` track the per-interval extremes of packets-per-batch (the logger
+/// resets them each interval: min→u64::MAX, max→0).
 struct DataStats {
     out_pkts: AtomicU64,
     out_bytes: AtomicU64,
@@ -213,6 +244,49 @@ struct DataStats {
     prev_out_bytes: AtomicU64,
     prev_in_pkts: AtomicU64,
     prev_in_bytes: AtomicU64,
+    out_batches: AtomicU64,
+    in_batches: AtomicU64,
+    prev_out_batches: AtomicU64,
+    prev_in_batches: AtomicU64,
+    out_batch_min: AtomicU64,
+    out_batch_max: AtomicU64,
+    in_batch_min: AtomicU64,
+    in_batch_max: AtomicU64,
+    /// Packets read from the TUN but never sent (sendmmsg short/error, encrypt failure).
+    out_drops: AtomicU64,
+    /// Datagrams received but never written to the TUN (write EAGAIN, decrypt fail, no session).
+    in_drops: AtomicU64,
+    prev_out_drops: AtomicU64,
+    prev_in_drops: AtomicU64,
+}
+
+impl Default for DataStats {
+    fn default() -> Self {
+        // Manual impl (not derive): the two `*_batch_min` fields must start at u64::MAX so the
+        // first observed batch wins the min; everything else starts at 0.
+        DataStats {
+            out_pkts: AtomicU64::new(0),
+            out_bytes: AtomicU64::new(0),
+            in_pkts: AtomicU64::new(0),
+            in_bytes: AtomicU64::new(0),
+            prev_out_pkts: AtomicU64::new(0),
+            prev_out_bytes: AtomicU64::new(0),
+            prev_in_pkts: AtomicU64::new(0),
+            prev_in_bytes: AtomicU64::new(0),
+            out_batches: AtomicU64::new(0),
+            in_batches: AtomicU64::new(0),
+            prev_out_batches: AtomicU64::new(0),
+            prev_in_batches: AtomicU64::new(0),
+            out_batch_min: AtomicU64::new(u64::MAX),
+            out_batch_max: AtomicU64::new(0),
+            in_batch_min: AtomicU64::new(u64::MAX),
+            in_batch_max: AtomicU64::new(0),
+            out_drops: AtomicU64::new(0),
+            in_drops: AtomicU64::new(0),
+            prev_out_drops: AtomicU64::new(0),
+            prev_in_drops: AtomicU64::new(0),
+        }
+    }
 }
 
 struct ThreadData {
@@ -528,14 +602,21 @@ impl Drop for DeviceHandle {
     }
 }
 
-fn set_sock_opt<T: NixSocket::SetSockOpt<Val = usize>>(
-    socket: BorrowedFd<'_>,
-    buffer: T,
-    buffer_size: usize,
-    buffer_name: &str,
-) {
+fn set_sock_opt<T>(socket: BorrowedFd<'_>, buffer: T, buffer_size: usize, buffer_name: &str)
+where
+    T: NixSocket::SetSockOpt<Val = usize> + NixSocket::GetSockOpt<Val = usize> + Copy,
+{
     match NixSocket::setsockopt(&socket, buffer, &buffer_size) {
-        Ok(()) => tracing::info!("Socket buffer {buffer_name:?} set with value {buffer_size}"),
+        Ok(()) => {
+            // Read back the EFFECTIVE size: the kernel clamps SO_RCVBUF/SO_SNDBUF to
+            // net.core.{r,w}mem_max (an unprivileged app can't exceed it), so the requested
+            // value alone is misleading. Linux reports ~2x the usable size here (bookkeeping
+            // overhead), so `effective` well below 2*requested means it was clamped.
+            let effective = NixSocket::getsockopt(&socket, buffer).unwrap_or(0);
+            tracing::info!(
+                "Socket buffer {buffer_name:?}: requested {buffer_size}, effective {effective} (kernel reports ~2x; if << 2x requested it was clamped to net.core.{{r,w}}mem_max)"
+            );
+        }
         Err(e) => tracing::warn!("Socket buffer {buffer_name:?} failed with {e}"),
     }
 }
@@ -918,10 +999,38 @@ impl Device {
                 let d_out_b = out_b.wrapping_sub(s.prev_out_bytes.swap(out_b, Ordering::Relaxed));
                 let d_in_p = in_p.wrapping_sub(s.prev_in_pkts.swap(in_p, Ordering::Relaxed));
                 let d_in_b = in_b.wrapping_sub(s.prev_in_bytes.swap(in_b, Ordering::Relaxed));
+
+                // Batch stats: per-interval packets-per-batch min/avg/max, per direction.
+                // Read + RESET the min/max every interval (unconditionally, before the idle
+                // guard, so a stale extreme can't linger). avg = interval pkts / interval batches.
+                let out_batches = s.out_batches.load(Ordering::Relaxed);
+                let in_batches = s.in_batches.load(Ordering::Relaxed);
+                let d_out_batches =
+                    out_batches.wrapping_sub(s.prev_out_batches.swap(out_batches, Ordering::Relaxed));
+                let d_in_batches =
+                    in_batches.wrapping_sub(s.prev_in_batches.swap(in_batches, Ordering::Relaxed));
+                let out_min = s.out_batch_min.swap(u64::MAX, Ordering::Relaxed);
+                let out_max = s.out_batch_max.swap(0, Ordering::Relaxed);
+                let in_min = s.in_batch_min.swap(u64::MAX, Ordering::Relaxed);
+                let in_max = s.in_batch_max.swap(0, Ordering::Relaxed);
+                // Display the u64::MAX sentinel (no batches this interval) as 0.
+                let out_min = if out_min == u64::MAX { 0 } else { out_min };
+                let in_min = if in_min == u64::MAX { 0 } else { in_min };
+                let out_avg = if d_out_batches > 0 { d_out_p as f64 / d_out_batches as f64 } else { 0.0 };
+                let in_avg = if d_in_batches > 0 { d_in_p as f64 / d_in_batches as f64 } else { 0.0 };
+
+                // Dropped packets per interval (sendmmsg short/error/encrypt fail on OUT;
+                // tun-write EAGAIN / decrypt fail / no session on IN). Nonzero here explains
+                // TCP retransmissions / throughput shortfall.
+                let out_drops = s.out_drops.load(Ordering::Relaxed);
+                let in_drops = s.in_drops.load(Ordering::Relaxed);
+                let d_out_drops = out_drops.wrapping_sub(s.prev_out_drops.swap(out_drops, Ordering::Relaxed));
+                let d_in_drops = in_drops.wrapping_sub(s.prev_in_drops.swap(in_drops, Ordering::Relaxed));
+
                 // Skip the line entirely when idle to avoid log spam.
                 if d_out_p != 0 || d_in_p != 0 {
                     tracing::info!(
-                        "neptun data-plane (last 10s): OUT +{d_out_p} pkts (+{d_out_b} B) | IN +{d_in_p} pkts (+{d_in_b} B) || totals OUT {out_p} pkts / {out_b} B, IN {in_p} pkts / {in_b} B"
+                        "neptun data-plane (last 10s): OUT +{d_out_p} pkts (+{d_out_b} B) [batch {d_out_batches}x min/avg/max {out_min}/{out_avg:.1}/{out_max}] drops {d_out_drops} | IN +{d_in_p} pkts (+{d_in_b} B) [batch {d_in_batches}x min/avg/max {in_min}/{in_avg:.1}/{in_max}] drops {d_in_drops} || totals OUT {out_p} pkts / {out_b} B ({out_drops} drop), IN {in_p} pkts / {in_b} B ({in_drops} drop)"
                     );
                 }
                 Action::Continue
@@ -1524,14 +1633,22 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
         (d.iface.clone(), d.data_stats.clone())
     };
     let tun_fd = iface.as_raw_fd();
-    let mut buf = [0u8; MAX_PKT_SIZE];
+
+    // Per-thread batch buffers (boxed: ~99 KB; Android thread stacks can be small). Each slot
+    // holds one raw IP packet read into [WG_HEADER_OFFSET..] and is encrypted IN PLACE; the
+    // resulting WireGuard data packet to send then starts at slot offset 0.
+    let mut bufs: Box<[[u8; MAX_PKT_SIZE]; MMSG_BATCH]> =
+        Box::new([[0u8; MAX_PKT_SIZE]; MMSG_BATCH]);
+    // Per-slot length: during drain it holds the plaintext length; after encrypt it is replaced
+    // with the full WG-packet length (0 == skip this slot in sendmmsg).
+    let mut lens = [0usize; MMSG_BATCH];
     // Cached clone of the peer's connected socket (appears after the first handshake).
     let mut conn: Option<socket2::Socket> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // Wait for TUN readiness with a timeout so we periodically re-check `stop` (the TUN
-        // char device has no SO_RCVTIMEO). The fd is non-blocking, so a read after a spurious
-        // wake / stolen packet returns EAGAIN instead of blocking.
+        // char device has no SO_RCVTIMEO). The fd is non-blocking, so the drain read below
+        // returns EWOULDBLOCK once the queue empties.
         let mut pfd = libc::pollfd {
             fd: tun_fd,
             events: libc::POLLIN,
@@ -1542,34 +1659,41 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
             continue; // timeout (re-check stop) or error
         }
 
+        // Drain the TUN fd into the batch: read until EWOULDBLOCK or the batch is full, so one
+        // sendmmsg can take the whole batch.
         let mtu = device.read().mtu.load(Ordering::Relaxed).min(MAX_PKT_SIZE - WG_HEADER_OFFSET);
-        let n = match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
-            Ok(s) => s.len(),
-            Err(e) => {
-                tracing::info!(message = "OUT: tun read error", error = ?e);
-                continue;
+        let mut count = 0usize;
+        while count < MMSG_BATCH {
+            match iface.read(&mut bufs[count][WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
+                Ok(s) => {
+                    let n = s.len();
+                    if n == 0 {
+                        break;
+                    }
+                    lens[count] = n; // plaintext length (replaced by encrypt below)
+                    count += 1;
+                }
+                // Non-blocking TUN drained: stop the batch.
+                Err(Error::IfaceRead(ref e)) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tracing::info!(message = "OUT: tun read error", error = ?e);
+                    break;
+                }
             }
-        };
-        if n == 0 {
+        }
+        if count == 0 {
             continue;
         }
-        // tracing::info!(message = "OUT: read from tun", len = n); // per-packet: off for perf
 
-        // Short critical section: route to the peer, clone out the current session and the
-        // connected socket, then release all locks before crypto + send.
+        // Single-peer PoC: every TUN packet goes to the one peer, so fetch the peer + its
+        // current session + connected socket ONCE per batch (short lock), then crypt off-lock.
+        // NOTE: multi-peer would require per-packet dst routing + grouping by destination here.
         let session = {
             let d = device.read();
-            let dst = match Tunn::dst_address(&buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + n]) {
-                Some(a) => a,
-                None => {
-                    tracing::info!("OUT: could not parse dst address; dropping");
-                    continue;
-                }
-            };
-            let peer = match d.peers_by_ip.find(dst) {
+            let peer = match d.peers.values().next() {
                 Some(p) => p,
                 None => {
-                    tracing::info!(message = "OUT: no peer for dst (peers_by_ip miss)", ?dst);
+                    tracing::info!("OUT: no peer configured; dropping batch");
                     continue;
                 }
             };
@@ -1581,43 +1705,96 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                     .and_then(|c| c.try_clone().ok());
                 tracing::info!(message = "OUT: connected-socket fetch", acquired = conn.is_some());
             }
-            // Bind to a local so the tunnel MutexGuard temporary is dropped here, before the
-            // device read guard `d` at the end of this block.
+            // Bind to a local so the tunnel MutexGuard temporary drops before the device guard.
             let current = peer.tunnel.lock().current_session();
             match current {
                 Some(s) => s,
                 None => {
-                    // No session yet: ask the control plane to handshake; drop this packet.
-                    tracing::info!(message = "OUT: no current session; requesting handshake, dropping", ?dst);
+                    // No session yet: ask the control plane to handshake; drop this batch (the
+                    // fd was already drained, so poll() won't hot-loop on the same packets).
+                    tracing::info!("OUT: no current session; requesting handshake, dropping batch");
                     peer.request_handshake();
                     continue;
                 }
             }
         };
 
-        let sock = match conn.as_ref() {
-            Some(c) => c,
+        let sock_fd = match conn.as_ref() {
+            Some(c) => c.as_raw_fd(),
             None => {
-                tracing::info!("OUT: have session but no connected socket yet; dropping");
-                continue; // session exists but socket not connected yet; drop
+                tracing::info!("OUT: have session but no connected socket yet; dropping batch");
+                continue;
             }
         };
 
-        match session.encrypt(n, &mut buf) {
-            Ok(packet) => match sock.send(packet) {
-                Ok(_sent) => {
-                    // tracing::info!(message = "OUT: sent via connected socket", len = _sent); // per-packet: off for perf
-                    stats.out_pkts.fetch_add(1, Ordering::Relaxed);
-                    stats.out_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
-                }
+        // Encrypt each drained packet in place; record the full WG-packet length per slot.
+        for i in 0..count {
+            let plain_len = lens[i];
+            match session.encrypt(plain_len, &mut bufs[i][..]) {
+                Ok(packet) => lens[i] = packet.len(),
                 Err(e) => {
-                    tracing::warn!(message = "OUT: conn.send failed", error = ?e);
-                    // Drop the cached socket so it is re-fetched (e.g. endpoint reset/roam).
-                    conn = None;
+                    tracing::warn!(message = "OUT: encrypt failed", error = ?e);
+                    lens[i] = 0; // skip this slot in sendmmsg
+                    stats.out_drops.fetch_add(1, Ordering::Relaxed);
                 }
-            },
-            Err(e) => tracing::warn!(message = "OUT: encrypt failed", error = ?e),
+            }
         }
+
+        // Build the sendmmsg vector from slots that encrypted successfully. iovec/mmsghdr hold
+        // raw pointers into `bufs`; no live Rust reference into the buffers is kept across the
+        // syscall.
+        let mut iovecs: [libc::iovec; MMSG_BATCH] = unsafe { std::mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; MMSG_BATCH] = unsafe { std::mem::zeroed() };
+        let mut vlen = 0usize;
+        for i in 0..count {
+            if lens[i] == 0 {
+                continue;
+            }
+            iovecs[vlen].iov_base = bufs[i].as_mut_ptr() as *mut libc::c_void;
+            iovecs[vlen].iov_len = lens[i] as _;
+            msgs[vlen].msg_hdr.msg_iov = &mut iovecs[vlen] as *mut libc::iovec;
+            msgs[vlen].msg_hdr.msg_iovlen = 1 as _;
+            vlen += 1;
+        }
+        if vlen == 0 {
+            continue;
+        }
+
+        // SAFETY: msgs/iovecs are valid for `vlen` entries and point into live `bufs`; the
+        // connected socket needs no addresses. The kernel only reads the buffers.
+        let sent = unsafe { libc::sendmmsg(sock_fd, msgs.as_mut_ptr(), vlen as _, 0) };
+        if sent < 0 {
+            let err = io::Error::last_os_error();
+            // The whole drained batch is lost here (read from TUN, never sent).
+            stats.out_drops.fetch_add(vlen as u64, Ordering::Relaxed);
+            match err.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {} // transient; drop
+                _ => {
+                    tracing::warn!(message = "OUT: sendmmsg failed", error = ?err);
+                    conn = None; // re-fetch the socket (e.g. endpoint reset/roam)
+                }
+            }
+            continue;
+        }
+        let sent = sent as usize;
+        // sendmmsg may stop early (e.g. ENOBUFS): the unsent tail is dropped — count it.
+        if sent < vlen {
+            stats.out_drops.fetch_add((vlen - sent) as u64, Ordering::Relaxed);
+        }
+        if sent == 0 {
+            continue;
+        }
+        // Count only actually-sent messages so throughput stats aren't inflated. After
+        // sendmmsg each msg_len holds the bytes transmitted for that datagram.
+        let mut sent_bytes = 0u64;
+        for v in 0..sent {
+            sent_bytes += msgs[v].msg_len as u64;
+        }
+        stats.out_pkts.fetch_add(sent as u64, Ordering::Relaxed);
+        stats.out_bytes.fetch_add(sent_bytes, Ordering::Relaxed);
+        stats.out_batches.fetch_add(1, Ordering::Relaxed);
+        atomic_min(&stats.out_batch_min, sent as u64);
+        atomic_max(&stats.out_batch_max, sent as u64);
     }
 }
 
@@ -1630,8 +1807,24 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
         let d = device.read();
         (d.iface.clone(), d.data_stats.clone())
     };
-    let mut rbuf = [0u8; MAX_PKT_SIZE];
+
+    // Per-thread batch buffers (boxed: ~99 KB; Android thread stacks can be small). recvmmsg
+    // fills up to MMSG_BATCH datagrams in one syscall. The iovec/mmsghdr arrays point into
+    // `rbufs` and are set up ONCE (the boxed buffers never move); the kernel only rewrites
+    // each `msg_len` (and msg_flags) per call. A single reused `dbuf` holds each decrypted IP
+    // packet (which is then written to the TUN one at a time — TUN can't batch writes).
+    let mut rbufs: Box<[[u8; MAX_PKT_SIZE]; MMSG_BATCH]> =
+        Box::new([[0u8; MAX_PKT_SIZE]; MMSG_BATCH]);
     let mut dbuf = [0u8; MAX_PKT_SIZE];
+    let mut iovecs: [libc::iovec; MMSG_BATCH] = unsafe { std::mem::zeroed() };
+    let mut msgs: [libc::mmsghdr; MMSG_BATCH] = unsafe { std::mem::zeroed() };
+    for i in 0..MMSG_BATCH {
+        iovecs[i].iov_base = rbufs[i].as_mut_ptr() as *mut libc::c_void;
+        iovecs[i].iov_len = MAX_PKT_SIZE as _;
+        msgs[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+        msgs[i].msg_hdr.msg_iovlen = 1 as _;
+    }
+
     // The single peer + a clone of its connected socket, established after the handshake.
     let mut bound: Option<(Arc<Peer>, socket2::Socket)> = None;
 
@@ -1660,34 +1853,79 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                 Some(b) => b,
                 None => continue,
             };
+            let sock_fd = conn.as_raw_fd();
 
-            // Safety: socket2 promises not to write uninitialised bytes into the buffer.
-            let recv_buf =
-                unsafe { &mut *(&mut rbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-            let n = match conn.recv(recv_buf) {
-                Ok(n) => n,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    // SO_RCVTIMEO fired: re-check `stop`.
-                    0
+            // MSG_WAITFORONE is REQUIRED: without it recvmmsg blocks (per recvmsg, bounded by
+            // SO_RCVTIMEO) trying to fill the whole batch, so a single datagram would return
+            // ~250 ms late (kills ping latency under sparse traffic). With MSG_WAITFORONE the
+            // first datagram blocks (bounded by SO_RCVTIMEO so we still wake to check `stop`),
+            // then MSG_DONTWAIT is turned on and it returns all immediately-available datagrams
+            // (1..=MMSG_BATCH) at once — low latency when sparse, real batching under load.
+            // SAFETY: msgs/iovecs are valid for MMSG_BATCH entries pointing into the live boxed
+            // `rbufs`; no live Rust reference into `rbufs` is held across the call.
+            let rc = unsafe {
+                libc::recvmmsg(
+                    sock_fd,
+                    msgs.as_mut_ptr(),
+                    MMSG_BATCH as _,
+                    libc::MSG_WAITFORONE,
+                    std::ptr::null_mut(),
+                )
+            };
+            let n_msgs = if rc < 0 {
+                let e = io::Error::last_os_error();
+                match e.kind() {
+                    io::ErrorKind::WouldBlock
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::Interrupted => 0, // re-check `stop`
+                    _ => {
+                        tracing::warn!(message = "IN: recvmmsg error; re-acquiring socket", error = ?e);
+                        reset = true;
+                        0
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(message = "IN: conn.recv error; re-acquiring socket", error = ?e);
-                    reset = true;
-                    0
-                }
+            } else {
+                rc as usize
             };
 
-            if n > 0 {
-                // tracing::info!(message = "IN: recv from connected socket", len = n); // per-packet: off for perf
-                let datagram = &rbuf[..n];
+            if n_msgs > 0 {
+                // tracing::info!(message = "IN: recvmmsg batch", n = n_msgs); // per-batch: off for perf
+                stats.in_batches.fetch_add(1, Ordering::Relaxed);
+                atomic_min(&stats.in_batch_min, n_msgs as u64);
+                atomic_max(&stats.in_batch_max, n_msgs as u64);
+            }
+
+            // Cache the session within the batch: all data packets in a batch share the same
+            // receiver_idx (constant within a session), so look it up once under the Tunn lock
+            // and reuse it for the rest of the batch — mirrors OUT's once-per-batch fetch
+            // instead of locking Tunn per datagram (the one gratuitous IN/OUT asymmetry).
+            // u32::MAX is never a valid (24-bit) receiver_idx, so it's a safe "empty" sentinel;
+            // cached_session's type (Option<Arc<Session>>) is inferred from the assignment below
+            // (the `session` module is private, so the type can't be named here).
+            let mut cached_idx: u32 = u32::MAX;
+            let mut cached_session = None;
+
+            // Dispatch each received datagram by type — a single batch may mix data packets and
+            // a handshake/cookie (e.g. rekey), so we must not assume all-data.
+            for mi in 0..n_msgs {
+                let len = msgs[mi].msg_len as usize;
+                if len == 0 {
+                    continue;
+                }
+                let datagram = &rbufs[mi][..len];
                 match Tunn::parse_incoming_packet(datagram) {
                     Ok(Packet::PacketData(p)) => {
                         let r_idx = p.receiver_idx;
-                        // Off-lock data decrypt: clone the session under a short lock.
-                        let session = peer.tunnel.lock().session_for_index(r_idx);
+                        // Off-lock data decrypt: reuse the cached session, else fetch it under a
+                        // short lock and cache it for the rest of the batch.
+                        let session = if cached_idx == r_idx {
+                            cached_session.clone()
+                        } else {
+                            let s = peer.tunnel.lock().session_for_index(r_idx);
+                            cached_session = s.clone();
+                            cached_idx = r_idx;
+                            s
+                        };
                         match session {
                             Some(session) => match session.decrypt(p, &mut dbuf) {
                                 // Empty payload == keepalive: nothing to write.
@@ -1696,18 +1934,34 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                                     // writing to the TUN (peers like kernel WireGuard pad data
                                     // packets to a 16-byte boundary).
                                     if let Some(len) = Tunn::decapsulated_packet_len(plain) {
-                                        let _ = iface.as_ref().write(&plain[..len]);
-                                        // tracing::info!(message = "IN: decrypted + wrote to tun", receiver_idx = r_idx, len); // per-packet: off for perf
-                                        stats.in_pkts.fetch_add(1, Ordering::Relaxed);
-                                        stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                        match iface.as_ref().write(&plain[..len]) {
+                                            Ok(_) => {
+                                                // tracing::info!(message = "IN: decrypted + wrote to tun", receiver_idx = r_idx, len); // per-packet: off for perf
+                                                stats.in_pkts.fetch_add(1, Ordering::Relaxed);
+                                                stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                            }
+                                            // TUN fd is non-blocking: a full TUN queue (EAGAIN)
+                                            // means the decrypted packet is dropped — download loss.
+                                            Err(e) => {
+                                                tracing::warn!(message = "IN: tun write failed; packet dropped", error = ?e);
+                                                stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
                                     } else {
                                         tracing::info!("IN: decrypted packet has unrecognised IP header; dropped");
+                                        stats.in_drops.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                                 Ok(_) => tracing::info!("IN: decrypted keepalive (empty); not written"),
-                                Err(e) => tracing::warn!(message = "IN: decrypt failed", error = ?e),
+                                Err(e) => {
+                                    tracing::warn!(message = "IN: decrypt failed", error = ?e);
+                                    stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                }
                             },
-                            None => tracing::info!(message = "IN: no session for receiver_idx", receiver_idx = r_idx),
+                            None => {
+                                tracing::info!(message = "IN: no session for receiver_idx", receiver_idx = r_idx);
+                                stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                     // Handshake / cookie: handle on the control path (under the Tunn lock).
