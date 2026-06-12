@@ -386,6 +386,19 @@ fn test_wireguard_get_on_device() {
 }
 
 #[test]
+/// Test that the event loop is registered with the dispatch group on creating DeviceHandle (registration is atomic)
+#[cfg(target_os = "macos")] // specific to dispatch crate's API (Apple's GCD wrapper)
+fn test_event_loop_active_directly_after_device_creation() {
+    let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
+
+    assert!(
+        wg.device.is_event_loop_active(),
+        "Device event loop's dispatch group is empty immediately after `DeviceHandle::new` returned. \
+        A call to `DeviceHandle::wait()` would return instantly."
+    );
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))] // macOS implementation does not support UAPI command chaining within a single connection
 fn test_wireguard_uapi_chaining() {
     let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
