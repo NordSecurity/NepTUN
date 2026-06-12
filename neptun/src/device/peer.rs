@@ -174,6 +174,34 @@ impl Peer {
         // Also mind that all socket setup functions should be called before .connect().
         udp_conn.connect(&addr.into())?;
 
+        // PoC: enable UDP GRO on the data socket. The kernel coalesces inbound WireGuard datagrams
+        // into one large buffer at the GRO layer, collapsing the per-packet NET_RX softirq cost
+        // that otherwise caps download throughput on a single (little) core. The IN thread reads
+        // the coalesced buffer via recvmsg + the UDP_GRO control message (gso_size) and splits it.
+        // Best-effort: if it fails, recvmsg simply never produces the cmsg and we fall back to
+        // single-datagram reads. (UDP_SEGMENT/GSO on send is set per-sendmsg as a cmsg, not here.)
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            const SOL_UDP: libc::c_int = 17;
+            const UDP_GRO: libc::c_int = 104;
+            let on: libc::c_int = 1;
+            let rc = unsafe {
+                libc::setsockopt(
+                    udp_conn.as_raw_fd(),
+                    SOL_UDP,
+                    UDP_GRO,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                tracing::warn!(
+                    message = "UDP_GRO setsockopt failed; continuing without RX coalescing",
+                    error = ?std::io::Error::last_os_error()
+                );
+            }
+        }
+
         tracing::info!(
             message="Connected endpoint",
             port=port,

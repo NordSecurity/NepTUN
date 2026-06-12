@@ -203,7 +203,12 @@ pub struct Device {
 /// PoC two-thread data plane counters, logged periodically (see register_timers). `out_*` is
 /// the OUT/encrypt thread (TUN→net), `in_*` is the IN/decrypt thread (net→TUN). `prev_*` hold
 /// the last logged values so the logger can report a per-interval delta.
-#[derive(Default)]
+///
+/// GRO/GSO stats: `*_calls` counts recvmsg/sendmsg calls that moved ≥1 packet (delta'd for a
+/// per-interval avg segments-per-call = coalescing factor), `*_seg_min`/`*_seg_max` track the
+/// per-interval min/max segments per call (the logger resets them each interval: min→u64::MAX,
+/// max→0), and `*_drops` counts packets lost when a syscall can't move all segments (sendmsg
+/// short/error/encrypt-fail on OUT; MSG_TRUNC/decrypt-fail/no-session on IN).
 struct DataStats {
     out_pkts: AtomicU64,
     out_bytes: AtomicU64,
@@ -213,6 +218,69 @@ struct DataStats {
     prev_out_bytes: AtomicU64,
     prev_in_pkts: AtomicU64,
     prev_in_bytes: AtomicU64,
+    out_sendmsg_calls: AtomicU64,
+    in_recvmsg_calls: AtomicU64,
+    prev_out_calls: AtomicU64,
+    prev_in_calls: AtomicU64,
+    out_seg_min: AtomicU64,
+    out_seg_max: AtomicU64,
+    in_seg_min: AtomicU64,
+    in_seg_max: AtomicU64,
+    out_drops: AtomicU64,
+    in_drops: AtomicU64,
+    prev_out_drops: AtomicU64,
+    prev_in_drops: AtomicU64,
+}
+
+impl Default for DataStats {
+    fn default() -> Self {
+        // Manual impl (not derive): the two `*_seg_min` fields must start at u64::MAX so the first
+        // observed batch wins the min; everything else starts at 0.
+        DataStats {
+            out_pkts: AtomicU64::new(0),
+            out_bytes: AtomicU64::new(0),
+            in_pkts: AtomicU64::new(0),
+            in_bytes: AtomicU64::new(0),
+            prev_out_pkts: AtomicU64::new(0),
+            prev_out_bytes: AtomicU64::new(0),
+            prev_in_pkts: AtomicU64::new(0),
+            prev_in_bytes: AtomicU64::new(0),
+            out_sendmsg_calls: AtomicU64::new(0),
+            in_recvmsg_calls: AtomicU64::new(0),
+            prev_out_calls: AtomicU64::new(0),
+            prev_in_calls: AtomicU64::new(0),
+            out_seg_min: AtomicU64::new(u64::MAX),
+            out_seg_max: AtomicU64::new(0),
+            in_seg_min: AtomicU64::new(u64::MAX),
+            in_seg_max: AtomicU64::new(0),
+            out_drops: AtomicU64::new(0),
+            in_drops: AtomicU64::new(0),
+            prev_out_drops: AtomicU64::new(0),
+            prev_in_drops: AtomicU64::new(0),
+        }
+    }
+}
+
+/// `AtomicU64::fetch_min` is unstable on the pinned toolchain, so do a CAS loop.
+fn atomic_min(a: &AtomicU64, v: u64) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while v < cur {
+        match a.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
+}
+
+/// `AtomicU64::fetch_max` counterpart of [`atomic_min`].
+fn atomic_max(a: &AtomicU64, v: u64) {
+    let mut cur = a.load(Ordering::Relaxed);
+    while v > cur {
+        match a.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(x) => cur = x,
+        }
+    }
 }
 
 struct ThreadData {
@@ -255,6 +323,10 @@ impl DeviceHandle {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<DeviceHandle, Error> {
+        // PoC: one-time check that this kernel + process context (Android untrusted_app SELinux
+        // domain) will accept UDP_GRO / UDP_SEGMENT, before committing to a GRO receive path.
+        probe_udp_offload_support();
+
         // PoC two-thread model: the epoll loop is only the control plane (timers, notifiers,
         // udp bootstrap), so a single epoll thread is enough. Forcing 1 also avoids the
         // multi-queue per-thread TUN creation (we dropped IFF_MULTI_QUEUE; unavailable on
@@ -918,10 +990,31 @@ impl Device {
                 let d_out_b = out_b.wrapping_sub(s.prev_out_bytes.swap(out_b, Ordering::Relaxed));
                 let d_in_p = in_p.wrapping_sub(s.prev_in_pkts.swap(in_p, Ordering::Relaxed));
                 let d_in_b = in_b.wrapping_sub(s.prev_in_bytes.swap(in_b, Ordering::Relaxed));
+
+                // GRO/GSO coalescing: per-interval segments-per-syscall min/avg/max + drops.
+                // Read + RESET min/max every interval, before the idle guard, so a stale extreme
+                // can't linger (min→u64::MAX, max→0). avg = interval pkts / interval syscalls.
+                let out_calls = s.out_sendmsg_calls.load(Ordering::Relaxed);
+                let in_calls = s.in_recvmsg_calls.load(Ordering::Relaxed);
+                let d_out_calls = out_calls.wrapping_sub(s.prev_out_calls.swap(out_calls, Ordering::Relaxed));
+                let d_in_calls = in_calls.wrapping_sub(s.prev_in_calls.swap(in_calls, Ordering::Relaxed));
+                let out_smin = s.out_seg_min.swap(u64::MAX, Ordering::Relaxed);
+                let out_smax = s.out_seg_max.swap(0, Ordering::Relaxed);
+                let in_smin = s.in_seg_min.swap(u64::MAX, Ordering::Relaxed);
+                let in_smax = s.in_seg_max.swap(0, Ordering::Relaxed);
+                let out_smin = if out_smin == u64::MAX { 0 } else { out_smin };
+                let in_smin = if in_smin == u64::MAX { 0 } else { in_smin };
+                let out_savg = if d_out_calls > 0 { d_out_p as f64 / d_out_calls as f64 } else { 0.0 };
+                let in_savg = if d_in_calls > 0 { d_in_p as f64 / d_in_calls as f64 } else { 0.0 };
+                let out_drops = s.out_drops.load(Ordering::Relaxed);
+                let in_drops = s.in_drops.load(Ordering::Relaxed);
+                let d_out_drops = out_drops.wrapping_sub(s.prev_out_drops.swap(out_drops, Ordering::Relaxed));
+                let d_in_drops = in_drops.wrapping_sub(s.prev_in_drops.swap(in_drops, Ordering::Relaxed));
+
                 // Skip the line entirely when idle to avoid log spam.
                 if d_out_p != 0 || d_in_p != 0 {
                     tracing::info!(
-                        "neptun data-plane (last 10s): OUT +{d_out_p} pkts (+{d_out_b} B) | IN +{d_in_p} pkts (+{d_in_b} B) || totals OUT {out_p} pkts / {out_b} B, IN {in_p} pkts / {in_b} B"
+                        "neptun data-plane (last 10s): OUT +{d_out_p} pkts (+{d_out_b} B) seg[{out_smin}/{out_savg:.1}/{out_smax}] drops {d_out_drops} | IN +{d_in_p} pkts (+{d_in_b} B) seg[{in_smin}/{in_savg:.1}/{in_smax}] drops {d_in_drops} || totals OUT {out_p} pkts / {out_b} B ({out_drops} drop), IN {in_p} pkts / {in_b} B ({in_drops} drop)"
                     );
                 }
                 Action::Continue
@@ -1518,20 +1611,103 @@ fn write_to_tun_worker(
 /// Crypto runs on a cloned `Arc<Session>` with no `Tunn` lock held (only a short lock to
 /// clone the session out). Single peer. No handshake/timer work here — if there is no
 /// session yet, it asks the control plane (epoll timers) to initiate a handshake.
+/// One-time availability probe for UDP segmentation/receive offload. Creates a throwaway UDP
+/// socket, tries `setsockopt(SOL_UDP, UDP_GRO/UDP_SEGMENT)`, reads `UDP_GRO` back, logs the
+/// outcome, and drops the socket. Touches nothing on the data path — it only answers "will this
+/// kernel + this (Android app) process let us turn these on?" before we build the GRO receive
+/// path. The iperf `--gsro` test already proved the kernel + NIC coalesce; this confirms the
+/// app's SELinux context permits the sockopts on our own socket.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn probe_udp_offload_support() {
+    // Option numbers are stable on Linux; define locally so we don't depend on the libc crate
+    // version exposing UDP_GRO. SOL_UDP == IPPROTO_UDP == 17.
+    const SOL_UDP: libc::c_int = 17;
+    const UDP_SEGMENT: libc::c_int = 103;
+    const UDP_GRO: libc::c_int = 104;
+
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_UDP);
+        if fd < 0 {
+            tracing::warn!(message = "UDP offload probe: socket() failed", error = ?std::io::Error::last_os_error());
+            return;
+        }
+
+        let on: libc::c_int = 1;
+        let gro_rc = libc::setsockopt(
+            fd,
+            SOL_UDP,
+            UDP_GRO,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let gro_err = (gro_rc != 0).then(|| std::io::Error::last_os_error());
+
+        let seg: libc::c_int = 1200;
+        let seg_rc = libc::setsockopt(
+            fd,
+            SOL_UDP,
+            UDP_SEGMENT,
+            &seg as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let seg_err = (seg_rc != 0).then(|| std::io::Error::last_os_error());
+
+        // Read UDP_GRO back to confirm it actually stuck (not just accepted-and-ignored).
+        let mut gro_readback: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let get_rc = libc::getsockopt(
+            fd,
+            SOL_UDP,
+            UDP_GRO,
+            &mut gro_readback as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+
+        tracing::info!(
+            message = "UDP offload probe",
+            udp_gro_set_ok = gro_rc == 0,
+            udp_gro_readback = if get_rc == 0 { gro_readback } else { -1 },
+            udp_gro_err = ?gro_err,
+            udp_segment_set_ok = seg_rc == 0,
+            udp_segment_err = ?seg_err,
+        );
+
+        libc::close(fd);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn probe_udp_offload_support() {}
+
 fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
+    const SOL_UDP: libc::c_int = 17;
+    const UDP_SEGMENT: libc::c_int = 103;
+    const N: usize = 64; // UDP_MAX_SEGMENTS
+    const GSO_MAX_BYTES: usize = 65536; // kernel UDP GSO total payload cap
+
     let (iface, stats) = {
         let d = device.read();
         (d.iface.clone(), d.data_stats.clone())
     };
     let tun_fd = iface.as_raw_fd();
-    let mut buf = [0u8; MAX_PKT_SIZE];
+
+    // Per-slot buffers (heap): each holds one IP packet read into [WG_HEADER_OFFSET..], encrypted
+    // IN PLACE → the WG packet starts at slot offset 0. UDP_SEGMENT (GSO) gathers the per-slot
+    // iovecs into one payload and cuts every gso_size, so the cuts align with packet boundaries as
+    // long as every packet except the last is exactly gso_size. `carry` holds a packet that was
+    // read but didn't fit the current run (larger than gso_size) so it seeds the NEXT batch.
+    let mut slots: Vec<[u8; MAX_PKT_SIZE]> = vec![[0u8; MAX_PKT_SIZE]; N];
+    let mut lens = [0usize; N]; // plaintext length per slot
+    let mut iovs = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; N];
+    let mut carry = [0u8; MAX_PKT_SIZE];
+    let mut carry_len = 0usize; // 0 = no carried packet
     // Cached clone of the peer's connected socket (appears after the first handshake).
     let mut conn: Option<socket2::Socket> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // Wait for TUN readiness with a timeout so we periodically re-check `stop` (the TUN
-        // char device has no SO_RCVTIMEO). The fd is non-blocking, so a read after a spurious
-        // wake / stolen packet returns EAGAIN instead of blocking.
+        // char device has no SO_RCVTIMEO). The fd is non-blocking, so the drain reads below
+        // return EWOULDBLOCK once the queue empties.
         let mut pfd = libc::pollfd {
             fd: tun_fd,
             events: libc::POLLIN,
@@ -1543,81 +1719,159 @@ fn out_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
         }
 
         let mtu = device.read().mtu.load(Ordering::Relaxed).min(MAX_PKT_SIZE - WG_HEADER_OFFSET);
-        let n = match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
-            Ok(s) => s.len(),
-            Err(e) => {
-                tracing::info!(message = "OUT: tun read error", error = ?e);
-                continue;
-            }
-        };
-        if n == 0 {
-            continue;
-        }
-        // tracing::info!(message = "OUT: read from tun", len = n); // per-packet: off for perf
 
-        // Short critical section: route to the peer, clone out the current session and the
-        // connected socket, then release all locks before crypto + send.
-        let session = {
-            let d = device.read();
-            let dst = match Tunn::dst_address(&buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + n]) {
-                Some(a) => a,
-                None => {
-                    tracing::info!("OUT: could not parse dst address; dropping");
+        // --- seed the batch: carried-over packet, else read the first one ---
+        let mut count;
+        let gso_plain; // plaintext size that defines this batch's segment size
+        if carry_len > 0 {
+            slots[0][WG_HEADER_OFFSET..WG_HEADER_OFFSET + carry_len]
+                .copy_from_slice(&carry[..carry_len]);
+            lens[0] = carry_len;
+            gso_plain = carry_len;
+            carry_len = 0;
+            count = 1;
+        } else {
+            match iface.read(&mut slots[0][WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
+                Ok(s) if !s.is_empty() => {
+                    lens[0] = s.len();
+                    gso_plain = s.len();
+                    count = 1;
+                }
+                Ok(_) => continue,
+                Err(Error::IfaceRead(ref e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    tracing::info!(message = "OUT: tun read error", error = ?e);
                     continue;
                 }
-            };
-            let peer = match d.peers_by_ip.find(dst) {
+            }
+        }
+
+        // Single-peer PoC: fetch the peer + current session + connected socket ONCE per batch.
+        // NOTE: multi-peer would require per-packet dst routing + grouping by destination here.
+        let session = {
+            let d = device.read();
+            let peer = match d.peers.values().next() {
                 Some(p) => p,
                 None => {
-                    tracing::info!(message = "OUT: no peer for dst (peers_by_ip miss)", ?dst);
+                    tracing::info!("OUT: no peer configured; dropping batch");
                     continue;
                 }
             };
             if conn.is_none() {
-                conn = peer
-                    .endpoint()
-                    .conn
-                    .as_ref()
-                    .and_then(|c| c.try_clone().ok());
+                conn = peer.endpoint().conn.as_ref().and_then(|c| c.try_clone().ok());
                 tracing::info!(message = "OUT: connected-socket fetch", acquired = conn.is_some());
             }
-            // Bind to a local so the tunnel MutexGuard temporary is dropped here, before the
-            // device read guard `d` at the end of this block.
             let current = peer.tunnel.lock().current_session();
             match current {
                 Some(s) => s,
                 None => {
-                    // No session yet: ask the control plane to handshake; drop this packet.
-                    tracing::info!(message = "OUT: no current session; requesting handshake, dropping", ?dst);
+                    tracing::info!("OUT: no current session; requesting handshake, dropping batch");
                     peer.request_handshake();
                     continue;
                 }
             }
         };
-
-        let sock = match conn.as_ref() {
-            Some(c) => c,
+        let sock_fd = match conn.as_ref() {
+            Some(c) => c.as_raw_fd(),
             None => {
-                tracing::info!("OUT: have session but no connected socket yet; dropping");
-                continue; // session exists but socket not connected yet; drop
+                tracing::info!("OUT: have session but no connected socket yet; dropping batch");
+                continue;
             }
         };
 
-        match session.encrypt(n, &mut buf) {
-            Ok(packet) => match sock.send(packet) {
-                Ok(_sent) => {
-                    // tracing::info!(message = "OUT: sent via connected socket", len = _sent); // per-packet: off for perf
-                    stats.out_pkts.fetch_add(1, Ordering::Relaxed);
-                    stats.out_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+        // --- coalesce: read more packets of the SAME size into the batch ---
+        loop {
+            if count >= N || (count + 1) * (gso_plain + 32) > GSO_MAX_BYTES {
+                break; // segment cap / 64 KB cap
+            }
+            match iface.read(&mut slots[count][WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
+                Ok(s) if !s.is_empty() => {
+                    let szn = s.len();
+                    if szn == gso_plain {
+                        lens[count] = szn;
+                        count += 1;
+                    } else if szn < gso_plain {
+                        // A shorter packet is a VALID last GSO segment; append then flush.
+                        lens[count] = szn;
+                        count += 1;
+                        break;
+                    } else {
+                        // Larger than gso_size: can't join. Carry it to the next batch (it's
+                        // already read — must not be dropped or reordered). `carry` is a separate
+                        // buffer, so this does not touch slots[0..count].
+                        carry[..szn].copy_from_slice(&slots[count][WG_HEADER_OFFSET..WG_HEADER_OFFSET + szn]);
+                        carry_len = szn;
+                        break;
+                    }
+                }
+                // EWOULDBLOCK / empty / error: TUN drained, flush what we have.
+                _ => break,
+            }
+        }
+
+        // --- flush: encrypt each slot in place, build iovecs ---
+        let mut total_wg = 0u64;
+        let mut encrypt_ok = true;
+        for i in 0..count {
+            match session.encrypt(lens[i], &mut slots[i][..]) {
+                Ok(pkt) => {
+                    iovs[i] = libc::iovec {
+                        iov_base: pkt.as_mut_ptr() as *mut libc::c_void,
+                        iov_len: pkt.len() as _,
+                    };
+                    total_wg += pkt.len() as u64;
                 }
                 Err(e) => {
-                    tracing::warn!(message = "OUT: conn.send failed", error = ?e);
-                    // Drop the cached socket so it is re-fetched (e.g. endpoint reset/roam).
-                    conn = None;
+                    tracing::warn!(message = "OUT: encrypt failed; dropping batch", error = ?e);
+                    encrypt_ok = false;
+                    break;
                 }
-            },
-            Err(e) => tracing::warn!(message = "OUT: encrypt failed", error = ?e),
+            }
         }
+        if !encrypt_ok {
+            stats.out_drops.fetch_add(count as u64, Ordering::Relaxed);
+            continue;
+        }
+
+        // --- one sendmsg for the whole batch; UDP_SEGMENT cmsg only when coalescing (count>1) ---
+        let mut cbuf = [0u8; 64];
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = iovs.as_mut_ptr();
+        msg.msg_iovlen = count as _;
+        if count > 1 {
+            msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) } as _;
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = SOL_UDP;
+                (*cmsg).cmsg_type = UDP_SEGMENT;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as _;
+                // UDP_SEGMENT segment size is the WG byte size (plaintext + 32) as a u16.
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut u16, (gso_plain + 32) as u16);
+            }
+        }
+        let rc = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            stats.out_drops.fetch_add(count as u64, Ordering::Relaxed);
+            match e.raw_os_error() {
+                Some(libc::EMSGSIZE) => {
+                    tracing::warn!(message = "OUT: sendmsg EMSGSIZE", gso = gso_plain + 32)
+                }
+                // Transient: socket buffer full / interrupted. Drop the batch (UDP is lossy).
+                Some(libc::ENOBUFS) | Some(libc::EAGAIN) | Some(libc::EINTR) => {}
+                _ => {
+                    tracing::warn!(message = "OUT: sendmsg failed", error = ?e);
+                    conn = None; // re-fetch the socket (e.g. endpoint reset/roam)
+                }
+            }
+        } else {
+            stats.out_pkts.fetch_add(count as u64, Ordering::Relaxed);
+            stats.out_bytes.fetch_add(total_wg, Ordering::Relaxed);
+        }
+        stats.out_sendmsg_calls.fetch_add(1, Ordering::Relaxed);
+        atomic_min(&stats.out_seg_min, count as u64);
+        atomic_max(&stats.out_seg_max, count as u64);
     }
 }
 
@@ -1630,8 +1884,12 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
         let d = device.read();
         (d.iface.clone(), d.data_stats.clone())
     };
-    let mut rbuf = [0u8; MAX_PKT_SIZE];
+    // 64 KB GRO super-buffer (boxed): UDP_GRO coalesces up to 64 KB of inbound datagrams into a
+    // single recvmsg; a MAX_PKT_SIZE buffer would MSG_TRUNC. `dbuf` is the reused decrypt dst;
+    // `cbuf` receives the UDP_GRO control message (segment size used to split the buffer).
+    let mut rbuf: Box<[u8]> = vec![0u8; 65536].into_boxed_slice();
     let mut dbuf = [0u8; MAX_PKT_SIZE];
+    let mut cbuf = [0u8; 64];
     // The single peer + a clone of its connected socket, established after the handshake.
     let mut bound: Option<(Arc<Peer>, socket2::Socket)> = None;
 
@@ -1661,92 +1919,159 @@ fn in_data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
                 None => continue,
             };
 
-            // Safety: socket2 promises not to write uninitialised bytes into the buffer.
-            let recv_buf =
-                unsafe { &mut *(&mut rbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-            let n = match conn.recv(recv_buf) {
-                Ok(n) => n,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    // SO_RCVTIMEO fired: re-check `stop`.
-                    0
+            // recvmsg into the 64 KB buffer with a control buffer for the UDP_GRO cmsg. With GRO
+            // on, the kernel coalesces several same-size datagrams into one read and reports the
+            // segment size via the cmsg; we split the buffer back into individual WG packets.
+            const SOL_UDP: libc::c_int = 17;
+            const UDP_GRO: libc::c_int = 104;
+            let mut iov = libc::iovec {
+                iov_base: rbuf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: rbuf.len(),
+            };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1 as _;
+            msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = cbuf.len() as _; // reset each call; kernel overwrites it
+            let rc = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
+            let n = if rc < 0 {
+                let e = io::Error::last_os_error();
+                match e.raw_os_error() {
+                    // EWOULDBLOCK == EAGAIN on Linux. SO_RCVTIMEO fires as EAGAIN/ETIMEDOUT.
+                    Some(libc::EAGAIN) | Some(libc::EINTR) | Some(libc::ETIMEDOUT) => 0,
+                    _ => {
+                        tracing::warn!(message = "IN: recvmsg error; re-acquiring socket", error = ?e);
+                        reset = true;
+                        0
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(message = "IN: conn.recv error; re-acquiring socket", error = ?e);
-                    reset = true;
-                    0
-                }
+            } else {
+                rc as usize
             };
 
             if n > 0 {
-                // tracing::info!(message = "IN: recv from connected socket", len = n); // per-packet: off for perf
-                let datagram = &rbuf[..n];
-                match Tunn::parse_incoming_packet(datagram) {
-                    Ok(Packet::PacketData(p)) => {
-                        let r_idx = p.receiver_idx;
-                        // Off-lock data decrypt: clone the session under a short lock.
-                        let session = peer.tunnel.lock().session_for_index(r_idx);
-                        match session {
-                            Some(session) => match session.decrypt(p, &mut dbuf) {
-                                // Empty payload == keepalive: nothing to write.
-                                Ok(plain) if !plain.is_empty() => {
-                                    // Trim WireGuard padding to the real IP length before
-                                    // writing to the TUN (peers like kernel WireGuard pad data
-                                    // packets to a 16-byte boundary).
-                                    if let Some(len) = Tunn::decapsulated_packet_len(plain) {
-                                        let _ = iface.as_ref().write(&plain[..len]);
-                                        // tracing::info!(message = "IN: decrypted + wrote to tun", receiver_idx = r_idx, len); // per-packet: off for perf
-                                        stats.in_pkts.fetch_add(1, Ordering::Relaxed);
-                                        stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
-                                    } else {
-                                        tracing::info!("IN: decrypted packet has unrecognised IP header; dropped");
-                                    }
-                                }
-                                Ok(_) => tracing::info!("IN: decrypted keepalive (empty); not written"),
-                                Err(e) => tracing::warn!(message = "IN: decrypt failed", error = ?e),
-                            },
-                            None => tracing::info!(message = "IN: no session for receiver_idx", receiver_idx = r_idx),
+                stats.in_recvmsg_calls.fetch_add(1, Ordering::Relaxed);
+
+                // Extract the UDP_GRO segment size (c_int). Absent => not coalesced => one datagram.
+                let mut gso_size = 0usize;
+                unsafe {
+                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    while !cmsg.is_null() {
+                        if (*cmsg).cmsg_level == SOL_UDP && (*cmsg).cmsg_type == UDP_GRO {
+                            let p = libc::CMSG_DATA(cmsg) as *const libc::c_int;
+                            gso_size = std::ptr::read_unaligned(p) as usize;
                         }
+                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
-                    // Handshake / cookie: handle on the control path (under the Tunn lock).
-                    Ok(_) => {
-                        tracing::info!("IN: non-data (handshake/cookie) packet -> decapsulate");
-                        let res = {
-                            let mut tun = peer.tunnel.lock();
-                            tun.decapsulate(None, datagram, &mut dbuf)
-                        };
-                        match res {
-                            TunnResult::WriteToNetwork(packet) => {
-                                tracing::info!(message = "IN: handshake reply -> send on conn", len = packet.len());
-                                let _ = conn.send(packet);
-                                // Drain any queued packets the handshake completion released.
-                                loop {
-                                    let mut out = [0u8; MAX_PKT_SIZE];
-                                    let r = {
-                                        let mut tun = peer.tunnel.lock();
-                                        tun.decapsulate(None, &[], &mut out)
-                                    };
-                                    match r {
-                                        TunnResult::WriteToNetwork(p2) => {
-                                            let _ = conn.send(p2);
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                            }
-                            TunnResult::WriteToTunnel(packet, _addr) => {
-                                tracing::info!(message = "IN: control path produced tun packet", len = packet.len());
-                                let _ = iface.as_ref().write(packet);
-                            }
-                            other => {
-                                tracing::info!(message = "IN: control path result", result = ?std::mem::discriminant(&other));
-                            }
-                        }
-                    }
-                    Err(e) => tracing::info!(message = "IN: parse_incoming_packet failed", error = ?e),
                 }
+                if msg.msg_flags & libc::MSG_TRUNC != 0 {
+                    tracing::warn!(message = "IN: recvmsg MSG_TRUNC; coalesced datagram exceeded buffer", len = n);
+                    stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Split the (possibly coalesced) buffer into gso_size segments; all but the last
+                // are gso_size, the last is the remainder. Cache the session within the read
+                // (a GRO run is same-flow same-size => same receiver_idx) to avoid per-segment locks.
+                let step = if gso_size == 0 { n } else { gso_size };
+                let mut seg_count = 0u64;
+                let mut cached_idx: u32 = u32::MAX;
+                let mut cached_session = None;
+                let mut off = 0usize;
+                while off < n {
+                    let end = (off + step).min(n);
+                    let datagram = &rbuf[off..end];
+                    off = end;
+                    seg_count += 1;
+                    if datagram.len() < 4 {
+                        continue; // too short to be a WG packet
+                    }
+                    match Tunn::parse_incoming_packet(datagram) {
+                        Ok(Packet::PacketData(p)) => {
+                            let r_idx = p.receiver_idx;
+                            // Off-lock data decrypt; reuse the cached session or fetch under a short lock.
+                            let session = if cached_idx == r_idx {
+                                cached_session.clone()
+                            } else {
+                                let s = peer.tunnel.lock().session_for_index(r_idx);
+                                cached_session = s.clone();
+                                cached_idx = r_idx;
+                                s
+                            };
+                            match session {
+                                Some(session) => match session.decrypt(p, &mut dbuf) {
+                                    // Empty payload == keepalive: nothing to write.
+                                    Ok(plain) if !plain.is_empty() => {
+                                        // Trim WireGuard padding to the real IP length before
+                                        // writing to the TUN (peers like kernel WireGuard pad data
+                                        // packets to a 16-byte boundary).
+                                        if let Some(len) = Tunn::decapsulated_packet_len(plain) {
+                                            match iface.as_ref().write(&plain[..len]) {
+                                                Ok(_) => {
+                                                    stats.in_pkts.fetch_add(1, Ordering::Relaxed);
+                                                    stats.in_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(message = "IN: tun write failed; packet dropped", error = ?e);
+                                                    stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                            }
+                                        } else {
+                                            tracing::info!("IN: decrypted packet has unrecognised IP header; dropped");
+                                            stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                    Ok(_) => tracing::info!("IN: decrypted keepalive (empty); not written"),
+                                    Err(e) => {
+                                        tracing::warn!(message = "IN: decrypt failed", error = ?e);
+                                        stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                },
+                                None => {
+                                    tracing::info!(message = "IN: no session for receiver_idx", receiver_idx = r_idx);
+                                    stats.in_drops.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        // Handshake / cookie: handle on the control path (under the Tunn lock).
+                        Ok(_) => {
+                            tracing::info!("IN: non-data (handshake/cookie) packet -> decapsulate");
+                            let res = {
+                                let mut tun = peer.tunnel.lock();
+                                tun.decapsulate(None, datagram, &mut dbuf)
+                            };
+                            match res {
+                                TunnResult::WriteToNetwork(packet) => {
+                                    tracing::info!(message = "IN: handshake reply -> send on conn", len = packet.len());
+                                    let _ = conn.send(packet);
+                                    // Drain any queued packets the handshake completion released.
+                                    loop {
+                                        let mut out = [0u8; MAX_PKT_SIZE];
+                                        let r = {
+                                            let mut tun = peer.tunnel.lock();
+                                            tun.decapsulate(None, &[], &mut out)
+                                        };
+                                        match r {
+                                            TunnResult::WriteToNetwork(p2) => {
+                                                let _ = conn.send(p2);
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                                TunnResult::WriteToTunnel(packet, _addr) => {
+                                    tracing::info!(message = "IN: control path produced tun packet", len = packet.len());
+                                    let _ = iface.as_ref().write(packet);
+                                }
+                                other => {
+                                    tracing::info!(message = "IN: control path result", result = ?std::mem::discriminant(&other));
+                                }
+                            }
+                        }
+                        Err(e) => tracing::info!(message = "IN: parse_incoming_packet failed", error = ?e),
+                    }
+                }
+                atomic_min(&stats.in_seg_min, seg_count);
+                atomic_max(&stats.in_seg_max, seg_count);
             }
         }
         if reset {
