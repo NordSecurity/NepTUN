@@ -9,7 +9,7 @@ use crate::noise::session::Session;
 use crate::sleepyinstant::Instant;
 use crate::x25519;
 use aead::{Aead, Payload};
-use aegis::aegis256::Aegis256;
+use aegis::aegis256x2::Aegis256X2;
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
@@ -26,12 +26,12 @@ pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
 const KEY_LEN: usize = 32;
 const TIMESTAMP_LEN: usize = 12;
 
-// PoC: AEGIS-256 cipher suite only. The Noise protocol name differs from stock WireGuard's
+// PoC: AEGIS-256X2 cipher suite only. The Noise protocol name differs from stock WireGuard's
 // ChaChaPoly construction, which changes the initial chaining key / hash. These match the
-// NordLynx kernel module's `WG_CRYPTO_SUITE_AEGIS256` (noise.c `handshake_name_aegis256` /
+// NordLynx kernel module's `WG_CRYPTO_SUITE_AEGIS256X2` (noise.c `handshake_name_aegis_x2` /
 // `identifier_name`), so the handshake interops byte-for-byte. Computed at handshake start (two
 // BLAKE2s ops — negligible) rather than hardcoded, to avoid magic constants.
-const NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_AEGIS256_BLAKE2s";
+const NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_AEGIS256X2_BLAKE2s";
 const NOISE_IDENTIFIER: &[u8] = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
 
 // initiator.chaining_key = HASH(CONSTRUCTION)
@@ -102,8 +102,8 @@ pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> Result<[u8; 24], WireGuard
     Ok(hmac.finalize_fixed().into())
 }
 
-/// AEGIS-256 seal for handshake fields. Matches the NordLynx kernel `message_encrypt` for
-/// `WG_CRYPTO_SUITE_AEGIS256`: 32-byte all-zero nonce (the WG handshake counter is always 0),
+/// AEGIS-256X2 seal for handshake fields. Matches the NordLynx kernel `message_encrypt` for
+/// `WG_CRYPTO_SUITE_AEGIS256X2`: 32-byte all-zero nonce (the WG handshake counter is always 0),
 /// AAD = the current Noise `hash`, 16-byte tag appended after the ciphertext. `ciphertext` must be
 /// `data.len() + 16` bytes. `_counter` is always 0 here (kept for call-site symmetry).
 #[inline]
@@ -122,7 +122,7 @@ fn aead_seal(
         .ok_or(WireGuardError::InvalidLength)?;
     ct_part.copy_from_slice(data);
 
-    let tag = Aegis256::<16>::new(&key, &nonce).encrypt_in_place(ct_part, aad);
+    let tag = Aegis256X2::<16>::new(&key, &nonce).encrypt_in_place(ct_part, aad);
     tag_part
         .get_mut(..16)
         .ok_or(WireGuardError::InvalidLength)?
@@ -130,7 +130,7 @@ fn aead_seal(
     Ok(())
 }
 
-/// AEGIS-256 open counterpart of [`aead_seal`]. `data` is `ciphertext ‖ tag(16)`; `buffer`
+/// AEGIS-256X2 open counterpart of [`aead_seal`]. `data` is `ciphertext ‖ tag(16)`; `buffer`
 /// receives the `data.len() - 16` bytes of plaintext.
 #[inline]
 fn aead_open(
@@ -148,7 +148,7 @@ fn aead_open(
     let tag: [u8; 16] = tag.try_into().map_err(|_| WireGuardError::InvalidLength)?;
 
     let mut inner = ct.to_owned();
-    Aegis256::<16>::new(&key, &nonce)
+    Aegis256X2::<16>::new(&key, &nonce)
         .decrypt_in_place(&mut inner, &tag, aad)
         .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
@@ -756,8 +756,8 @@ impl Handshake {
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
-        // PoC: tag the suite in header byte 1 (= WG_CRYPTO_SUITE_AEGIS256) for kernel interop.
-        message_type[1] = super::CRYPTO_SUITE_AEGIS256;
+        // PoC: tag the suite in header byte 1 (= WG_CRYPTO_SUITE_AEGIS256X2) for kernel interop.
+        message_type[1] = super::CRYPTO_SUITE_AEGIS256X2;
         // msg.sender_index = little_endian(initiator.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
@@ -850,8 +850,8 @@ impl Handshake {
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&super::HANDSHAKE_RESP.to_le_bytes());
-        // PoC: tag the suite in header byte 1 (= WG_CRYPTO_SUITE_AEGIS256) for kernel interop.
-        message_type[1] = super::CRYPTO_SUITE_AEGIS256;
+        // PoC: tag the suite in header byte 1 (= WG_CRYPTO_SUITE_AEGIS256X2) for kernel interop.
+        message_type[1] = super::CRYPTO_SUITE_AEGIS256X2;
         // msg.sender_index = little_endian(responder.sender_index)
         sender_index.copy_from_slice(&local_index.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)

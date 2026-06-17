@@ -4,7 +4,7 @@
 
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
-use aegis::aegis256::Aegis256;
+use aegis::aegis256x2::Aegis256X2;
 use parking_lot::Mutex;
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    // AEGIS-256 transport keys (32 bytes). A fresh Aegis256 state is built per packet, so we keep
-    // the raw keys rather than a pre-expanded cipher object.
+    // AEGIS-256X2 transport keys (32 bytes). A fresh Aegis256X2 state is built per packet, so we
+    // keep the raw keys rather than a pre-expanded cipher object.
     receiving_key: [u8; 32],
     sending_key: [u8; 32],
     sending_key_counter: AtomicUsize,
@@ -227,7 +227,7 @@ impl Session {
         receiver_index.copy_from_slice(&self.sending_index.to_le_bytes());
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
-        // AEGIS-256: 32-byte nonce = LE64 counter at offset 0 (zeros after), empty AAD, 16-byte
+        // AEGIS-256X2: 32-byte nonce = LE64 counter at offset 0 (zeros after), empty AAD, 16-byte
         // tag appended inline. Matches the NordLynx kernel data-packet format.
         let n = {
             let mut nonce = [0u8; 32];
@@ -238,7 +238,8 @@ impl Session {
             let plaintext = data
                 .get_mut(..payload_len)
                 .ok_or(WireGuardError::InvalidLength)?;
-            let tag = Aegis256::<16>::new(&self.sending_key, &nonce).encrypt_in_place(plaintext, &[]);
+            let tag =
+                Aegis256X2::<16>::new(&self.sending_key, &nonce).encrypt_in_place(plaintext, &[]);
             #[allow(clippy::indexing_slicing)]
             {
                 data[payload_len..payload_len + AEAD_SIZE].copy_from_slice(&tag);
@@ -285,7 +286,7 @@ impl Session {
             let tag: [u8; AEAD_SIZE] = tag.try_into().map_err(|_| WireGuardError::InvalidLength)?;
             let out = dst.get_mut(..pt_len).ok_or(WireGuardError::InvalidLength)?;
             out.copy_from_slice(ct);
-            Aegis256::<16>::new(&self.receiving_key, &nonce)
+            Aegis256X2::<16>::new(&self.receiving_key, &nonce)
                 .decrypt_in_place(out, &tag, &[])
                 .map_err(|_| WireGuardError::InvalidAeadTag)?;
             out
@@ -360,7 +361,7 @@ impl Session {
             let tag: [u8; AEAD_SIZE] = tag.try_into().map_err(|_| WireGuardError::InvalidLength)?;
             let out = dst.get_mut(..pt_len).ok_or(WireGuardError::InvalidLength)?;
             out.copy_from_slice(ct);
-            Aegis256::<16>::new(decrypt_key, &nonce)
+            Aegis256X2::<16>::new(decrypt_key, &nonce)
                 .decrypt_in_place(out, &tag, &[])
                 .map_err(|_| WireGuardError::InvalidAeadTag)?;
             out
@@ -381,73 +382,68 @@ pub fn message_data_len(plain_text_len: usize) -> usize {
 mod tests {
     use super::*;
 
-    /// Interop gate: prove `rust-aegis` (the cipher NepTUN uses) produces byte-identical output to
-    /// the NordLynx kernel module's bundled zinc AEGIS-256. Both implement IETF
-    /// draft-irtf-cfrg-aegis-aead, so these are the exact vectors from the kernel's
-    /// `crypto/zinc/selftest/aegis256.c` (tv1 + tv3). If this passes, a NepTUN↔kernel-AEGIS
-    /// tunnel will agree on the wire.
+    /// Interop gate: prove `rust-aegis` (the cipher NepTUN uses) produces the AEGIS-256X2 output
+    /// mandated by IETF draft-irtf-cfrg-aegis-aead. These are the draft's official AEGIS-256X2
+    /// Test Vector 1 and Test Vector 2 tags. The NordLynx kernel module's *implementation* is
+    /// standard and produces these same bytes (verified by running its VAES code directly), so a
+    /// NepTUN↔kernel-AEGIS256X2 tunnel agrees on the wire. (NB: the kernel's bundled
+    /// `crypto/zinc/selftest/aegis256x2.c` has a mis-transcribed TV2 constant — `94a3bd44…`
+    /// instead of the correct `635d3918…` — which makes the kernel's own self-test fail at load;
+    /// that is a kernel-side test-vector bug, not a cipher incompatibility.) We mirror the kernel
+    /// selftest shape: assert the tag, then a decrypt round-trip recovers the plaintext.
     #[test]
-    fn aegis256_matches_kernel_ietf_vectors() {
-        use aegis::aegis256::Aegis256;
+    fn aegis256x2_matches_ietf_vectors() {
+        use aegis::aegis256x2::Aegis256X2;
 
-        // Common key/nonce (draft §"AEGIS-256 Test Vectors").
+        // Common key/nonce: key = 0x00..=0x1f, nonce = 0x10..=0x2f (draft AEGIS-256X2 vectors).
         let mut key = [0u8; 32];
-        key[0] = 0x10;
-        key[1] = 0x01;
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = i as u8;
+        }
         let mut nonce = [0u8; 32];
-        nonce[0] = 0x10;
-        nonce[2] = 0x02;
+        for (i, b) in nonce.iter_mut().enumerate() {
+            *b = (0x10 + i) as u8;
+        }
 
-        // tv1: empty AD, 16 zero bytes of plaintext.
-        let mut buf = [0u8; 16];
-        let tag = Aegis256::<16>::new(&key, &nonce).encrypt_in_place(&mut buf, &[]);
-        assert_eq!(
-            buf,
-            [
-                0x75, 0x4f, 0xc3, 0xd8, 0xc9, 0x73, 0x24, 0x6d, 0xcc, 0x6d, 0x74, 0x14, 0x12, 0xa4,
-                0xb2, 0x36
-            ],
-            "tv1 ciphertext mismatch (rust-aegis vs kernel)"
-        );
+        // tv1: empty AD, empty message — tag only.
+        let mut buf: [u8; 0] = [];
+        let tag = Aegis256X2::<16>::new(&key, &nonce).encrypt_in_place(&mut buf, &[]);
         assert_eq!(
             tag,
             [
-                0x3f, 0xe9, 0x19, 0x94, 0x76, 0x8b, 0x33, 0x2e, 0xd7, 0xf5, 0x70, 0xa1, 0x9e, 0xc5,
-                0x89, 0x6e
+                0x62, 0xcd, 0xba, 0xb0, 0x84, 0xc8, 0x3d, 0xac, 0xdb, 0x94, 0x5b, 0xb4, 0x46, 0xf0,
+                0x49, 0xc8
             ],
             "tv1 tag mismatch (rust-aegis vs kernel)"
         );
 
-        // tv3: 8-byte AD, 32-byte plaintext = 0x00..=0x1f.
-        let ad: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-        let mut msg = [0u8; 32];
+        // tv2: 8-byte AD = 0102030401020304, 120-byte message = repeated 0x04 0x05 0x06 0x07.
+        let ad: [u8; 8] = [0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x03, 0x04];
+        let mut msg = [0u8; 120];
         for (i, b) in msg.iter_mut().enumerate() {
-            *b = i as u8;
+            *b = (0x04 + (i % 4)) as u8;
         }
-        let tag3 = Aegis256::<16>::new(&key, &nonce).encrypt_in_place(&mut msg, &ad);
+        let plaintext = msg;
+        let tag2 = Aegis256X2::<16>::new(&key, &nonce).encrypt_in_place(&mut msg, &ad);
         assert_eq!(
-            msg,
+            tag2,
             [
-                0xf3, 0x73, 0x07, 0x9e, 0xd8, 0x4b, 0x27, 0x09, 0xfa, 0xee, 0x37, 0x35, 0x84, 0x58,
-                0x5d, 0x60, 0xac, 0xcd, 0x19, 0x1d, 0xb3, 0x10, 0xef, 0x5d, 0x8b, 0x11, 0x83, 0x3d,
-                0xf9, 0xde, 0xc7, 0x11
+                0x63, 0x5d, 0x39, 0x18, 0x28, 0x52, 0x0b, 0xf1, 0x51, 0x27, 0x63, 0xf0, 0xc8, 0xf5,
+                0xcd, 0xbd
             ],
-            "tv3 ciphertext mismatch (rust-aegis vs kernel)"
+            "tv2 tag mismatch (rust-aegis vs IETF draft)"
         );
-        assert_eq!(
-            tag3,
-            [
-                0x8d, 0x86, 0xf9, 0x1e, 0xe6, 0x06, 0xe9, 0xff, 0x26, 0xa0, 0x1b, 0x64, 0xcc, 0xbd,
-                0xd9, 0x1d
-            ],
-            "tv3 tag mismatch (rust-aegis vs kernel)"
-        );
+        // Round-trip: decrypting the ciphertext with the same key/nonce/AD recovers the plaintext.
+        Aegis256X2::<16>::new(&key, &nonce)
+            .decrypt_in_place(&mut msg, &tag2, &ad)
+            .expect("tv2 decrypt failed");
+        assert_eq!(msg, plaintext, "tv2 round-trip plaintext mismatch");
     }
 
-    /// AEGIS-256 transport round-trip through a real `Session` pair (encrypt with one, decrypt
+    /// AEGIS-256X2 transport round-trip through a real `Session` pair (encrypt with one, decrypt
     /// with the matching key on the peer).
     #[test]
-    fn aegis256_session_roundtrip() {
+    fn aegis256x2_session_roundtrip() {
         let key_a = [0x11u8; 32]; // A's sending == B's receiving
         let key_b = [0x22u8; 32]; // B's sending == A's receiving
         let a = Session::new(1, 2, key_b, key_a).unwrap();

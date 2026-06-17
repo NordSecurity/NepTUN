@@ -90,10 +90,10 @@ const HANDSHAKE_RESP: MessageType = 2;
 const COOKIE_REPLY: MessageType = 3;
 const DATA: MessageType = 4;
 
-/// PoC: AEGIS-256 cipher suite id, carried in header byte 1 (the first WireGuard reserved-zero
-/// byte) to interop with the NordLynx kernel module's `WG_CRYPTO_SUITE_AEGIS256`. This build
-/// speaks AEGIS-256 only — packets are written with, and required to carry, this byte.
-const CRYPTO_SUITE_AEGIS256: u8 = 1;
+/// PoC: AEGIS-256X2 cipher suite id, carried in header byte 1 (the first WireGuard reserved-zero
+/// byte) to interop with the NordLynx kernel module's `WG_CRYPTO_SUITE_AEGIS256X2`. This build
+/// speaks AEGIS-256X2 only — packets are written with, and required to carry, this byte.
+const CRYPTO_SUITE_AEGIS256X2: u8 = 2;
 
 const HANDSHAKE_INIT_SZ: u64 = 148;
 const HANDSHAKE_RESP_SZ: u64 = 92;
@@ -151,7 +151,7 @@ impl Tunn {
             return Err(WireGuardError::InvalidPacket);
         }
 
-        // PoC AEGIS-256 wire format: header byte 0 = message type, byte 1 = crypto suite.
+        // PoC AEGIS-256X2 wire format: header byte 0 = message type, byte 1 = crypto suite.
         // The suite byte is ONLY carried on HANDSHAKE messages (the NordLynx kernel negotiates the
         // suite there). DATA packets leave it zero — the kernel's send.c writes only
         // `type = MESSAGE_DATA` (`04 00 00 00`) and decrypts using the negotiated keypair's suite,
@@ -159,7 +159,7 @@ impl Tunn {
         // the reserved bytes (else we'd drop the kernel's `04 00 00 00` data packets).
         let packet_type = src[0] as u32;
         if matches!(packet_type, HANDSHAKE_INIT | HANDSHAKE_RESP)
-            && (src[1] != CRYPTO_SUITE_AEGIS256 || src[2] != 0 || src[3] != 0)
+            && (src[1] != CRYPTO_SUITE_AEGIS256X2 || src[2] != 0 || src[3] != 0)
         {
             return Err(WireGuardError::InvalidPacket);
         }
