@@ -302,6 +302,13 @@ struct HandshakeInitSentState {
     local_index: u32,
     hash: [u8; KEY_LEN],
     chaining_key: [u8; KEY_LEN],
+    // For the debug / research purposes only:
+    // Normally, `ReusableSecret` is used, which intentionally does not expose its bytes.
+    // Setting the `neptun_keylog` build-time cfg replaces it with `StaticSecret`, that
+    // allows for dumping the ephemeral private keys for the session.
+    #[cfg(neptun_keylog)]
+    ephemeral_private: x25519_dalek::StaticSecret,
+    #[cfg(not(neptun_keylog))]
     ephemeral_private: x25519::ReusableSecret,
     time_sent: Instant,
 }
@@ -766,6 +773,33 @@ impl Handshake {
         Ok(dst)
     }
 
+    // For the debug / research purposes only:
+    // This helper function creates an ephemeral private key and also dumps it to the file
+    // specified in the NEPTUN_KEYLOG env var.
+    #[cfg(neptun_keylog)]
+    fn create_and_dump_ephemeral_private(&self) -> x25519_dalek::StaticSecret {
+        let ephemeral_private = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        if let Ok(path) = std::env::var("NEPTUN_KEYLOG") {
+            use base64::Engine as _;
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(&path)
+            {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let _ = writeln!(
+                    f,
+                    "LOCAL_STATIC_PRIVATE_KEY={}\n\
+                    REMOTE_STATIC_PUBLIC_KEY={}\n\
+                    LOCAL_EPHEMERAL_PRIVATE_KEY={}\n",
+                    b64.encode(self.params.static_private.to_bytes()),
+                    b64.encode(self.params.peer_static_public.as_bytes()),
+                    b64.encode(ephemeral_private.to_bytes()),
+                );
+            }
+        }
+        ephemeral_private
+    }
+
     pub(super) fn format_handshake_initiation<'a>(
         &mut self,
         dst: &'a mut [u8],
@@ -788,7 +822,14 @@ impl Handshake {
         let mut hash = INITIAL_CHAIN_HASH;
         hash = b2s_hash(&hash, self.params.peer_static_public.as_bytes());
         // initiator.ephemeral_private = DH_GENERATE()
+
+        // For the debug / research purposes only:
+        // Dumps created ephemeral private keys to the file specified by NEPTUN_KEYLOG env var
+        #[cfg(neptun_keylog)]
+        let ephemeral_private = self.create_and_dump_ephemeral_private();
+        #[cfg(not(neptun_keylog))]
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+
         // msg.message_type = 1
         // msg.reserved_zero = { 0, 0, 0 }
         message_type.copy_from_slice(&super::HANDSHAKE_INIT.to_le_bytes());
@@ -879,7 +920,14 @@ impl Handshake {
         let (encrypted_nothing, _) = rest.split_at_mut(16);
 
         // responder.ephemeral_private = DH_GENERATE()
+
+        // For the debug / research purposes only:
+        // Dumps created ephemeral private keys to the file specified by NEPTUN_KEYLOG env var
+        #[cfg(neptun_keylog)]
+        let ephemeral_private = self.create_and_dump_ephemeral_private();
+        #[cfg(not(neptun_keylog))]
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(OsRng);
+
         let local_index = self.inc_index();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }

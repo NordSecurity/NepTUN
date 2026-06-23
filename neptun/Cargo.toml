@@ -18,6 +18,9 @@ device = ["socket2", "thiserror"]
 mock-instant = ["mock_instant"]
 xray = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(neptun_keylog)'] }
+
 [dependencies]
 base64 = "0.22.1"
 zeroize = { version = "1.8.2", features = ["derive"] }
