@@ -755,7 +755,7 @@ mod tests {
         REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
     };
     #[cfg(feature = "mock-instant")]
-    use mock_instant::MockClock;
+    use mock_instant::thread_local::MockClock;
 
     use super::*;
     use rand_core::{OsRng, RngCore};
@@ -1083,7 +1083,7 @@ mod tests {
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
         assert!(matches!(packet, Packet::HandshakeInit(_)));
 
-        mock_instant::MockClock::advance(REKEY_TIMEOUT.into());
+        mock_instant::thread_local::MockClock::advance(REKEY_TIMEOUT.into());
         update_timer_results_in_handshake(&mut my_tun)
     }
 

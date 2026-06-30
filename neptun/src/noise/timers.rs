@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use base64::{engine::general_purpose, Engine};
 #[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
+use mock_instant::thread_local::Instant;
 use x25519_dalek::PublicKey;
 
 #[cfg(not(any(

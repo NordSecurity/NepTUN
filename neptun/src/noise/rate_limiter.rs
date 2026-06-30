@@ -6,7 +6,7 @@ use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 
 #[cfg(feature = "mock-instant")]
-use mock_instant::Instant;
+use mock_instant::thread_local::Instant;
 use std::net::IpAddr;
 
 #[cfg(not(feature = "mock-instant"))]
