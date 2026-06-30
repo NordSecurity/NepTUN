@@ -21,33 +21,33 @@ docker-tests = []
 
 [dependencies]
 base64 = "0.22.1"
-zeroize = { version = "1.8.2", features = ["derive"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 hex = { version = "0.4" }
 untrusted = "0.9.0"
 libc = { version = "0.2", default-features = false }
 parking_lot = "0.12"
-tracing =  { version = "0.1.29", default-features = false }
+tracing =  { version = "0.1.44", default-features = false }
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
-ring = { version = "0.17.5", default-features = false }
+ring = { version = "0.17.14", default-features = false }
 x25519-dalek = { version = "=2.0.1", features = ["reusable_secrets", "static_secrets"], default-features = false }
-rand_core = { version = "0.6.3", features = ["getrandom"], default-features = false }
-chacha20poly1305 = { features = ["alloc"], default-features = false, version = "0.10.0-pre.1" }
-aead = { version = "0.5.0-pre.2", default-features = false }
+rand_core = { version = "0.6.4", features = ["getrandom"], default-features = false }
+chacha20poly1305 = { features = ["alloc"], default-features = false, version = "0.10" }
+aead = { version = "0.5", default-features = false }
 blake2 = { version = "0.10", default-features = false }
 hmac = "0.12"
-mock_instant = { version = "0.2", optional = true }
+mock_instant = { version = "0.6", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
-thiserror = { version = "1", optional = true }
-num_cpus = "1.16.0"
+thiserror = { version = "2", optional = true }
+num_cpus = "1.17.0"
 subtle = "2.6.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
 dispatch = { git = "https://github.com/NordSecurity/rust-dispatch.git", rev = "13447cd7221a74ebcce1277ae0cfc9a421a28ec5" }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", default-features = false, features = [
+nix = { version = "0.31", default-features = false, features = [
     "ioctl",
     "time",
     "user",
@@ -55,12 +55,12 @@ nix = { version = "0.29", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-etherparse = "0.12"
+etherparse = "0.20"
 tracing-subscriber = "0.3"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 rand = "0.10"
 tokio = { version = ">=1.22", features = ["rt", "net", "sync", "macros"] }
-test-log = { version = "0.2.17", features = ["trace"] }
+test-log = { version = "0.2.21", features = ["trace"] }
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]
