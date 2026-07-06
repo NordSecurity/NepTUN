@@ -43,7 +43,7 @@ num_cpus = "1.16.0"
 subtle = "2.6.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
-dispatch = { git = "https://github.com/NordSecurity/rust-dispatch.git", rev = "13447cd7221a74ebcce1277ae0cfc9a421a28ec5" }
+dispatch2 = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", default-features = false, features = [

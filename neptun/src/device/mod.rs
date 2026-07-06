@@ -40,7 +40,9 @@ use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::mem::{swap, MaybeUninit};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::mem::swap;
+use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
@@ -49,6 +51,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tun::TunSocket;
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+use dispatch2::{
+    DispatchGroup, DispatchQueue, DispatchQueueGlobalPriority, DispatchRetained, DispatchTime,
+    GlobalQueueIdentifier,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use {
@@ -132,7 +140,7 @@ pub struct DeviceHandle {
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    threads: (dispatch::Group, Vec<dispatch::Queue>),
+    threads: DispatchRetained<DispatchGroup>,
     sockets_to_close: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
 
@@ -224,7 +232,7 @@ type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<Arc<TunSocket>
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type EventLoopThreads = Result<
     (
-        (dispatch::Group, Vec<dispatch::Queue>),
+        DispatchRetained<DispatchGroup>,
         Arc<Lock<Vec<Arc<TunSocket>>>>,
     ),
     Error,
@@ -260,21 +268,20 @@ impl DeviceHandle {
         let sockets_to_close = Arc::new(Lock::new(vec![]));
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let threads = {
-            let group = dispatch::Group::create();
-            let mut queues = vec![];
+            let group = DispatchGroup::new();
+            // `global_queue` returns a shared singleton, so fetch it once.
+            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
+                DispatchQueueGlobalPriority::High,
+            ));
             for i in 0..n_threads {
-                queues.push({
-                    let dev = Arc::clone(&interface_lock);
-                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
-                    sockets_to_close
-                        .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                    let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
-                    group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
-                    queue
-                });
+                let dev = Arc::clone(&interface_lock);
+                let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
+                sockets_to_close
+                    .read()
+                    .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
+                group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
             }
-            (group, queues)
+            group
         };
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -337,7 +344,7 @@ impl DeviceHandle {
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     pub fn wait(&mut self) {
-        self.threads.0.wait();
+        let _ = self.threads.wait(DispatchTime::FOREVER);
     }
 
     pub fn clean(&mut self) {
@@ -351,11 +358,11 @@ impl DeviceHandle {
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safelly cleared.
         // See clear_event_by_fd() function description
-        let mut threads = vec![];
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        swap(&mut threads, &mut self.threads);
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-        swap(&mut threads, &mut self.threads.1);
+        {
+            let mut threads = vec![];
+            swap(&mut threads, &mut self.threads);
+        }
         self.device
             .read()
             .try_writeable(
@@ -633,11 +640,29 @@ impl Device {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<Device, Error> {
-        let poll = EventPoll::<Handler>::new()?;
-
         // Create a tunnel device
         let iface = Arc::new(tun.set_non_blocking()?);
         let mtu = iface.mtu()?;
+        Self::new_with_iface(iface, mtu, config)
+    }
+
+    #[cfg(all(test, any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) fn new_with_mock_tun(
+        tun: TunSocket,
+        mtu: usize,
+        config: DeviceConfig,
+    ) -> Result<Device, Error> {
+        let iface = Arc::new(tun.set_non_blocking()?);
+        Self::new_with_iface(iface, mtu, config)
+    }
+
+    fn new_with_iface(
+        iface: Arc<TunSocket>,
+        mtu: usize,
+        config: DeviceConfig,
+    ) -> Result<Device, Error> {
+        let poll = EventPoll::<Handler>::new()?;
+
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let workers = PacketWorkers::new(&config);
 
@@ -1443,5 +1468,51 @@ mod tests {
         let mtu = 1420;
         let checked = CheckedMtu::new(mtu).unwrap();
         assert_eq!(checked.get(), mtu);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn start_event_loop_threads_starts_one_loop_per_thread() {
+        use std::convert::TryFrom;
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        const N_THREADS: usize = 4;
+        const MOCK_MTU: usize = 1420;
+
+        // `_far` keeps the socket's peer end open; `near` backs the TunSocket.
+        let (near, _far) = UnixStream::pair().unwrap();
+        let tun = TunSocket::new_from_fd(near.into_raw_fd()).unwrap();
+
+        let config = DeviceConfig {
+            n_threads: N_THREADS,
+            use_connected_socket: false,
+            open_uapi_socket: false,
+            protect: Arc::new(MakeExternalNeptunNoop),
+            firewall_process_inbound_callback: None,
+            firewall_process_outbound_callback: None,
+            skt_buffer_size: None,
+            inter_thread_channel_size: None,
+            max_inter_thread_batched_pkts: None,
+        };
+
+        let device = Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap();
+        let interface_lock = Arc::new(Lock::new(device));
+
+        let (threads, sockets_to_close) =
+            DeviceHandle::start_event_loop_threads(N_THREADS, Arc::clone(&interface_lock)).unwrap();
+
+        // One `sockets_to_close` entry per thread confirms all loops started.
+        assert_eq!(sockets_to_close.read().len(), N_THREADS);
+
+        // Bounded wait: a regression fails the assertion instead of hanging.
+        interface_lock.read().trigger_exit();
+        assert!(
+            threads
+                .wait(DispatchTime::try_from(Duration::from_secs(10)).unwrap())
+                .is_ok(),
+            "event loops did not exit"
+        );
     }
 }
