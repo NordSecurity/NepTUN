@@ -2,8 +2,7 @@
 //!
 //! On non-Apple targets, packet processing crosses thread boundaries: the
 //! event-loop handlers read packets and dispatch batches through bounded
-//! channels to dedicated worker threads that perform the actual encryption
-//! and write to the network or tunnel. This module owns the channels, the
+//! channels to dedicated worker threads. This module owns the channels, the
 //! batch types, and the worker thread bodies.
 //!
 //! Apple targets process packets inline and do not use this module at all.
@@ -16,12 +15,14 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 
 use super::{
-    encapsulate_and_send, read_packet, Action, CheckedMtu, DeviceConfig, IfaceReadResult,
-    MAX_PKT_SIZE, WG_HEADER_OFFSET,
+    encapsulate_and_send, read_packet, send_to_peer, Action, CheckedMtu, DeviceConfig,
+    IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
 };
 use crate::device::allowed_ips::AllowedIps;
+use crate::device::packet_slot::{PacketSlot, SlotState};
 use crate::device::peer::Peer;
 use crate::device::tun::TunSocket;
+use crate::noise::{ReservedNonce, TunnResult};
 
 const CHANNEL_SIZE: usize = 500;
 const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
@@ -44,6 +45,20 @@ struct NetworkTaskData {
     buf_len: usize,
     peer: Arc<Peer>,
     iface: Arc<TunSocket>,
+    /// The AEAD nonce reserved for this packet at staging time together with the slot
+    /// in the order tracking queue for send.
+    reserved: Option<(ReservedNonce, Arc<PacketSlot>)>,
+}
+
+impl NetworkTaskData {
+    /// Resolve this task's ordering slot without encrypting or sending anything, and
+    /// immediately drop any `Failed` slots currently at the head of the peer's queue.
+    fn abandon(&self) {
+        if let Some((_, slot)) = &self.reserved {
+            slot.set_state(SlotState::Failed);
+            self.peer.tx_queue.drain_failed_head();
+        }
+    }
 }
 
 pub(super) struct TunnelWorkerData {
@@ -155,6 +170,12 @@ impl PacketWorkers {
                 BatchResult::Continue | BatchResult::Exhausted => {
                     if let Err(e) = self.tunnel_to_socket_tx.send(batched_pkts) {
                         tracing::warn!("Unable to forward data onto network worker {e}");
+                        // The staged slots have already been pushed onto their peers' queues and leaving them `Unencrypted`
+                        // would make subsequent packets stall
+                        let batch = e.into_inner();
+                        for element in &batch {
+                            element.abandon();
+                        }
                     }
                     if matches!(result, BatchResult::Exhausted) {
                         break;
@@ -191,11 +212,21 @@ fn read_iface_batch(
             IfaceReadResult::Skip => continue,
             IfaceReadResult::Packet { payload, peer } => {
                 let len = payload.len();
+
+                // Reserve the nonce and push the ordering slot, so that the order in which packets are sent
+                // per each peer is the same order in which the packets were read off the tun device
+                let reserved = peer.tunnel.lock().reserve_send_nonce().map(|reserved| {
+                    let slot = Arc::new(PacketSlot::new());
+                    peer.tx_queue.push(slot.clone());
+                    (reserved, slot)
+                });
+
                 batched_pkts.push(NetworkTaskData {
                     data: buffer,
                     buf_len: len,
                     peer,
                     iface: iface.clone(),
+                    reserved,
                 });
             }
         }
@@ -220,17 +251,46 @@ fn write_to_socket_worker(
                     for element in batched_pkts.iter_mut() {
                         let len = element.buf_len;
 
-                        if let Some(callback) = &firewall_process_outbound_callback {
-                            let buffer = match element.data.get_mut(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
-                                continue;
+                        let firewall_passed = match &firewall_process_outbound_callback {
+                            Some(callback) => {
+                                match element.data.get_mut(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                                    Some(buffer) => callback(
+                                        &element.peer.public_key.0,
+                                        buffer,
+                                        &mut element.iface.as_ref(),
+                                    ),
+                                    None => false,
+                                }
                             }
+                            None => true,
+                        };
+
+                        if !firewall_passed {
+                            // A packet dropped here must still resolve its slot to prevent a stall
+                            if let Some((_, slot)) = &element.reserved {
+                                slot.set_state(SlotState::Failed);
+                                commit_ready(&element.peer, &udp4, &udp6);
+                            }
+                            continue;
                         }
 
-                        encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6);
+                        match &element.reserved {
+                            Some((reserved, slot)) => {
+                                encrypt_into_slot(
+                                    &element.peer,
+                                    &mut element.data[..],
+                                    len,
+                                    reserved,
+                                    slot,
+                                );
+
+                                // Make an attempt to become a committer for this peer and flush ready slots from the queue
+                                commit_ready(&element.peer, &udp4, &udp6);
+                            }
+                            None => {
+                                encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6);
+                            }
+                        }
                     }
                 }
             }
@@ -239,6 +299,54 @@ fn write_to_socket_worker(
             }
         }
     }
+}
+
+/// Attempts to become a peer's committer and drain ready slots from the queue,
+/// stopping at the first slot that's still `Unencrypted` (or an empty queue).
+fn commit_ready(peer: &Arc<Peer>, udp4: &socket2::Socket, udp6: &socket2::Socket) {
+    peer.tx_queue.drain_ready(|slot| {
+        slot.with_state(|state| {
+            if let SlotState::Encrypted { buffer, len } = state {
+                send_to_peer(peer, &buffer[..*len], udp4, udp6);
+            }
+        })
+    });
+}
+
+/// Encrypts a packet using the nonce reserved for it at staging time, and stores the result in
+/// its `PacketSlot`.
+fn encrypt_into_slot(
+    peer: &Arc<Peer>,
+    buf: &mut [u8],
+    payload_len: usize,
+    reserved: &ReservedNonce,
+    slot: &Arc<PacketSlot>,
+) {
+    let res = {
+        let mut tun = peer.tunnel.lock();
+        tun.encapsulate_with_reserved_nonce(reserved, payload_len, buf)
+    };
+
+    let state = match res {
+        TunnResult::WriteToNetwork(packet) => {
+            let mut buffer = [0u8; MAX_PKT_SIZE];
+            let len = packet.len();
+            match buffer.get_mut(..len) {
+                Some(dst) => {
+                    dst.copy_from_slice(packet);
+                    SlotState::Encrypted { buffer, len }
+                }
+                None => SlotState::Failed,
+            }
+        }
+        TunnResult::Err(e) => {
+            tracing::error!(message = "Encapsulation error", error = ?e, public_key = peer.public_key.1);
+            SlotState::Failed
+        }
+        TunnResult::Done | TunnResult::WriteToTunnel(..) => SlotState::Failed,
+    };
+
+    slot.set_state(state);
 }
 
 fn write_to_tun_worker(

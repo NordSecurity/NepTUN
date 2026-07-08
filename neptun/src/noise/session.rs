@@ -199,11 +199,32 @@ impl Session {
         ret
     }
 
+    /// Atomically sets the nonce for the next packet
+    pub(super) fn reserve_send_nonce(&self) -> u64 {
+        self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64
+    }
+
     /// payload_len - length of data available in packet_buffer
     /// packet_buffer - pre-allocated space containing the payload, to be replaced by encrypted UDP packet to send over the network
     /// returns the size of the formatted packet
     pub(super) fn format_packet_data<'a>(
         &self,
+        payload_len: usize,
+        packet_buffer: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        let sending_key_counter = self.reserve_send_nonce();
+        self.format_packet_data_with_nonce(sending_key_counter, payload_len, packet_buffer)
+    }
+
+    /// Same as `format_packet_data`, but uses a pre-reserved nonce earlier
+    ///
+    /// sending_key_counter - AEAD nonce reserved via `reserve_send_nonce`
+    /// payload_len - length of data available in packet_buffer
+    /// packet_buffer - pre-allocated space containing the payload, to be replaced by encrypted UDP packet to send over the network
+    /// returns the size of the formatted packet
+    pub(super) fn format_packet_data_with_nonce<'a>(
+        &self,
+        sending_key_counter: u64,
         payload_len: usize,
         packet_buffer: &'a mut [u8],
     ) -> Result<&'a mut [u8], WireGuardError> {
@@ -215,8 +236,6 @@ impl Session {
             );
             return Err(WireGuardError::IncorrectPacketLength);
         }
-
-        let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
         let (message_type, rest) = packet_buffer.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);

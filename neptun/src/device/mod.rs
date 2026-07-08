@@ -25,6 +25,8 @@ pub mod tun;
 pub mod tun;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+mod packet_slot;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 mod packet_workers;
 
 use crate::noise::errors::WireGuardError;
@@ -1317,45 +1319,54 @@ fn encapsulate_and_send(
                 error = ?e,
                 public_key = peer.public_key.1);
         }
-        TunnResult::WriteToNetwork(packet) => {
-            let endpoint = peer.endpoint();
-            if let Some(conn) = endpoint.conn.as_ref() {
-                match conn.send(packet) {
-                    Ok(_) => {
-                        tracing::trace!(
-                            "Pkt -> ConnSock ({:?}), len: {}",
-                            endpoint.addr,
-                            packet.len()
-                        );
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
-                    }
-                    Err(err) => {
-                        tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                        drop(endpoint);
-                        peer.shutdown_endpoint();
-                    }
-                }
-            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                } else {
-                    tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
-                }
-            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                } else {
-                    tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
-                }
-            } else {
-                tracing::error!("No endpoint");
-            }
-        }
+        TunnResult::WriteToNetwork(packet) => send_to_peer(peer, packet, udp4, udp6),
         _ => {
             tracing::error!("Unexpected result from encapsulate");
         }
+    }
+}
+
+/// Sends an encrypted packet to a peer's endpoint (connected socket if one exists, shared v4/v6
+/// UDP socket otherwise).
+pub(super) fn send_to_peer(
+    peer: &Arc<Peer>,
+    packet: &[u8],
+    udp4: &socket2::Socket,
+    udp6: &socket2::Socket,
+) {
+    let endpoint = peer.endpoint();
+    if let Some(conn) = endpoint.conn.as_ref() {
+        match conn.send(packet) {
+            Ok(_) => {
+                tracing::trace!(
+                    "Pkt -> ConnSock ({:?}), len: {}",
+                    endpoint.addr,
+                    packet.len()
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
+            }
+            Err(err) => {
+                tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                drop(endpoint);
+                peer.shutdown_endpoint();
+            }
+        }
+    } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+        if let Err(err) = udp4.send_to(packet, &addr.into()) {
+            tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+        } else {
+            tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
+        }
+    } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+        if let Err(err) = udp6.send_to(packet, &addr.into()) {
+            tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
+        } else {
+            tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
+        }
+    } else {
+        tracing::error!("No endpoint");
     }
 }
 

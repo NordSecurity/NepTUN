@@ -60,12 +60,26 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
     }
 }
 
+/// An AEAD nonce reserved from a specific session, ahead of the actual packet encryption
+///
+/// The reservation pins the exact `Session` so that:
+///   * the session cannot be dropped while a reserved nonce is still outstanding
+///   * `encapsulate_with_reserved_nonce` cannot accidentally encrypt with a different
+///     session that happens to occupy the same ring slot after rotation
+#[derive(Debug, Clone)]
+pub struct ReservedNonce {
+    session: Arc<session::Session>,
+    nonce: u64,
+}
+
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     /// The handshake currently in progress
     handshake: handshake::Handshake,
-    /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
-    sessions: [Option<session::Session>; N_SESSIONS],
+    /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS.
+    /// Wrapped in `Arc` so that outstanding `ReservedNonce` handles can keep a session
+    /// alive across ring rotation.
+    sessions: [Option<Arc<session::Session>>; N_SESSIONS],
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
@@ -337,6 +351,51 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
+    /// Reserves the next AEAD nonce from the current session.
+    ///
+    /// Returns `None` if there is no established session.
+    pub fn reserve_send_nonce(&mut self) -> Option<ReservedNonce> {
+        let idx = self.current % N_SESSIONS;
+        #[allow(clippy::indexing_slicing)]
+        let session = self.sessions[idx].as_ref()?;
+        let nonce = session.reserve_send_nonce();
+        Some(ReservedNonce {
+            session: Arc::clone(session),
+            nonce,
+        })
+    }
+
+    /// Encrypts `src_len` bytes of `dst` using a nonce previously obtained from
+    /// `reserve_send_nonce`.
+    ///
+    /// Note: if the session has been "soft-purged" (e.g. by `set_static_private` or
+    /// `set_preshared_key`) between reservation and this call, encryption still succeeds with the
+    /// old key. The peer will drop such packets.
+    pub fn encapsulate_with_reserved_nonce<'a>(
+        &mut self,
+        reserved: &ReservedNonce,
+        src_len: usize,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        let packet =
+            match reserved
+                .session
+                .format_packet_data_with_nonce(reserved.nonce, src_len, dst)
+            {
+                Ok(packet) => packet,
+                Err(e) => return TunnResult::Err(e),
+            };
+
+        self.timer_tick(TimerName::TimeLastPacketSent);
+
+        if src_len.ne(&0) {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+
+        self.tx_bytes += packet.len() as u64;
+        TunnResult::WriteToNetwork(packet)
+    }
+
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
@@ -450,7 +509,7 @@ impl Tunn {
         let index = session.local_index();
         #[allow(clippy::indexing_slicing)]
         {
-            self.sessions[index % N_SESSIONS] = Some(session);
+            self.sessions[index % N_SESSIONS] = Some(Arc::new(session));
         }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
@@ -487,7 +546,7 @@ impl Tunn {
         #[allow(clippy::indexing_slicing)]
         let index = {
             let idx = l_idx % N_SESSIONS;
-            self.sessions[idx] = Some(session);
+            self.sessions[idx] = Some(Arc::new(session));
             idx
         };
 
