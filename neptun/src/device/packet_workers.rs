@@ -22,10 +22,17 @@ use crate::device::allowed_ips::AllowedIps;
 use crate::device::packet_slot::{PacketSlot, SlotState};
 use crate::device::peer::Peer;
 use crate::device::tun::TunSocket;
+use crate::noise::errors::WireGuardError;
 use crate::noise::{ReservedNonce, TunnResult};
 
 const CHANNEL_SIZE: usize = 500;
 const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
+
+/// What a `PacketSlot` holds once a worker has encrypted it (`SlotState::Ready` for Tx side)
+pub type TxReady = ([u8; MAX_PKT_SIZE], usize);
+
+/// What a `PacketSlot` holds once a worker has decrypted it (`SlotState::Ready` for Rx side)
+pub type RxReady = ([u8; MAX_PKT_SIZE], usize, IpAddr);
 
 pub(super) struct PacketWorkers {
     pub max_batched_pkts: usize,
@@ -36,8 +43,12 @@ pub(super) struct PacketWorkers {
     socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
     socket_to_tunnel_rx: Receiver<Vec<TunnelWorkerData>>,
 
+    decrypt_queue_tx: Sender<Vec<DecryptTaskData>>,
+    decrypt_queue_rx: Receiver<Vec<DecryptTaskData>>,
+
     close_network_worker_tx: Option<Sender<()>>,
     close_tun_worker_tx: Option<Sender<()>>,
+    close_decrypt_worker_tx: Option<Sender<()>>,
 }
 
 struct NetworkTaskData {
@@ -47,7 +58,7 @@ struct NetworkTaskData {
     iface: Arc<TunSocket>,
     /// The AEAD nonce reserved for this packet at staging time together with the slot
     /// in the order tracking queue for send.
-    reserved: Option<(ReservedNonce, Arc<PacketSlot>)>,
+    reserved: Option<(ReservedNonce, Arc<PacketSlot<TxReady>>)>,
 }
 
 impl NetworkTaskData {
@@ -69,6 +80,13 @@ pub(super) struct TunnelWorkerData {
     pub buf_len: usize,
 }
 
+/// A datagram staged for parallel decryption on a peer's connected socket,
+/// and its ordering slot its plaintext will land in.
+pub(super) struct DecryptTaskData {
+    pub worker_data: TunnelWorkerData,
+    pub slot: Arc<PacketSlot<RxReady>>,
+}
+
 enum BatchResult {
     Continue,
     Exhausted,
@@ -84,6 +102,7 @@ impl PacketWorkers {
         let channel_size = config.inter_thread_channel_size.unwrap_or(CHANNEL_SIZE);
         let (tunnel_to_socket_tx, tunnel_to_socket_rx) = crossbeam_channel::bounded(channel_size);
         let (socket_to_tunnel_tx, socket_to_tunnel_rx) = crossbeam_channel::bounded(channel_size);
+        let (decrypt_queue_tx, decrypt_queue_rx) = crossbeam_channel::bounded(channel_size);
 
         Self {
             max_batched_pkts,
@@ -91,8 +110,11 @@ impl PacketWorkers {
             tunnel_to_socket_rx,
             socket_to_tunnel_tx,
             socket_to_tunnel_rx,
+            decrypt_queue_tx,
+            decrypt_queue_rx,
             close_network_worker_tx: None,
             close_tun_worker_tx: None,
+            close_decrypt_worker_tx: None,
         }
     }
 
@@ -109,6 +131,13 @@ impl PacketWorkers {
                 tracing::error!("Unable to close tun thread {e}");
             }
         }
+        if let Some(close_decrypt_worker_tx) = &self.close_decrypt_worker_tx {
+            for _ in 0..num_cpus::get_physical() {
+                if let Err(e) = close_decrypt_worker_tx.try_send(()) {
+                    tracing::error!("Unable to close decrypt thread {e}");
+                }
+            }
+        }
     }
 
     pub fn start(
@@ -121,9 +150,12 @@ impl PacketWorkers {
         let (close_network_worker_tx, close_network_worker_rx) =
             crossbeam_channel::bounded(num_cpus::get_physical() * 5);
         let (close_tun_worker_tx, close_tun_worker_rx) = crossbeam_channel::bounded(5);
+        let (close_decrypt_worker_tx, close_decrypt_worker_rx) =
+            crossbeam_channel::bounded(num_cpus::get_physical() * 5);
 
         self.close_network_worker_tx = Some(close_network_worker_tx);
         self.close_tun_worker_tx = Some(close_tun_worker_tx);
+        self.close_decrypt_worker_tx = Some(close_decrypt_worker_tx);
 
         for _ in 0..num_cpus::get_physical() {
             let tunnel_to_socket_rx = self.tunnel_to_socket_rx.clone();
@@ -150,6 +182,21 @@ impl PacketWorkers {
         thread::spawn(move || {
             write_to_tun_worker(socket_to_tunnel_rx, close_tun_worker_rx, fw_callback)
         });
+
+        for _ in 0..num_cpus::get_physical() {
+            let decrypt_queue_rx = self.decrypt_queue_rx.clone();
+            let close_chan_clone = close_decrypt_worker_rx.clone();
+            let socket_to_tunnel_tx = self.socket_to_tunnel_tx.clone();
+            thread::spawn(move || {
+                decrypt_worker(decrypt_queue_rx, close_chan_clone, socket_to_tunnel_tx)
+            });
+        }
+    }
+
+    pub fn submit_for_decrypt(&self, batch: Vec<DecryptTaskData>) {
+        if let Err(e) = self.decrypt_queue_tx.send(batch) {
+            tracing::warn!("Unable to forward data onto decrypt worker {e}");
+        }
     }
 
     /// Reads packets from the iface in batches and dispatches each batch to the
@@ -185,14 +232,6 @@ impl PacketWorkers {
         }
 
         Action::Continue
-    }
-
-    /// Submit a batch of decapsulated packets to the inbound worker for
-    /// writing to the tun interface.
-    pub fn submit_inbound(&self, batch: Vec<TunnelWorkerData>) {
-        if let Err(e) = self.socket_to_tunnel_tx.send(batch) {
-            tracing::warn!("Unable to forward data onto tunnel worker {e}");
-        }
     }
 }
 
@@ -302,11 +341,11 @@ fn write_to_socket_worker(
 }
 
 /// Attempts to become a peer's committer and drain ready slots from the queue,
-/// stopping at the first slot that's still `Unencrypted` (or an empty queue).
+/// stopping at the first slot that's still `Pending` (or an empty queue).
 fn commit_ready(peer: &Arc<Peer>, udp4: &socket2::Socket, udp6: &socket2::Socket) {
     peer.tx_queue.drain_ready(|slot| {
         slot.with_state(|state| {
-            if let SlotState::Encrypted { buffer, len } = state {
+            if let SlotState::Ready((buffer, len)) = state {
                 send_to_peer(peer, &buffer[..*len], udp4, udp6);
             }
         })
@@ -320,7 +359,7 @@ fn encrypt_into_slot(
     buf: &mut [u8],
     payload_len: usize,
     reserved: &ReservedNonce,
-    slot: &Arc<PacketSlot>,
+    slot: &Arc<PacketSlot<TxReady>>,
 ) {
     let res = {
         let mut tun = peer.tunnel.lock();
@@ -334,7 +373,7 @@ fn encrypt_into_slot(
             match buffer.get_mut(..len) {
                 Some(dst) => {
                     dst.copy_from_slice(packet);
-                    SlotState::Encrypted { buffer, len }
+                    SlotState::Ready((buffer, len))
                 }
                 None => SlotState::Failed,
             }
@@ -392,4 +431,103 @@ fn write_to_tun_worker(
             }
         }
     }
+}
+
+fn decrypt_worker(
+    decrypt_queue_rx: Receiver<Vec<DecryptTaskData>>,
+    close_chan: Receiver<()>,
+    socket_to_tunnel_tx: Sender<Vec<TunnelWorkerData>>,
+) {
+    loop {
+        crossbeam_channel::select! {
+            recv(decrypt_queue_rx) -> batch => {
+                if let Ok(batch) = batch {
+                    for item in batch {
+                        let mut dst_buf = [0u8; MAX_PKT_SIZE];
+                        decrypt_into_slot(
+                            &item.worker_data.peer,
+                            item.worker_data.addr,
+                            &item.worker_data.buffer[..item.worker_data.buf_len],
+                            &mut dst_buf[..],
+                            &item.slot,
+                        );
+
+                        // Make an attempt to become a committer for this peer and flush ready slots from the queue
+                        rx_commit_ready(&item.worker_data.peer, &item.worker_data.iface, &socket_to_tunnel_tx);
+                    }
+                }
+            }
+            recv(close_chan) -> _n => {
+                break;
+            }
+        }
+    }
+}
+
+fn rx_commit_ready(
+    peer: &Arc<Peer>,
+    iface: &Arc<TunSocket>,
+    socket_to_tunnel_tx: &Sender<Vec<TunnelWorkerData>>,
+) {
+    peer.rx_queue.drain_ready(|slot| {
+        slot.with_state(|state| {
+            if let SlotState::Ready((buffer, len, addr)) = state {
+                let worker_data = TunnelWorkerData {
+                    buffer: *buffer,
+                    buf_len: *len,
+                    addr: *addr,
+                    iface: iface.clone(),
+                    peer: peer.clone(),
+                };
+                if let Err(e) = socket_to_tunnel_tx.send(vec![worker_data]) {
+                    tracing::warn!("Unable to forward data onto tunnel worker {e}");
+                }
+            }
+        });
+    });
+}
+
+fn decrypt_into_slot(
+    peer: &Arc<Peer>,
+    addr: IpAddr,
+    datagram: &[u8],
+    buf: &mut [u8],
+    slot: &Arc<PacketSlot<RxReady>>,
+) {
+    let res = {
+        let mut tun = peer.tunnel.lock();
+        tun.decapsulate(Some(addr), datagram, buf)
+    };
+
+    let state = match res {
+        TunnResult::WriteToTunnel(packet, addr) => {
+            let mut buffer = [0u8; MAX_PKT_SIZE];
+            let len = packet.len();
+            match buffer.get_mut(..len) {
+                Some(dst) => {
+                    dst.copy_from_slice(packet);
+                    SlotState::Ready((buffer, len, addr))
+                }
+                None => SlotState::Failed,
+            }
+        }
+        // TODO: come up with a better name maybe?
+        // A keepalive: decrypted successfully, nothing to deliver - not an error.
+        TunnResult::Done => SlotState::Failed,
+        TunnResult::Err(e) => {
+            match e {
+                WireGuardError::DuplicateCounter => {
+                    // TODO(LLT-6071): revert back to having error level for all error types
+                    tracing::debug!(message = "Decapsulate error", error = ?e, public_key = peer.public_key.1);
+                }
+                _ => {
+                    tracing::error!(message = "Decapsulate error", error = ?e, public_key = peer.public_key.1);
+                }
+            }
+            SlotState::Failed
+        }
+        _ => SlotState::Failed,
+    };
+
+    slot.set_state(state);
 }

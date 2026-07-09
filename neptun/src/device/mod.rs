@@ -55,7 +55,8 @@ use tun::TunSocket;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use {
     nix::sys::socket as NixSocket,
-    packet_workers::{PacketWorkers, TunnelWorkerData},
+    packet_slot::PacketSlot,
+    packet_workers::{DecryptTaskData, PacketWorkers, TunnelWorkerData},
     std::net::IpAddr,
     std::os::fd::{AsFd, BorrowedFd},
     std::thread::{self, JoinHandle},
@@ -1111,6 +1112,39 @@ impl Device {
                         };
 
                         if let Ok(read_bytes) = udp.recv(src_buf) {
+                            // Only real data packets go through the parallel-decrypt / ordering
+                            // pipeline. Handshake-related datagrams keep using the inline path
+                            // below.`decapsulate` below still re-parses and fully verifies
+                            // whatever it's given.
+                            #[allow(clippy::indexing_slicing)]
+                            let is_data_packet = matches!(
+                                Tunn::parse_incoming_packet(&t.src_buf[..read_bytes]),
+                                Ok(Packet::PacketData(_))
+                            );
+
+                            if is_data_packet {
+                                // Packet staging: pin decrypt-commit order to socket-read order
+                                let slot = Arc::new(PacketSlot::new());
+                                peer.rx_queue.push(slot.clone());
+
+                                let mut data = [0u8; MAX_PKT_SIZE];
+                                #[allow(clippy::indexing_slicing)]
+                                data[..read_bytes].copy_from_slice(&t.src_buf[..read_bytes]);
+
+                                batched_pkts.push(DecryptTaskData {
+                                    worker_data: TunnelWorkerData {
+                                        buffer: data,
+                                        peer: peer.clone(),
+                                        iface: t.iface.clone(),
+                                        addr: peer_addr,
+                                        buf_len: read_bytes,
+                                    },
+                                    slot,
+                                });
+
+                                continue;
+                            }
+
                             let mut flush = false;
                             let mut buffer = [0u8; MAX_PKT_SIZE];
                             let res = {
@@ -1145,15 +1179,11 @@ impl Device {
                                         tracing::warn!(message="Failed to write packet", error = ?err);
                                     }
                                 }
-                                TunnResult::WriteToTunnel(packet, addr) => {
-                                    let worker_data = TunnelWorkerData {
-                                        buf_len: packet.len(),
-                                        addr,
-                                        buffer,
-                                        iface: t.iface.clone(),
-                                        peer: peer.clone(),
-                                    };
-                                    batched_pkts.push(worker_data);
+                                TunnResult::WriteToTunnel(..) => {
+                                    // TODO: is WriteToTunnel still needed at all?
+                                    tracing::error!(
+                                        "Unexpected WriteToTunnel result from inline decapsulate"
+                                    );
                                 }
                             }
 
@@ -1180,7 +1210,7 @@ impl Device {
                         }
                     }
 
-                    d.workers.submit_inbound(batched_pkts);
+                    d.workers.submit_for_decrypt(batched_pkts);
 
                     if socket_buffer_exhausted {
                         break;

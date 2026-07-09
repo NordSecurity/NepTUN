@@ -12,7 +12,9 @@ use std::sync::Arc;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::device::modify_skt_buffer_size;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crate::device::packet_slot::PeerTxQueue;
+use crate::device::packet_slot::PacketQueue;
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::device::packet_workers::{RxReady, TxReady};
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 
@@ -39,7 +41,9 @@ pub struct Peer {
     protect: Arc<dyn MakeExternalNeptun>,
     /// Per-peer ordering queue
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    pub(super) tx_queue: PeerTxQueue,
+    pub(super) tx_queue: PacketQueue<TxReady>,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(super) rx_queue: PacketQueue<RxReady>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -95,7 +99,9 @@ impl Peer {
             preshared_key: RwLock::new(preshared_key),
             protect,
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            tx_queue: PeerTxQueue::new(),
+            tx_queue: PacketQueue::new(),
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+            rx_queue: PacketQueue::new(),
         }
     }
 

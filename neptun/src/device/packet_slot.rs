@@ -1,5 +1,5 @@
-//! Per-packet synchronization point for preserving per-peer packet send order after parallel
-//! encryption handled by workers.
+//! Per-packet synchronization point for preserving per-peer packet send/receive order after
+//! parallel encryption/decryption handled by workers.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -9,41 +9,36 @@ use std::sync::{
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 
-use super::MAX_PKT_SIZE;
-
-pub(super) enum SlotState {
-    Unencrypted,
-    Encrypted {
-        buffer: [u8; MAX_PKT_SIZE],
-        len: usize,
-    },
+pub(super) enum SlotState<T> {
+    Pending,
+    Ready(T),
     Failed,
 }
 
-pub(super) struct PacketSlot {
-    state: Mutex<SlotState>,
+pub(super) struct PacketSlot<T> {
+    state: Mutex<SlotState<T>>,
 }
 
-impl PacketSlot {
+impl<T> PacketSlot<T> {
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(SlotState::Unencrypted),
+            state: Mutex::new(SlotState::Pending),
         }
     }
 
-    pub(super) fn set_state(&self, state: SlotState) {
+    pub(super) fn set_state(&self, state: SlotState<T>) {
         *self.state.lock() = state;
     }
 
-    fn is_unencrypted(&self) -> bool {
-        matches!(&*self.state.lock(), SlotState::Unencrypted)
+    fn is_pending(&self) -> bool {
+        matches!(&*self.state.lock(), SlotState::Pending)
     }
 
     fn is_failed(&self) -> bool {
         matches!(&*self.state.lock(), SlotState::Failed)
     }
 
-    pub(super) fn with_state<R>(&self, f: impl FnOnce(&SlotState) -> R) -> R {
+    pub(super) fn with_state<R>(&self, f: impl FnOnce(&SlotState<T>) -> R) -> R {
         f(&self.state.lock())
     }
 }
@@ -52,17 +47,17 @@ impl PacketSlot {
 ///
 /// Implemented with a SPSC crossbeam_channel, leveraging on the FIFO ordering maintained between a
 /// single sender and receiver.
-pub(super) struct PeerTxQueue {
-    sender: Sender<Arc<PacketSlot>>,
-    receiver: Receiver<Arc<PacketSlot>>,
+pub(super) struct PacketQueue<T> {
+    sender: Sender<Arc<PacketSlot<T>>>,
+    receiver: Receiver<Arc<PacketSlot<T>>>,
     // The current queue head is cached after dequeue as crossbeam_channel does not allow to simply
     // peek a next item to be received
-    peeked: Mutex<Option<Arc<PacketSlot>>>,
+    peeked: Mutex<Option<Arc<PacketSlot<T>>>>,
     // Ensures that at most one worker is draining this queue at a time
     committing: AtomicBool,
 }
 
-impl PeerTxQueue {
+impl<T> PacketQueue<T> {
     pub(super) fn new() -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
         Self {
@@ -73,11 +68,11 @@ impl PeerTxQueue {
         }
     }
 
-    pub(super) fn push(&self, slot: Arc<PacketSlot>) {
+    pub(super) fn push(&self, slot: Arc<PacketSlot<T>>) {
         let _ = self.sender.send(slot);
     }
 
-    fn peek(&self) -> Option<Arc<PacketSlot>> {
+    fn peek(&self) -> Option<Arc<PacketSlot<T>>> {
         let mut peeked = self.peeked.lock();
         if peeked.is_none() {
             *peeked = self.receiver.try_recv().ok();
@@ -105,14 +100,14 @@ impl PeerTxQueue {
     /// A queue can be drained by a single worker at a time (no-op if another worker is draining a
     /// queue already, so it is safe to call from any worker as soon as it finished encrypting a
     /// slot for this peer).
-    pub(super) fn drain_ready(&self, mut on_ready: impl FnMut(&PacketSlot)) {
+    pub(super) fn drain_ready(&self, mut on_ready: impl FnMut(&PacketSlot<T>)) {
         if !self.try_acquire_committer() {
             return;
         }
 
         loop {
             while let Some(slot) = self.peek() {
-                if slot.is_unencrypted() {
+                if slot.is_pending() {
                     break;
                 }
                 self.drop_peeked();
@@ -121,7 +116,7 @@ impl PeerTxQueue {
 
             self.release_committer();
 
-            // Another worker that finished encrypting at this moment may have lost the race to
+            // Another worker that finished processing at this moment may have lost the race to
             // reclaim the committer role that has just been released.
             //
             // A single re-check after releasing is made to ensure this newly completed packet is
@@ -129,7 +124,7 @@ impl PeerTxQueue {
             // reclaim the committer role and will keep draining, or another thread has already
             // acquired the committer role and will proceed with queue draining.
             match self.peek() {
-                Some(slot) if !slot.is_unencrypted() && self.try_acquire_committer() => continue,
+                Some(slot) if !slot.is_pending() && self.try_acquire_committer() => continue,
                 _ => break,
             }
         }
