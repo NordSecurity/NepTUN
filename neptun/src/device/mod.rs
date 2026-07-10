@@ -56,7 +56,7 @@ use tun::TunSocket;
 use {
     nix::sys::socket as NixSocket,
     packet_slot::PacketSlot,
-    packet_workers::{DecryptTaskData, PacketWorkers, TunnelWorkerData},
+    packet_workers::{DecryptTaskData, PacketWorkers},
     std::net::IpAddr,
     std::os::fd::{AsFd, BorrowedFd},
     std::thread::{self, JoinHandle},
@@ -1125,21 +1125,18 @@ impl Device {
                             if is_data_packet {
                                 // Packet staging: pin decrypt-commit order to socket-read order
                                 let slot = Arc::new(PacketSlot::new());
+                                #[allow(clippy::indexing_slicing)]
+                                if !slot.stage(&t.src_buf[..read_bytes]) {
+                                    tracing::warn!("Datagram exceeds slot buffer, dropping");
+                                    continue;
+                                }
                                 peer.rx_queue.push(slot.clone());
 
-                                let mut data = [0u8; MAX_PKT_SIZE];
-                                #[allow(clippy::indexing_slicing)]
-                                data[..read_bytes].copy_from_slice(&t.src_buf[..read_bytes]);
-
                                 batched_pkts.push(DecryptTaskData {
-                                    worker_data: TunnelWorkerData {
-                                        buffer: data,
-                                        peer: peer.clone(),
-                                        iface: t.iface.clone(),
-                                        addr: peer_addr,
-                                        buf_len: read_bytes,
-                                    },
                                     slot,
+                                    buf_len: read_bytes,
+                                    peer: peer.clone(),
+                                    iface: t.iface.clone(),
                                 });
 
                                 continue;

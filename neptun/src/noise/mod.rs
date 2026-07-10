@@ -627,6 +627,59 @@ impl Tunn {
         Ok(self.validate_decapsulated_packet(decapsulated_packet))
     }
 
+    /// Decrypt a received WireGuard data packet in place.
+    ///
+    /// `buf[..datagram_len]` must contain a full received data message (header +
+    /// ciphertext + AEAD tag). Unlike [`Tunn::decapsulate`], this does not run the
+    /// rate limiter and only handles `PacketData` messages: handshake/cookie packets
+    /// must be routed through [`Tunn::decapsulate`] on the slow path.
+    ///
+    /// On success returns [`TunnResult::WriteToTunnel`] pointing at the decrypted IP
+    /// packet, which lives in place at `buf[DATA_OFFSET..]`.
+    pub fn decapsulate_in_place<'a>(
+        &mut self,
+        buf: &'a mut [u8],
+        datagram_len: usize,
+    ) -> TunnResult<'a> {
+        // Parse just the header fields we need; keep only Copy values so the
+        // immutable borrow of `buf` ends before we decrypt in place.
+        let (receiver_idx, counter) = match buf.get(..datagram_len) {
+            Some(datagram) => match Tunn::parse_incoming_packet(datagram) {
+                Ok(Packet::PacketData(p)) => (p.receiver_idx, p.counter),
+                Ok(_) => return TunnResult::Err(WireGuardError::WrongPacketType),
+                Err(e) => return TunnResult::Err(e),
+            },
+            None => return TunnResult::Err(WireGuardError::InvalidLength),
+        };
+
+        let r_idx = receiver_idx as usize;
+        let idx = r_idx % N_SESSIONS;
+
+        let plaintext_len = {
+            #[allow(clippy::indexing_slicing)]
+            let session = match self.sessions[idx].as_ref() {
+                Some(session) => Arc::clone(session),
+                None => {
+                    tracing::trace!(message = "No current session available", remote_idx = r_idx);
+                    return TunnResult::Err(WireGuardError::NoCurrentSession);
+                }
+            };
+            match session.receive_packet_data_in_place(receiver_idx, counter, buf, datagram_len) {
+                Ok(len) => len,
+                Err(e) => return TunnResult::Err(e),
+            }
+        };
+
+        self.set_current_session(r_idx);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        let plaintext = match buf.get_mut(DATA_OFFSET..DATA_OFFSET + plaintext_len) {
+            Some(p) => p,
+            None => return TunnResult::Err(WireGuardError::InvalidLength),
+        };
+        self.validate_decapsulated_packet(plaintext)
+    }
+
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
     /// a new handshake, even if a handshake is already in progress (for example when a handshake times out)
     pub fn format_handshake_initiation<'a>(

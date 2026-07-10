@@ -320,6 +320,57 @@ impl Session {
         Ok(ret)
     }
 
+    /// Decrypt a received data packet in place, without copying the ciphertext into a
+    /// separate destination buffer.
+    ///
+    /// `buf[..datagram_len]` must contain the full received WireGuard data message
+    /// (header + ciphertext + AEAD tag). On success the plaintext is written back in
+    /// place at `buf[DATA_OFFSET..DATA_OFFSET + plaintext_len]` and `plaintext_len` is
+    /// returned. The header bytes at `buf[..DATA_OFFSET]` are left untouched.
+    pub(super) fn receive_packet_data_in_place(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+        buf: &mut [u8],
+        datagram_len: usize,
+    ) -> Result<usize, WireGuardError> {
+        if datagram_len < DATA_OFFSET || datagram_len > buf.len() {
+            return Err(WireGuardError::InvalidLength);
+        }
+        let ct_len = datagram_len - DATA_OFFSET;
+        if ct_len < AEAD_SIZE {
+            return Err(WireGuardError::InvalidLength);
+        }
+        if receiver_idx != self.receiving_index {
+            return Err(WireGuardError::WrongIndex);
+        }
+        // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
+        self.receiving_counter_quick_check(counter)?;
+
+        let plaintext_len = {
+            let mut nonce = [0u8; 12];
+            nonce
+                .get_mut(4..12)
+                .ok_or(WireGuardError::InvalidIndex)?
+                .copy_from_slice(&counter.to_le_bytes());
+            let ciphertext = buf
+                .get_mut(DATA_OFFSET..datagram_len)
+                .ok_or(WireGuardError::InvalidLength)?;
+            self.receiver
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(&[]),
+                    ciphertext,
+                )
+                .map_err(|_| WireGuardError::InvalidAeadTag)?
+                .len()
+        };
+
+        // After decryption is done, check counter again, and mark as received
+        self.receiving_counter_mark(counter)?;
+        Ok(plaintext_len)
+    }
+
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
         let counter_validator = self.receiving_key_counter.lock();
