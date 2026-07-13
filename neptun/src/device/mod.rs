@@ -272,12 +272,8 @@ impl DeviceHandle {
                     sockets_to_close
                         .read()
                         .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                    let group_clone = group.clone();
                     let queue = dispatch::Queue::global(dispatch::QueuePriority::High);
-                    queue.exec_async(move || {
-                        group_clone.enter();
-                        DeviceHandle::event_loop(thread_local, &dev)
-                    });
+                    group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
                     queue
                 });
             }
@@ -335,6 +331,11 @@ impl DeviceHandle {
                 tracing::error!("Unable to gracefully close thread. {:?}", e);
             }
         }
+    }
+
+    #[cfg(all(feature = "docker-tests", target_os = "macos"))]
+    pub fn is_event_loop_active(&self) -> bool {
+        !self.threads.0.is_empty()
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
@@ -1266,11 +1267,12 @@ fn process_iface_inline(
 
 fn read_packet<'a>(
     iface: &Arc<TunSocket>,
-    buf: &'a mut [u8],
+    buf: &'a mut [u8; MAX_PKT_SIZE],
     mtu: &CheckedMtu,
     peers: &AllowedIps<Arc<Peer>>,
 ) -> IfaceReadResult<'a> {
-    #[allow(clippy::indexing_slicing)] // Correct size guaranteed by the CheckedMtu type
+    // buf is [u8; MAX_PKT_SIZE] and CheckedMtu guarantees mtu + WG_HEADER_OFFSET <= MAX_PKT_SIZE
+    #[allow(clippy::indexing_slicing)]
     match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu.get()]) {
         Ok(payload) => match Tunn::dst_address(payload) {
             None => IfaceReadResult::Skip,
