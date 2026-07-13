@@ -342,7 +342,9 @@ impl DeviceHandle {
 
     #[cfg(all(feature = "docker-tests", target_os = "macos"))]
     pub fn is_event_loop_active(&self) -> bool {
-        !self.threads.0.is_empty()
+        // A zero-timeout wait succeeds only once the group is empty, so a
+        // timeout means event loop tasks are still running.
+        self.threads.wait(DispatchTime::NOW).is_err()
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
