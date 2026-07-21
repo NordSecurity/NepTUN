@@ -54,7 +54,7 @@ use tun::TunSocket;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 use dispatch2::{
-    DispatchGroup, DispatchQueue, DispatchQueueGlobalPriority, DispatchRetained, DispatchTime,
+    DispatchGroup, DispatchQueue, DispatchQoS, DispatchRetained, DispatchTime,
     GlobalQueueIdentifier,
 };
 
@@ -270,8 +270,8 @@ impl DeviceHandle {
         let threads = {
             let group = DispatchGroup::new();
             // `global_queue` returns a shared singleton, so fetch it once.
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-                DispatchQueueGlobalPriority::High,
+            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+                DispatchQoS::UserInteractive,
             ));
             for i in 0..n_threads {
                 let dev = Arc::clone(&interface_lock);
