@@ -1018,11 +1018,11 @@ impl Device {
                             }
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
-                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
-                                    continue;
-                                }
-                            }
+                            // if let Some(callback) = &d.config.firewall_process_inbound_callback {
+                            //     if !callback(&peer.public_key.0, packet) {
+                            //         continue;
+                            //     }
+                            // }
 
                             if peer.is_allowed_ip(addr) {
                                 _ = t.iface.as_ref().write(packet);
@@ -1249,11 +1249,11 @@ fn process_iface_inline(
             IfaceReadResult::Fatal => return Action::Exit,
             IfaceReadResult::Skip => continue,
             IfaceReadResult::Packet { payload, peer } => {
-                if let Some(callback) = &device.config.firewall_process_outbound_callback {
-                    if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
-                        continue;
-                    }
-                }
+                // if let Some(callback) = &device.config.firewall_process_outbound_callback {
+                //     if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
+                //         continue;
+                //     }
+                // }
 
                 let len = payload.len();
                 encapsulate_and_send(&peer, &mut thread_data.dst_buf[..], len, udp4, udp6);

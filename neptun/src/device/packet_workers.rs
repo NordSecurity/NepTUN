@@ -220,15 +220,15 @@ fn write_to_socket_worker(
                     for element in batched_pkts.iter_mut() {
                         let len = element.buf_len;
 
-                        if let Some(callback) = &firewall_process_outbound_callback {
-                            let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
-                                Some(b) => b,
-                                None => continue,
-                            };
-                            if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
-                                continue;
-                            }
-                        }
+                        // if let Some(callback) = &firewall_process_outbound_callback {
+                        //     let buffer = match element.data.get(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
+                        //         Some(b) => b,
+                        //         None => continue,
+                        //     };
+                        //     if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
+                        //         continue;
+                        //     }
+                        // }
 
                         encapsulate_and_send(&element.peer, &mut element.data[..], len, &udp4, &udp6);
                     }
@@ -262,11 +262,11 @@ fn write_to_tun_worker(
                                 continue
                             },
                         };
-                        if let Some(callback) = &firewall_process_inbound_callback {
-                            if !callback(&peer.public_key.0, buffer) {
-                                continue;
-                            }
-                        }
+                        // if let Some(callback) = &firewall_process_inbound_callback {
+                        //     if !callback(&peer.public_key.0, buffer) {
+                        //         continue;
+                        //     }
+                        // }
                         if peer.is_allowed_ip(t.addr) {
                             _ = t.iface.as_ref().write(buffer);
                             tracing::trace!(
