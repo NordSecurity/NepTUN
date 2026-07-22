@@ -404,6 +404,10 @@ impl DeviceHandle {
     }
 
     fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>) {
+        // DEBUG: log current QoS for the thread
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        log_thread_qos("DeviceHandle::event_loop start");
+
         loop {
             let mut device_lock = device.read();
 
@@ -863,6 +867,11 @@ impl Device {
         self.queue.new_periodic_event(
             // Reset the rate limiter every second give or take
             Box::new(|d, _| {
+
+                // DEBUG: log current QoS for the thread
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+                log_thread_qos("periodic check");
+
                 if let Some(r) = d.rate_limiter.as_ref() {
                     r.reset_count()
                 }
@@ -1515,4 +1524,22 @@ mod tests {
             "event loops did not exit"
         );
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn log_thread_qos(tag: &str) {
+    // qos_class_self() is in <sys/qos.h> / pthread
+    extern "C" { fn qos_class_self() -> u32; }
+    let q = unsafe { qos_class_self() };
+    // QOS_CLASS_USER_INTERACTIVE=0x21, USER_INITIATED=0x19,
+    // DEFAULT=0x15, UTILITY=0x11, BACKGROUND=0x09, UNSPECIFIED=0x00
+    let name = match q {
+        0x21 => "USER_INTERACTIVE",
+        0x19 => "USER_INITIATED",
+        0x15 => "DEFAULT",
+        0x11 => "UTILITY",
+        0x09 => "BACKGROUND",
+        _ => "UNSPECIFIED",
+    };
+    tracing::info!(target: "neptun::qos", "{tag}: effective QoS = {name} (0x{q:02x})");
 }
