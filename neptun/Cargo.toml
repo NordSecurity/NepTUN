@@ -42,6 +42,7 @@ socket2 = { version = "0.6", features = ["all"], optional = true }
 thiserror = { version = "2", optional = true }
 num_cpus = "1.17.0"
 subtle = "2.6.1"
+crossbeam-queue = "0.3.13"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
 dispatch2 = "0.3"
@@ -52,6 +53,7 @@ nix = { version = "0.31", default-features = false, features = [
     "time",
     "user",
     "socket",
+    "event",
 ] }
 
 [dev-dependencies]

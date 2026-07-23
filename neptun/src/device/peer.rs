@@ -7,6 +7,7 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -35,6 +36,7 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    want_handshake: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -89,6 +91,7 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            want_handshake: AtomicBool::new(false),
         }
     }
 
@@ -214,6 +217,18 @@ impl Peer {
 
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.tunnel.lock().has_session()
+    }
+
+    pub fn set_want_handshake(&self) {
+        self.want_handshake.store(true, Ordering::Release);
+    }
+
+    pub fn take_want_handshake(&self) -> bool {
+        self.want_handshake.swap(false, Ordering::AcqRel)
     }
 }
 

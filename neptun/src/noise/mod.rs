@@ -79,6 +79,13 @@ pub struct Tunn {
     pub peer_static_public: x25519_dalek::PublicKey,
 }
 
+impl Tunn {
+    pub fn has_session(&self) -> bool {
+        #[allow(clippy::indexing_slicing)]
+        self.sessions[self.current % N_SESSIONS].is_some()
+    }
+}
+
 type MessageType = u32;
 const HANDSHAKE_INIT: MessageType = 1;
 const HANDSHAKE_RESP: MessageType = 2;
