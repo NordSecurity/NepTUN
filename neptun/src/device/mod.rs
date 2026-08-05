@@ -52,9 +52,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tun::TunSocket;
 
+#[allow(unused_imports)]
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 use dispatch2::{
-    DispatchGroup, DispatchQueue, DispatchQoS, DispatchRetained, DispatchTime,
+    DispatchGroup, DispatchQoS, DispatchQueue, DispatchRetained, DispatchTime,
     GlobalQueueIdentifier,
 };
 
@@ -249,6 +250,8 @@ impl DeviceHandle {
         let mut wg_interface = Device::new_with_tun(tun, config)?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
+        log_device_config(&wg_interface);
+
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
         let (threads, sockets_to_close) =
@@ -268,18 +271,42 @@ impl DeviceHandle {
         let sockets_to_close = Arc::new(Lock::new(vec![]));
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let threads = {
+            #[allow(unused_imports)]
+            use dispatch2::{DispatchAutoReleaseFrequency, DispatchQueueAttr};
+
             let group = DispatchGroup::new();
-            // `global_queue` returns a shared singleton, so fetch it once.
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
-                DispatchQoS::UserInteractive,
-            ));
+
+            let attr = DispatchQueueAttr::SERIAL;
+
+            // let attr = DispatchQueueAttr::with_autorelease_frequency(
+            //     attr,
+            //     DispatchAutoReleaseFrequency::WORK_ITEM,
+            // );
+
+            // let attr = DispatchQueueAttr::with_qos_class(
+            //     Some(attr.as_ref()),
+            //     DispatchQoS::UserInteractive,
+            //     0,
+            // );
+
+            let queue = DispatchQueue::new("neptun-evtloop-queue", attr);
+
+            // // `global_queue` returns a shared singleton, so fetch it once.
+            // let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::QualityOfService(
+            //     DispatchQoS::UserInteractive,
+            // ));
             for i in 0..n_threads {
                 let dev = Arc::clone(&interface_lock);
                 let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
                 sockets_to_close
                     .read()
                     .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
+
+                let queue_for_closure = queue.clone();
+
+                group.exec_async(&queue, move || {
+                    DeviceHandle::event_loop(thread_local, &dev, &queue_for_closure)
+                });
             }
             group
         };
@@ -321,6 +348,7 @@ impl DeviceHandle {
     }
 
     pub fn trigger_exit(&self) {
+        tracing::info!("Exit triggered externally");
         self.device.read().trigger_exit();
     }
 
@@ -355,6 +383,7 @@ impl DeviceHandle {
     }
 
     pub fn set_iface(&mut self, new_iface: TunSocket) -> Result<(), Error> {
+        tracing::info!("Replacing tun in place, existing DeviceHandle reused");
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safelly cleared.
         // See clear_event_by_fd() function description
@@ -403,10 +432,28 @@ impl DeviceHandle {
         Ok(())
     }
 
-    fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>) {
-        // DEBUG: log current QoS for the thread
+    fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>, work_queue: &DispatchQueue) {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-        log_thread_qos("DeviceHandle::event_loop start");
+        {
+            // DEBUG: log current QoS for the thread
+            // #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            // log_thread_qos("DeviceHandle::event_loop start");
+            let mut relative_priority: std::os::raw::c_int = 0;
+            let requested_qos = unsafe { work_queue.qos_class(&mut relative_priority) };
+            tracing::info!(
+                target: "neptun::qos",
+                "Event loop starting on queue {:?}, requested QoS {} at relative priority {relative_priority}",
+                DispatchQueue::label(Some(work_queue)),
+                qos_mapper(requested_qos),
+            );
+            log_scheduling_state("event loop start");
+
+            request_thread_qos(QOS_CLASS_USER_INITIATED);
+            log_scheduling_state("after requesting USER_INITIATED");
+        }
+
+        work_queue.assert();
+        tracing::info!("Queue assertion passed.");
 
         loop {
             let mut device_lock = device.read();
@@ -414,6 +461,11 @@ impl DeviceHandle {
             if device_lock.update_seq != thread_local.update_seq {
                 // New threads are started when the tun interface is changed, so this
                 // thread that was started for an older tun should end.
+                tracing::info!(
+                    "Event loop closing: tun replaced, update_seq {} -> {}",
+                    thread_local.update_seq,
+                    device_lock.update_seq,
+                );
                 return;
             }
 
@@ -428,6 +480,7 @@ impl DeviceHandle {
                             Action::Continue => {}
                             Action::Yield => break,
                             Action::Exit => {
+                                tracing::info!("Event loop closing: exit requested");
                                 device_lock.try_writeable(
                                     |dev| dev.trigger_yield(),
                                     |dev| dev.closed = true,
@@ -493,6 +546,7 @@ impl DeviceHandle {
 
 impl Drop for DeviceHandle {
     fn drop(&mut self) {
+        tracing::info!("DeviceHandle dropped");
         self.device.read().trigger_exit();
         self.clean();
     }
@@ -867,10 +921,11 @@ impl Device {
         self.queue.new_periodic_event(
             // Reset the rate limiter every second give or take
             Box::new(|d, _| {
-
                 // DEBUG: log current QoS for the thread
                 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-                log_thread_qos("periodic check");
+                log_scheduling_state_on_change("periodic check");
+
+                log_device_state_on_change(d);
 
                 if let Some(r) = d.rate_limiter.as_ref() {
                     r.reset_count()
@@ -1526,14 +1581,189 @@ mod tests {
     }
 }
 
+fn log_device_config(device: &Device) {
+    let config = &device.config;
+
+    tracing::info!(
+        "Device config: n_threads = {}, use_connected_socket = {}, open_uapi_socket = {}, \
+         skt_buffer_size = {:?}, inter_thread_channel_size = {:?}, \
+         max_inter_thread_batched_pkts = {:?}, firewall_inbound = {}, firewall_outbound = {}, \
+         iface = {:?}, listen_port = {}, fwmark = {:?}, mtu = {}",
+        config.n_threads,
+        config.use_connected_socket,
+        config.open_uapi_socket,
+        config.skt_buffer_size,
+        config.inter_thread_channel_size,
+        config.max_inter_thread_batched_pkts,
+        config.firewall_process_inbound_callback.is_some(),
+        config.firewall_process_outbound_callback.is_some(),
+        device.iface.name(),
+        device.listen_port,
+        device.fwmark,
+        device.mtu.load(Ordering::Relaxed),
+    );
+}
+
+/// Runtime state that is only settled after the first handshake, so it cannot be logged
+/// alongside the config.
+fn log_device_state_on_change(device: &Device) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::AtomicU64;
+
+    static LAST_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    let mtu = device.mtu.load(Ordering::Relaxed);
+    // HashMap order is not stable, so sort before hashing or every tick looks like a change.
+    let mut endpoints: Vec<Option<SocketAddr>> =
+        device.peers.values().map(|p| p.endpoint().addr).collect();
+    endpoints.sort();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (mtu, device.listen_port, &endpoints).hash(&mut hasher);
+    let state = hasher.finish();
+
+    if LAST_SEEN.swap(state, Ordering::Relaxed) != state {
+        tracing::info!(
+            "Device state: mtu = {mtu}, listen_port = {}, rate_limiter = {}, peer endpoints = {endpoints:?}",
+            device.listen_port,
+            device.rate_limiter.is_some(),
+        );
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-fn log_thread_qos(tag: &str) {
-    // qos_class_self() is in <sys/qos.h> / pthread
-    extern "C" { fn qos_class_self() -> u32; }
-    let q = unsafe { qos_class_self() };
-    // QOS_CLASS_USER_INTERACTIVE=0x21, USER_INITIATED=0x19,
-    // DEFAULT=0x15, UTILITY=0x11, BACKGROUND=0x09, UNSPECIFIED=0x00
-    let name = match q {
+fn log_scheduling_state(tag: &str) {
+    let (qos, qos_name) = thread_qos();
+
+    let darwin_background = unsafe {
+        *libc::__error() = 0;
+        match (
+            libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0),
+            *libc::__error(),
+        ) {
+            (-1, errno) if errno != 0 => Err(std::io::Error::from_raw_os_error(errno)),
+            (priority, _) => Ok(priority),
+        }
+    };
+
+    let task_role = match task_role() {
+        Ok((role, name)) => format!("{name} ({role})"),
+        Err(kr) => format!("<task_policy_get failed, kr = {kr}>"),
+    };
+
+    tracing::info!(
+        target: "neptun::qos",
+        "{tag}: pid = {}, current queue = {:?}, effective thread QoS = {qos_name} (0x{qos:02x}), darwin background = {darwin_background:?}, task role = {task_role}",
+        std::process::id(),
+        current_queue_label(),
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn log_scheduling_state_on_change(tag: &str) {
+    use std::sync::atomic::AtomicU64;
+
+    static LAST_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    let pack = |value: i32| u64::from(value as u32 & 0xffff);
+
+    let (qos, _) = thread_qos();
+    let darwin_background = unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0) };
+    let role = task_role().map_or(i32::MIN, |(role, _)| role);
+    let state = pack(qos as i32) << 32 | pack(darwin_background) << 16 | pack(role);
+
+    if LAST_SEEN.swap(state, Ordering::Relaxed) != state {
+        log_scheduling_state(tag);
+    }
+}
+
+/// Task level role from `TASK_CATEGORY_POLICY`, which `PRIO_DARWIN_PROCESS` does not cover.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn task_role() -> Result<(i32, &'static str), libc::c_int> {
+    const TASK_CATEGORY_POLICY: u32 = 1;
+    const KERN_SUCCESS: libc::c_int = 0;
+
+    extern "C" {
+        // What the mach_task_self() macro expands to.
+        static mach_task_self_: libc::mach_port_t;
+
+        fn task_policy_get(
+            task: libc::mach_port_t,
+            flavor: u32,
+            policy_info: *mut i32,
+            count: *mut u32,
+            get_default: *mut u32,
+        ) -> libc::c_int;
+    }
+
+    // TASK_CATEGORY_POLICY_COUNT is 1; get_default is in-out and must start false.
+    let mut role: i32 = 0;
+    let mut count: u32 = 1;
+    let mut get_default: u32 = 0;
+
+    let kr = unsafe {
+        task_policy_get(
+            mach_task_self_,
+            TASK_CATEGORY_POLICY,
+            &mut role,
+            &mut count,
+            &mut get_default,
+        )
+    };
+
+    if kr != KERN_SUCCESS {
+        return Err(kr);
+    }
+
+    let name = match role {
+        -1 => "RENICED",
+        0 => "UNSPECIFIED",
+        1 => "FOREGROUND_APPLICATION",
+        2 => "BACKGROUND_APPLICATION",
+        3 => "CONTROL_APPLICATION",
+        4 => "GRAPHICS_SERVER",
+        5 => "THROTTLE_APPLICATION",
+        6 => "NONUI_APPLICATION",
+        7 => "DEFAULT_APPLICATION",
+        8 => "DARWINBG_APPLICATION",
+        _ => "UNKNOWN",
+    };
+
+    Ok((role, name))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+
+/// Raises the calling thread's requested QoS. Expected to fail with EPERM on a GCD worker
+/// thread already executing a workitem with an assigned QoS class.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn request_thread_qos(qos: u32) {
+    extern "C" {
+        fn pthread_set_qos_class_self_np(
+            qos_class: u32,
+            relative_priority: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    if unsafe { pthread_set_qos_class_self_np(qos, 0) } != 0 {
+        tracing::warn!(
+            target: "neptun::qos",
+            "pthread_set_qos_class_self_np(0x{qos:02x}) failed: {}",
+            std::io::Error::last_os_error(),
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn thread_qos() -> (u32, &'static str) {
+    // qos_class_self() is in <sys/qos.h>
+    extern "C" {
+        fn qos_class_self() -> u32;
+    }
+
+    let qos = unsafe { qos_class_self() };
+    let name = match qos {
         0x21 => "USER_INTERACTIVE",
         0x19 => "USER_INITIATED",
         0x15 => "DEFAULT",
@@ -1541,5 +1771,39 @@ fn log_thread_qos(tag: &str) {
         0x09 => "BACKGROUND",
         _ => "UNSPECIFIED",
     };
-    tracing::info!(target: "neptun::qos", "{tag}: effective QoS = {name} (0x{q:02x})");
+
+    (qos, name)
+}
+
+/// Label of the queue the calling thread is currently executing, if any.
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn current_queue_label() -> String {
+    extern "C" {
+        fn dispatch_queue_get_label(queue: *const std::ffi::c_void) -> *const std::os::raw::c_char;
+    }
+
+    // A null queue asks for the label of the currently executing queue, which is what
+    // DISPATCH_CURRENT_QUEUE_LABEL expands to.
+    let label = unsafe { dispatch_queue_get_label(std::ptr::null()) };
+    if label.is_null() {
+        return "<none>".to_owned();
+    }
+
+    unsafe { std::ffi::CStr::from_ptr(label) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn qos_mapper(dispatch_qos: DispatchQoS) -> String {
+    let result = match dispatch_qos {
+        DispatchQoS::UserInteractive => "USER_INTERACTIVE",
+        DispatchQoS::UserInitiated => "USER_INITIATED",
+        DispatchQoS::Default => "DEFAULT",
+        DispatchQoS::Utility => "UTILITY",
+        DispatchQoS::Background => "BACKGROUND",
+        _ => "UNSPECIFIED",
+    };
+
+    result.to_owned()
 }
