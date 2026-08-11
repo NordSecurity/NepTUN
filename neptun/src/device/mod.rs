@@ -176,6 +176,10 @@ pub struct Device {
     udp4: Option<Arc<socket2::Socket>>,
     udp6: Option<Arc<socket2::Socket>>,
 
+    // Event loop holds a dup of each fd inside its handler closure; track
+    // these to actually close the old sockets when rebuilding them.
+    udp_event_fds: Vec<RawFd>,
+
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
 
@@ -329,6 +333,28 @@ impl DeviceHandle {
 
     pub fn drop_connected_sockets(&self) {
         self.device.read().drop_connected_sockets();
+
+        // No connected sockets on Apple; rebuild the shared socket instead,
+        // or it wedges with EAGAIN after a network change (LLT-7562).
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            let rebuilt = self.device.read().try_writeable(
+                |device| device.trigger_yield(),
+                |device| {
+                    device.cancel_yield();
+                    device.rebuild_listen_sockets()
+                },
+            );
+            match rebuilt {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::error!("Failed to rebuild listen sockets on network change: {e:?}")
+                }
+                None => tracing::error!(
+                    "Failed to gain write access to rebuild listen sockets on network change"
+                ),
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -687,6 +713,7 @@ impl Device {
             peers_by_ip: AllowedIps::new(),
             udp4: Default::default(),
             udp6: Default::default(),
+            udp_event_fds: Default::default(),
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
@@ -724,17 +751,14 @@ impl Device {
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
-        if let Some(s) = self.udp4.take() {
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        if self.udp4.is_some() {
             self.workers.shutdown();
-            unsafe {
-                // This is safe because the event loop is not running yet
-                self.queue.clear_event_by_fd(s.as_raw_fd());
-            }
-        };
-
-        if let Some(s) = self.udp6.take() {
-            unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
+        }
+        self.udp4 = None;
+        self.udp6 = None;
+        for fd in std::mem::take(&mut self.udp_event_fds) {
+            unsafe { self.queue.clear_event_by_fd(fd) };
         }
 
         for peer in self.peers.values() {
@@ -768,8 +792,10 @@ impl Device {
             modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
-        self.register_udp_handler(udp_sock4.try_clone()?)?;
-        self.register_udp_handler(udp_sock6.try_clone()?)?;
+        self.udp_event_fds = vec![
+            self.register_udp_handler(udp_sock4.try_clone()?)?,
+            self.register_udp_handler(udp_sock6.try_clone()?)?,
+        ];
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
@@ -780,6 +806,64 @@ impl Device {
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         self.workers.start(udp4, udp6, &self.config);
 
+        self.listen_port = port;
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn rebuild_listen_sockets(&mut self) -> Result<(), Error> {
+        // Mirrors wireguard-go's BindUpdate(): close, then rebind the same
+        // port (falls back to ephemeral) so an existing NAT mapping
+        // survives. Must close via the event loop first - that's what
+        // actually frees the port.
+        let port = self.listen_port;
+
+        for fd in std::mem::take(&mut self.udp_event_fds) {
+            unsafe { self.queue.clear_event_by_fd(fd) };
+        }
+        self.udp4 = None;
+        self.udp6 = None;
+
+        match self.bind_listen_sockets(port) {
+            Ok(()) => Ok(()),
+            Err(e) if port != 0 => {
+                tracing::warn!("Failed to rebind port {port} ({e:?}), taking a new one");
+                self.bind_listen_sockets(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn bind_listen_sockets(&mut self, mut port: u16) -> Result<(), Error> {
+        let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        udp_sock4.set_reuse_address(true)?;
+        udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+        udp_sock4.set_nonblocking(true)?;
+        self.config.protect.make_external(udp_sock4.as_raw_fd());
+
+        if port == 0 {
+            port = udp_sock4
+                .local_addr()?
+                .as_socket()
+                .map(|s| s.port())
+                .ok_or_else(|| Error::GetSockName("no local address on new socket".to_owned()))?;
+        }
+
+        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        udp_sock6.set_reuse_address(true)?;
+        udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+        udp_sock6.set_nonblocking(true)?;
+        self.config.protect.make_external(udp_sock6.as_raw_fd());
+
+        self.udp_event_fds = vec![
+            self.register_udp_handler(udp_sock4.try_clone()?)?,
+            self.register_udp_handler(udp_sock6.try_clone()?)?,
+        ];
+
+        self.udp4 = Some(Arc::new(udp_sock4));
+        self.udp6 = Some(Arc::new(udp_sock6));
         self.listen_port = port;
 
         Ok(())
@@ -958,7 +1042,8 @@ impl Device {
         }
     }
 
-    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
+    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<RawFd, Error> {
+        let event_fd = udp.as_raw_fd();
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -1108,7 +1193,7 @@ impl Device {
                 Action::Continue
             }),
         )?;
-        Ok(())
+        Ok(event_fd)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]

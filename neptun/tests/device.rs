@@ -386,6 +386,45 @@ fn test_wireguard_get_on_device() {
 }
 
 #[test]
+#[cfg(target_os = "macos")] // rebuild_listen_sockets is Apple-only
+fn test_network_change_rebuild_keeps_port() {
+    let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
+    let port = next_port();
+    assert!(wg.wg_set_port(port).ends_with("errno=0\n\n"));
+
+    // What the platform integration calls on a network change notification
+    wg.device.drop_connected_sockets();
+
+    let response = wg.wg_get();
+    assert!(response.ends_with("errno=0\n\n"));
+    assert!(response.contains(&format!("listen_port={port}\n")));
+    assert_port_held(port);
+
+    // A second rebuild must keep working
+    wg.device.drop_connected_sockets();
+
+    let response = wg.wg_get();
+    assert!(response.ends_with("errno=0\n\n"));
+    assert!(response.contains(&format!("listen_port={port}\n")));
+    assert_port_held(port);
+}
+
+/// `listen_port=` in the UAPI response is a stored field, so it survives even a
+/// failed rebuild. Binding the port ourselves is what proves a live socket holds
+/// it.
+#[cfg(target_os = "macos")]
+fn assert_port_held(port: u16) {
+    match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+        Ok(_) => panic!("port {} is free, so no socket was rebuilt", port),
+        Err(e) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "binding port {port} failed for an unexpected reason: {e:?}"
+        ),
+    }
+}
+
+#[test]
 /// Test that the event loop is registered with the dispatch group on creating DeviceHandle (registration is atomic)
 #[cfg(target_os = "macos")] // specific to dispatch crate's API (Apple's GCD wrapper)
 fn test_event_loop_active_directly_after_device_creation() {
