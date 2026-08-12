@@ -837,6 +837,14 @@ impl Device {
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     fn bind_listen_sockets(&mut self, mut port: u16) -> Result<(), Error> {
+        // MUTATION FOR CI EXPERIMENT - DO NOT MERGE.
+        // When the env var is set, every rebind fails, so rebuild_listen_sockets
+        // tears the sockets down and leaves the device wedged. Lets one CI run
+        // check both directions with a single build.
+        if std::env::var_os("NEPTUN_MUTATE_BREAK_REBIND").is_some() {
+            return Err(Error::GetSockName("mutation: rebind disabled".to_owned()));
+        }
+
         let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;

@@ -1,0 +1,50 @@
+name: Test CI macOS device test
+on: [push]
+permissions: {}
+
+jobs:
+  macos-device-test:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Show sudo and utun availability
+      run: |
+        echo "::warning::uname=$(uname -m) host=$(rustc -vV | sed -n 's/^host: //p')"
+        ifconfig | grep -c utun || true
+        sudo -n -E true && echo "passwordless sudo with -E: yes"
+    - name: Control - plain utun device tests work on this runner
+      env:
+        CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: sudo -E
+      run: |
+        set -o pipefail
+        cargo test -p neptun --features device,docker-tests --test device \
+          test_wireguard_get -- --test-threads=1 --nocapture 2>&1 | tee control.log
+        grep -q "2 passed" control.log || { echo "::error::control matched no tests - environment problem, not the fix"; exit 1; }
+    - name: New assertion must FAIL when the rebind is broken
+      env:
+        CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: sudo -E
+        NEPTUN_MUTATE_BREAK_REBIND: "1"
+      run: |
+        set -o pipefail
+        sudo -n -E env | grep -q NEPTUN_MUTATE_BREAK_REBIND \
+          || { echo "::error::the mutation env var does not survive sudo -E - inconclusive"; exit 1; }
+        if cargo test -p neptun --features device,docker-tests --test device \
+             test_network_change_rebuild_keeps_port -- --test-threads=1 --nocapture 2>&1 | tee broken.log; then
+          echo "::error::STILL VACUOUS - passed while every rebind failed and the device was wedged"
+          exit 1
+        fi
+        grep -q "1 failed" broken.log || { echo "::error::the test did not run at all - inconclusive"; exit 1; }
+        grep -q "so no socket was rebuilt" broken.log \
+          || { echo "::error::failed, but not on the new assertion - check the reason"; exit 1; }
+        echo "::notice::the new assertion detects a failed rebuild"
+    - name: New assertion must PASS when the rebind works
+      env:
+        CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER: sudo -E
+      run: |
+        set -o pipefail
+        cargo test -p neptun --features device,docker-tests --test device \
+          test_network_change_rebuild_keeps_port -- --test-threads=1 --nocapture 2>&1 | tee healthy.log
+        grep -q "1 passed" healthy.log || { echo "::error::the test did not run at all - inconclusive"; exit 1; }
+        echo "::notice::the new assertion passes against the real fix"

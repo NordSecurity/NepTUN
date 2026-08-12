@@ -36,8 +36,17 @@ jobs:
       run: |
         cargo xtask code-coverage clean
         cargo xtask code-coverage mock-instant
-        # Docker not available in GitHub runners for Apple Silicon
+        # Docker not available in GitHub runners for Apple Silicon, so run only
+        # the device tests that do not need a container.
+        CARGO_TARGET_AARCH64_APPLE_DARWIN_RUNNER="sudo -E" \
+          cargo llvm-cov --features device,docker-tests --test device --no-report -- \
+            --test-threads=1 --skip test_wg_start --skip test_wg_concurrent 2>&1 | tee dev.log
+        grep -q "6 passed" dev.log || { echo "::error::expected 6 Docker-free device tests"; exit 1; }
         cargo xtask code-coverage report-lcov
+    - name: Did the Apple-only rebuild code get covered?
+      run: |
+        grep -E 'FNDA:[0-9]+,.*(rebuild_listen_sockets|bind_listen_sockets)' target/lcov.info \
+          || echo "::warning::no function records matched - check lcov format"
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5
       with:
