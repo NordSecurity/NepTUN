@@ -1142,11 +1142,14 @@ impl Device {
                         }
                     }
 
+                    // Update the peer's endpoint to the source of the last valid packet
+                    // so outbound traffic follows a roaming peer.
+                    peer.set_endpoint(sock);
+
                     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
                     {
                         // This packet was OK, that means we want to create a connected socket for this peer
                         let ip_addr = sock.ip();
-                        peer.set_endpoint(sock);
                         if d.config.use_connected_socket {
                             // No need for additional checking, as from this point all packets will arrive to connected socket handler
                             if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
@@ -1640,6 +1643,123 @@ mod tests {
         assert!(
             handle
                 .threads
+                .wait(DispatchTime::try_from(Duration::from_secs(10)).unwrap())
+                .is_ok(),
+            "event loops did not exit"
+        );
+    }
+
+    /// Regression test for LLT-7521: on Apple platforms the UDP handler must
+    /// update the peer's endpoint to the source address of the last valid
+    /// packet (WireGuard roaming), since connected sockets are not used there.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn udp_handler_updates_peer_endpoint_on_roaming() {
+        use std::convert::TryFrom;
+        use std::net::UdpSocket;
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+
+        const MOCK_MTU: usize = 1420;
+        const MAX_PACKET: usize = 2048;
+
+        // `_far` keeps the socket's peer end open; `near` backs the TunSocket.
+        let (near, _far) = UnixStream::pair().unwrap();
+        let tun = TunSocket::new_from_fd(near.into_raw_fd()).unwrap();
+
+        let config = DeviceConfig {
+            n_threads: 1,
+            use_connected_socket: false,
+            open_uapi_socket: false,
+            protect: Arc::new(MakeExternalNeptunNoop),
+            firewall_process_inbound_callback: None,
+            firewall_process_outbound_callback: None,
+            skt_buffer_size: None,
+            inter_thread_channel_size: None,
+            max_inter_thread_batched_pkts: None,
+        };
+
+        let device_secret = x25519::StaticSecret::random_from_rng(&mut OsRng);
+        let device_public = x25519::PublicKey::from(&device_secret);
+        let client_secret = x25519::StaticSecret::random_from_rng(&mut OsRng);
+        let client_public = x25519::PublicKey::from(&client_secret);
+
+        let mut device = Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap();
+        device.set_key(device_secret);
+        device.open_listen_socket(0).unwrap();
+        let listen_port = device.listen_port;
+        // Deliberately no endpoint configured: it must be learned from packets.
+        device
+            .update_peer(client_public, false, false, false, None, &[], None, None)
+            .unwrap();
+
+        let interface_lock = Arc::new(Lock::new(device));
+        let (threads, _sockets_to_close) =
+            DeviceHandle::start_event_loop_threads(1, Arc::clone(&interface_lock)).unwrap();
+
+        let wait_for_endpoint = |expected: SocketAddr| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let addr = interface_lock
+                    .read()
+                    .peers
+                    .get(&client_public)
+                    .unwrap()
+                    .endpoint()
+                    .addr;
+                if addr == Some(expected) {
+                    return true;
+                }
+                if Instant::now() > deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        let mut tunnel = Tunn::new(client_secret, device_public, None, None, 0, None).unwrap();
+        let device_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listen_port));
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock_a
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let mut tx_buf = [0u8; MAX_PACKET];
+        let mut rx_buf = [0u8; MAX_PACKET];
+
+        let TunnResult::WriteToNetwork(init) = tunnel.encapsulate(&[], &mut tx_buf) else {
+            panic!("expected handshake initiation");
+        };
+        sock_a.send_to(init, device_addr).unwrap();
+
+        assert!(
+            wait_for_endpoint(sock_a.local_addr().unwrap()),
+            "endpoint was not learned from the handshake initiation"
+        );
+
+        // Complete the handshake: the response yields the keepalive that
+        // confirms the session.
+        let (len, _) = sock_a.recv_from(&mut rx_buf).unwrap();
+        let TunnResult::WriteToNetwork(keepalive) =
+            tunnel.decapsulate(None, &rx_buf[..len], &mut tx_buf)
+        else {
+            panic!("expected keepalive after handshake response");
+        };
+
+        // Roam: send the next valid packet from a different source port.
+        let sock_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock_b.send_to(keepalive, device_addr).unwrap();
+
+        assert!(
+            wait_for_endpoint(sock_b.local_addr().unwrap()),
+            "endpoint was not updated after the peer roamed to a new port"
+        );
+
+        interface_lock.read().trigger_exit();
+        assert!(
+            threads
                 .wait(DispatchTime::try_from(Duration::from_secs(10)).unwrap())
                 .is_ok(),
             "event loops did not exit"
