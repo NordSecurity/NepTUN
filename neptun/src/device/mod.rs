@@ -651,7 +651,7 @@ impl Device {
         Self::new_with_iface(iface, mtu, config)
     }
 
-    #[cfg(all(test, any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    #[cfg(test)]
     pub(crate) fn new_with_mock_tun(
         tun: TunSocket,
         mtu: usize,
@@ -724,17 +724,23 @@ impl Device {
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
-        if let Some(s) = self.udp4.take() {
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        if self.udp4.is_some() {
             self.workers.shutdown();
+        }
+        if let Some(udp) = self.udp4.take() {
             unsafe {
-                // This is safe because the event loop is not running yet
-                self.queue.clear_event_by_fd(s.as_raw_fd());
+                // Safe: the event loop is either not started yet or parked
+                // behind the write lock.
+                self.queue.clear_event_by_fd(udp.as_raw_fd());
             }
-        };
-
-        if let Some(s) = self.udp6.take() {
-            unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
+        }
+        if let Some(udp) = self.udp6.take() {
+            unsafe {
+                // Safe: the event loop is either not started yet or parked
+                // behind the write lock.
+                self.queue.clear_event_by_fd(udp.as_raw_fd());
+            }
         }
 
         for peer in self.peers.values() {
@@ -768,13 +774,13 @@ impl Device {
             modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
-        self.register_udp_handler(udp_sock4.try_clone()?)?;
-        self.register_udp_handler(udp_sock6.try_clone()?)?;
-
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
+
+        self.register_udp_handler(udp4.clone())?;
+        self.register_udp_handler(udp6.clone())?;
 
         // Process packet in a separate thread for non-Apple platforms
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -958,7 +964,7 @@ impl Device {
         }
     }
 
-    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
+    fn register_udp_handler(&self, udp: Arc<socket2::Socket>) -> Result<(), Error> {
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -1518,6 +1524,73 @@ mod tests {
                 .wait(DispatchTime::try_from(Duration::from_secs(10)).unwrap())
                 .is_ok(),
             "event loops did not exit"
+        );
+    }
+
+    /// The event loop's dup of the socket is the last thing holding the old
+    /// port, so clearing the event by the wrong descriptor leaves it bound.
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    fn changing_listen_port_releases_the_old_port() {
+        use std::os::unix::io::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        const MOCK_MTU: usize = 1420;
+
+        // `_far` keeps the socket's peer end open; `near` backs the TunSocket.
+        // TUNGETIFF would reject a socket pair, so the fd is wrapped directly.
+        let (near, _far) = UnixStream::pair().unwrap();
+        let tun = TunSocket::new_mock_from_fd(near.into_raw_fd());
+
+        let config = DeviceConfig {
+            n_threads: 1,
+            use_connected_socket: false,
+            #[cfg(target_os = "linux")]
+            use_multi_queue: false,
+            open_uapi_socket: false,
+            protect: Arc::new(MakeExternalNeptunNoop),
+            firewall_process_inbound_callback: None,
+            firewall_process_outbound_callback: None,
+            skt_buffer_size: None,
+            inter_thread_channel_size: None,
+            max_inter_thread_batched_pkts: None,
+        };
+
+        let mut device = Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap();
+
+        device.open_listen_socket(0).unwrap();
+        let old_port = device.listen_port;
+        assert_ne!(old_port, 0, "no port was assigned to the listen socket");
+
+        let mut attempts = 0;
+        let new_port = loop {
+            let probe = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+            let candidate = probe.local_addr().unwrap().port();
+            drop(probe);
+
+            if candidate != old_port && device.open_listen_socket(candidate).is_ok() {
+                break candidate;
+            }
+            attempts += 1;
+            assert!(attempts < 16, "no probed port could be bound");
+        };
+        assert_eq!(device.listen_port, new_port);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let released = loop {
+            if std::net::UdpSocket::bind(("0.0.0.0", old_port)).is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert!(
+            released,
+            "port {} is still bound, so the old socket outlived the rebind",
+            old_port
         );
     }
 }
