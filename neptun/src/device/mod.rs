@@ -2,6 +2,10 @@
 // Copyright (c) 2019-2024 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+mod control;
+mod inbound;
+mod outbound;
+
 pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
@@ -27,6 +31,9 @@ pub mod tun;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 mod packet_workers;
 
+use crate::device::control::Control;
+use crate::device::inbound::Inbound;
+use crate::device::outbound::Outbound;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -37,7 +44,7 @@ use dev_lock::{Lock, LockReadGuard};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Type};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -47,7 +54,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tun::TunSocket;
@@ -140,7 +147,7 @@ pub struct DeviceHandle {
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     threads: Vec<thread::JoinHandle<()>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    threads: DispatchRetained<DispatchGroup>,
+    threads: Vec<DispatchRetained<DispatchGroup>>,
     sockets_to_close: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
 
@@ -188,9 +195,12 @@ pub struct Device {
 
     cleanup_paths: Vec<String>,
 
-    mtu: AtomicUsize,
+    mtu: Arc<AtomicUsize>,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Set to stop the OUT/IN data threads. The control plane stops via its exit notifier.
+    data_stop: Arc<AtomicBool>,
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     workers: PacketWorkers,
@@ -248,19 +258,25 @@ impl DeviceHandle {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        let n_threads = config.n_threads;
         let mut wg_interface = Device::new_with_tun(tun, config)?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
-        let (threads, sockets_to_close) =
-            Self::start_event_loop_threads(n_threads, interface_lock.clone())?;
+        let mut threads = vec![];
+
+        let Control { thread, sockets } = Control::start(interface_lock.clone());
+        threads.push(thread);
+
+        let stop_in = interface_lock.read().data_stop.clone();
+        let stop_out = stop_in.clone();
+        threads.push(Inbound::start(interface_lock.clone(), stop_in));
+        threads.push(Outbound::start(interface_lock.clone(), stop_out));
 
         Ok(DeviceHandle {
             device: interface_lock,
             threads,
-            sockets_to_close,
+            sockets_to_close: sockets,
         })
     }
 
@@ -344,12 +360,15 @@ impl DeviceHandle {
     pub fn is_event_loop_active(&self) -> bool {
         // A zero-timeout wait succeeds only once the group is empty, so a
         // timeout means event loop tasks are still running.
-        self.threads.wait(DispatchTime::NOW).is_err()
+        self.thread.wait(DispatchTime::NOW).is_err()
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     pub fn wait(&mut self) {
-        let _ = self.threads.wait(DispatchTime::FOREVER);
+        while let Some(queue) = self.threads.pop() {
+            // TODO: double check if this is also correct in case of a serial queue
+            let _ = queue.wait(DispatchTime::FOREVER);
+        }
     }
 
     pub fn clean(&mut self) {
@@ -361,7 +380,7 @@ impl DeviceHandle {
 
     pub fn set_iface(&mut self, new_iface: TunSocket) -> Result<(), Error> {
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
-        // The event loop must be stopped so that the old iface event handler can be safelly cleared.
+        // The event loop must be stopped so that the old iface event handler can be safely cleared.
         // See clear_event_by_fd() function description
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         {
@@ -392,19 +411,17 @@ impl DeviceHandle {
 
                     (device.update_seq, _) = device.update_seq.overflowing_add(1);
                     device.iface = Arc::new(new_iface.set_non_blocking()?);
-                    device.register_read_iface_handler(device.iface.clone())?;
+                    // device.register_read_iface_handler(device.iface.clone())?;
                     device.cancel_yield();
 
                     Ok(())
                 },
             )
             .ok_or(Error::SetTunnel)??;
-        let (threads, sockets_to_close) = DeviceHandle::start_event_loop_threads(
-            self.device.read().config.n_threads,
-            self.device.clone(),
-        )?;
-        self.threads = threads;
-        self.sockets_to_close = sockets_to_close;
+        // TODO: handle restart of data plane threads
+        let Control { thread, sockets } = Control::start(self.device.clone());
+        // self.threads = threads;
+        self.sockets_to_close = sockets;
         Ok(())
     }
 
@@ -646,7 +663,7 @@ impl Device {
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<Device, Error> {
         // Create a tunnel device
-        let iface = Arc::new(tun.set_non_blocking()?);
+        let iface = Arc::new(tun);
         let mtu = iface.mtu()?;
         Self::new_with_iface(iface, mtu, config)
     }
@@ -657,7 +674,7 @@ impl Device {
         mtu: usize,
         config: DeviceConfig,
     ) -> Result<Device, Error> {
-        let iface = Arc::new(tun.set_non_blocking()?);
+        let iface = Arc::new(tun);
         Self::new_with_iface(iface, mtu, config)
     }
 
@@ -688,9 +705,10 @@ impl Device {
             udp4: Default::default(),
             udp6: Default::default(),
             cleanup_paths: Default::default(),
-            mtu: AtomicUsize::new(mtu),
+            mtu: Arc::new(AtomicUsize::new(mtu)),
             rate_limiter: None,
             update_seq: 0,
+            data_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             workers,
         };
@@ -698,7 +716,7 @@ impl Device {
         if device.config.open_uapi_socket {
             device.register_api_handler()?;
         }
-        device.register_read_iface_handler(Arc::clone(&device.iface))?;
+        // device.register_read_iface_handler(Arc::clone(&device.iface))?;
         device.register_notifiers()?;
         device.register_timers()?;
 
@@ -725,8 +743,8 @@ impl Device {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            self.workers.shutdown();
+            // #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+            // self.workers.shutdown();
             unsafe {
                 // This is safe because the event loop is not running yet
                 self.queue.clear_event_by_fd(s.as_raw_fd());
@@ -776,9 +794,7 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
-        // Process packet in a separate thread for non-Apple platforms
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        self.workers.start(udp4, udp6, &self.config);
+        let _ = (&udp4, &udp6);
 
         self.listen_port = port;
 
@@ -919,6 +935,22 @@ impl Device {
                         }
                         _ => tracing::error!("Unexpected result from update_timers"),
                     };
+
+                    if peer.take_handshake_request() {
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.format_handshake_initiation(&mut t.dst_buf[..], false)
+                        };
+                        if let TunnResult::WriteToNetwork(packet) = res {
+                            let r = match endpoint_addr {
+                                SocketAddr::V4(_) => udp4.send_to(packet, &endpoint_addr.into()),
+                                SocketAddr::V6(_) => udp6.send_to(packet, &endpoint_addr.into()),
+                            };
+                            if let Err(e) = r {
+                                tracing::warn!(message = "Failed to send handshake init", error = ?e, dst = ?endpoint_addr);
+                            }
+                        }
+                    }
                 }
                 Action::Continue
             }),
@@ -935,6 +967,9 @@ impl Device {
     }
 
     pub(crate) fn trigger_exit(&self) {
+        // Stop the data-plane threads
+        self.data_stop.store(true, Ordering::Relaxed);
+
         match self.exit_notice.as_ref() {
             Some(notice) => self.queue.trigger_notification(notice),
             None => tracing::error!("Exit requested while there is no notice"),
@@ -1005,8 +1040,8 @@ impl Device {
                         },
                         None => {
                             match Tunn::parse_incoming_packet(packet) {
-                            Ok(packet) => packet,
-                            Err(_) => continue,
+                                Ok(packet) => packet,
+                                Err(_) => continue,
                             }
                         }
                     };
@@ -1084,18 +1119,15 @@ impl Device {
                         }
                     }
 
+                    peer.set_endpoint(sock);
+
                     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
                     {
-                        // This packet was OK, that means we want to create a connected socket for this peer
-                        let ip_addr = sock.ip();
-                        peer.set_endpoint(sock);
                         if d.config.use_connected_socket {
                             // No need for additional checking, as from this point all packets will arrive to connected socket handler
-                            if let Ok(sock) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                                if let Err(e) = d.register_read_conn_skt_handler(Arc::clone(peer), sock, ip_addr) {
-                                    tracing::error!("Failed to register connected socket handler {}", e);
-                                    peer.shutdown_endpoint();
-                                }
+                            if let Err(e) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
+                                tracing::error!("Failed to create connected socket {}", e);
+                                // peer.shutdown_endpoint();
                             }
                         }
                     }

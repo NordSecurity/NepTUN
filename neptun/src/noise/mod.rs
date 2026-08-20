@@ -65,7 +65,7 @@ pub struct Tunn {
     /// The handshake currently in progress
     handshake: handshake::Handshake,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
-    sessions: [Option<session::Session>; N_SESSIONS],
+    sessions: [Option<Arc<session::Session>>; N_SESSIONS],
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
@@ -337,6 +337,21 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
+    /// Clone out the current sending session, if any (data-path OUT thread).
+    ///
+    /// Returns an `Arc<Session>` the caller can use for `Session::encrypt` after releasing
+    /// the `Tunn` lock.
+    pub fn current_session(&self) -> Option<Arc<session::Session>> {
+        self.sessions[self.current % N_SESSIONS].clone()
+    }
+
+    /// Clone out the session that should decrypt a data packet with the given receiver index
+    /// (data-path IN thread). Returns an `Arc<Session>` for use with `Session::decrypt` after
+    /// releasing the `Tunn` lock.
+    pub fn session_for_index(&self, receiver_idx: u32) -> Option<Arc<session::Session>> {
+        self.sessions[receiver_idx as usize % N_SESSIONS].clone()
+    }
+
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
@@ -450,7 +465,7 @@ impl Tunn {
         let index = session.local_index();
         #[allow(clippy::indexing_slicing)]
         {
-            self.sessions[index % N_SESSIONS] = Some(session);
+            self.sessions[index % N_SESSIONS] = Some(Arc::new(session));
         }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
@@ -487,7 +502,7 @@ impl Tunn {
         #[allow(clippy::indexing_slicing)]
         let index = {
             let idx = l_idx % N_SESSIONS;
-            self.sessions[idx] = Some(session);
+            self.sessions[idx] = Some(Arc::new(session));
             idx
         };
 
@@ -599,6 +614,32 @@ impl Tunn {
             }
             Err(e) => TunnResult::Err(e),
         }
+    }
+
+    /// Length of a decapsulated IP packet as declared by its IP header length field, used to
+    /// strip WireGuard padding before writing to the TUN. Mirrors the length logic in
+    /// `validate_decapsulated_packet` but is a stateless helper (no `&mut self`), so the
+    /// off-lock data path (device IN thread) can trim a packet decrypted directly via
+    /// `Session::decrypt`. Returns `None` for empty/keepalive or unrecognised packets;
+    /// the result is clamped to the buffer length.
+    pub fn decapsulated_packet_len(packet: &[u8]) -> Option<usize> {
+        let computed = match packet.first() {
+            None => return None,
+            Some(b) if b >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
+                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ]
+                    .try_into()
+                    .ok()?;
+                u16::from_be_bytes(len_bytes) as usize
+            }
+            Some(b) if b >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
+                let len_bytes: [u8; IP_LEN_SZ] = packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ]
+                    .try_into()
+                    .ok()?;
+                u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE
+            }
+            _ => return None,
+        };
+        Some(computed.min(packet.len()))
     }
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field

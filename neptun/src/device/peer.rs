@@ -7,7 +7,9 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::device::modify_skt_buffer_size;
@@ -17,6 +19,10 @@ use crate::noise::Tunn;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+
+/// Coarse read timeout on the connected data socket so the IN data thread wakes periodically
+/// to check the shutdown flag (and lets the control thread drive timers independently).
+const DATA_SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -35,6 +41,7 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    want_handshake: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -89,7 +96,16 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            want_handshake: AtomicBool::new(false),
         }
+    }
+
+    pub fn request_handshake(&self) {
+        self.want_handshake.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_handshake_request(&self) -> bool {
+        self.want_handshake.swap(false, Ordering::Relaxed)
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
@@ -153,7 +169,12 @@ impl Peer {
             SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into()
         };
         udp_conn.bind(&bind_addr)?;
-        udp_conn.set_nonblocking(true)?;
+
+        // The connected socket is the data-path socket, used with BLOCKING recv/send (one thread per
+        // direction). A coarse read timeout lets the IN thread wake to check the shutdown flag.
+        udp_conn.set_nonblocking(false)?;
+        udp_conn.set_read_timeout(Some(DATA_SOCKET_READ_TIMEOUT))?;
+
         // fw_mark is being set inside make_external(), so no need to set it twice as in Cloudflare's repo.
         self.protect.make_external(udp_conn.as_raw_fd());
         // Also mind that all socket setup functions should be called before .connect().
