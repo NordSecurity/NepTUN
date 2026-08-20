@@ -1520,4 +1520,117 @@ mod tests {
             "event loops did not exit"
         );
     }
+
+    /// CI experiment for LLT-7623, not for merging. Panics by design so the
+    /// report lands in the job log on every platform. Questions it answers:
+    /// which second binds succeed against a holder with each reuse option,
+    /// where packets go while two sockets share the port, and whether another
+    /// uid can join the port.
+    #[test]
+    fn ci_experiment_reuseport_semantics() {
+        use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+        use std::time::Duration;
+
+        fn mk(reuse_addr: bool, reuse_port: bool) -> socket2::Socket {
+            let s = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            s.set_reuse_address(reuse_addr).unwrap();
+            s.set_reuse_port(reuse_port).unwrap();
+            s
+        }
+
+        fn try_second(port: u16, reuse_addr: bool, reuse_port: bool) -> String {
+            let b = mk(reuse_addr, reuse_port);
+            match b.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()) {
+                Ok(()) => "OK".to_owned(),
+                Err(e) => format!("ERR {}", e),
+            }
+        }
+
+        let mut report = format!("\ntarget_os={}\n", std::env::consts::OS);
+
+        // Phase 1: which second binds succeed. (true, false) is what neptun
+        // sets today; (true, true) is what the pre-socket2 code set on Apple.
+        for &(a_ra, a_rp) in &[(true, false), (true, true)] {
+            let a = mk(a_ra, a_rp);
+            a.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+                .unwrap();
+            let port = a.local_addr().unwrap().as_socket().unwrap().port();
+            report.push_str(&format!(
+                "\nA(reuse_addr={}, reuse_port={}) holds port {}\n",
+                a_ra, a_rp, port
+            ));
+            for &(b_ra, b_rp) in &[(false, false), (true, false), (false, true), (true, true)] {
+                report.push_str(&format!(
+                    "  B(reuse_addr={}, reuse_port={}): {}\n",
+                    b_ra,
+                    b_rp,
+                    try_second(port, b_ra, b_rp)
+                ));
+            }
+        }
+
+        // Phase 2: delivery while two REUSEPORT sockets share the port, and
+        // after the older one closes.
+        let a = mk(true, true);
+        a.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+            .unwrap();
+        let port = a.local_addr().unwrap().as_socket().unwrap().port();
+        let b = mk(true, true);
+        b.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
+            .unwrap();
+        let a: UdpSocket = a.into();
+        let b: UdpSocket = b.into();
+        a.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        b.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut buf = [0u8; 16];
+        let (mut got_a, mut got_b) = (0, 0);
+        for i in 0..8u8 {
+            tx.send_to(&[i], ("127.0.0.1", port)).unwrap();
+            if a.recv_from(&mut buf).is_ok() {
+                got_a += 1;
+            }
+            if b.recv_from(&mut buf).is_ok() {
+                got_b += 1;
+            }
+        }
+        report.push_str(&format!(
+            "\nDelivery while A (older) and B share the port: A got {}, B got {} of 8\n",
+            got_a, got_b
+        ));
+        drop(a);
+        let mut got_b2 = 0;
+        for i in 0..4u8 {
+            tx.send_to(&[i], ("127.0.0.1", port)).unwrap();
+            if b.recv_from(&mut buf).is_ok() {
+                got_b2 += 1;
+            }
+        }
+        report.push_str(&format!("After closing A: B got {} of 4\n", got_b2));
+
+        // Phase 3: can a different uid join the port B still holds.
+        let py = format!(
+            "import socket\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
+             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)\n\
+             try:\n s.bind(('0.0.0.0',{}))\n print('BIND OK')\n\
+             except OSError as e:\n print('BIND ERR', e)",
+            port
+        );
+        match std::process::Command::new("sudo")
+            .args(&["-n", "-u", "nobody", "python3", "-c", &py])
+            .output()
+        {
+            Ok(o) => report.push_str(&format!(
+                "Cross-uid bind as nobody: status={:?} stdout={:?} stderr={:?}\n",
+                o.status,
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            )),
+            Err(e) => report.push_str(&format!("Cross-uid attempt could not run: {}\n", e)),
+        }
+
+        panic!("REUSEPORT CI EXPERIMENT REPORT{}", report);
+    }
 }
