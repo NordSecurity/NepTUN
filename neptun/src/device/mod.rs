@@ -756,9 +756,13 @@ impl Device {
 
         if port == 0 {
             // Random port was assigned
-            if let Some(socket) = udp_sock4.local_addr()?.as_socket() {
-                port = socket.port();
-            }
+            port = udp_sock4
+                .local_addr()?
+                .as_socket()
+                .map(|s| s.port())
+                .ok_or_else(|| {
+                    Error::GetSockName("bound socket reported a non-IP address family".to_owned())
+                })?;
         }
 
         let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
