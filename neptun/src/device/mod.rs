@@ -329,6 +329,31 @@ impl DeviceHandle {
 
     pub fn drop_connected_sockets(&self) {
         self.device.read().drop_connected_sockets();
+
+        // No connected sockets on Apple; rebuild the shared socket instead,
+        // or it wedges with EAGAIN after a network change (LLT-7562).
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        {
+            let rebuilt = self.device.read().try_writeable(
+                |device| device.trigger_yield(),
+                |device| {
+                    device.cancel_yield();
+                    if device.closed {
+                        return Ok(());
+                    }
+                    device.rebuild_listen_sockets()
+                },
+            );
+            match rebuilt {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::error!("Failed to rebuild listen sockets on network change: {e:?}")
+                }
+                None => tracing::error!(
+                    "Failed to gain write access to rebuild listen sockets on network change"
+                ),
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -791,6 +816,29 @@ impl Device {
         self.workers.start(udp4, udp6, &self.config);
 
         self.listen_port = port;
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn rebuild_listen_sockets(&mut self) -> Result<(), Error> {
+        // Mirrors wireguard-go's BindUpdate(): close, then rebind the same
+        // port (falls back to a new one) so an existing NAT mapping survives.
+        let port = self.listen_port;
+
+        match self.open_listen_socket(port) {
+            Ok(()) => {
+                tracing::info!("Rebuilt listen sockets on network change, kept port {port}");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to rebind port {port} ({e:?}), taking a new one");
+                self.open_listen_socket(0)?;
+                tracing::info!(
+                    "Rebuilt listen sockets on network change on a new port {}",
+                    self.listen_port
+                );
+            }
+        }
 
         Ok(())
     }
@@ -1485,24 +1533,26 @@ mod tests {
         assert_eq!(checked.get(), mtu);
     }
 
-    #[test]
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    fn start_event_loop_threads_starts_one_loop_per_thread() {
-        use std::convert::TryFrom;
+    fn mock_device(n_threads: usize) -> (Device, std::os::unix::net::UnixStream) {
         use std::os::unix::io::IntoRawFd;
         use std::os::unix::net::UnixStream;
-        use std::time::Duration;
 
-        const N_THREADS: usize = 4;
         const MOCK_MTU: usize = 1420;
 
-        // `_far` keeps the socket's peer end open; `near` backs the TunSocket.
-        let (near, _far) = UnixStream::pair().unwrap();
+        // The far end keeps the socket's peer open; `near` backs the TunSocket.
+        // TUNGETIFF would reject a socket pair, so off Apple the fd is wrapped
+        // directly.
+        let (near, far) = UnixStream::pair().unwrap();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let tun = TunSocket::new_from_fd(near.into_raw_fd()).unwrap();
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        let tun = TunSocket::new_mock_from_fd(near.into_raw_fd());
 
         let config = DeviceConfig {
-            n_threads: N_THREADS,
+            n_threads,
             use_connected_socket: false,
+            #[cfg(target_os = "linux")]
+            use_multi_queue: false,
             open_uapi_socket: false,
             protect: Arc::new(MakeExternalNeptunNoop),
             firewall_process_inbound_callback: None,
@@ -1512,7 +1562,21 @@ mod tests {
             max_inter_thread_batched_pkts: None,
         };
 
-        let device = Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap();
+        (
+            Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap(),
+            far,
+        )
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn start_event_loop_threads_starts_one_loop_per_thread() {
+        use std::convert::TryFrom;
+        use std::time::Duration;
+
+        const N_THREADS: usize = 4;
+
+        let (device, _far) = mock_device(N_THREADS);
         let interface_lock = Arc::new(Lock::new(device));
 
         let (threads, sockets_to_close) =
@@ -1531,36 +1595,63 @@ mod tests {
         );
     }
 
+    /// Regression test for LLT-7562: a network change must rebuild the listen
+    /// sockets on the same port, or the tunnel wedges until it is restarted.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn network_change_rebuild_keeps_listen_port() {
+        use std::convert::TryFrom;
+        use std::time::Duration;
+
+        let (mut device, _far) = mock_device(1);
+        // Port 0 lets the kernel pick a free one, so concurrent tests cannot collide.
+        device.open_listen_socket(0).unwrap();
+        let port = device.listen_port;
+        assert_ne!(port, 0, "no port was assigned to the listen socket");
+
+        let interface_lock = Arc::new(Lock::new(device));
+        let (threads, sockets_to_close) =
+            DeviceHandle::start_event_loop_threads(1, Arc::clone(&interface_lock)).unwrap();
+        let handle = DeviceHandle {
+            device: Arc::clone(&interface_lock),
+            threads,
+            sockets_to_close,
+        };
+
+        // What the platform integration calls on a network change notification
+        let old4 = Arc::downgrade(interface_lock.read().udp4.as_ref().unwrap());
+        let old6 = Arc::downgrade(interface_lock.read().udp6.as_ref().unwrap());
+        handle.drop_connected_sockets();
+        assert!(old4.upgrade().is_none(), "the IPv4 socket was not replaced");
+        assert!(old6.upgrade().is_none(), "the IPv6 socket was not replaced");
+        assert_eq!(interface_lock.read().listen_port, port);
+        assert_port_held(port);
+
+        // A second rebuild must keep working
+        let old4 = Arc::downgrade(interface_lock.read().udp4.as_ref().unwrap());
+        let old6 = Arc::downgrade(interface_lock.read().udp6.as_ref().unwrap());
+        handle.drop_connected_sockets();
+        assert!(old4.upgrade().is_none(), "the IPv4 socket was not replaced");
+        assert!(old6.upgrade().is_none(), "the IPv6 socket was not replaced");
+        assert_eq!(interface_lock.read().listen_port, port);
+        assert_port_held(port);
+
+        interface_lock.read().trigger_exit();
+        assert!(
+            handle
+                .threads
+                .wait(DispatchTime::try_from(Duration::from_secs(10)).unwrap())
+                .is_ok(),
+            "event loops did not exit"
+        );
+    }
+
     /// The event loop's dup of the socket is the last thing holding the old
     /// port, so clearing the event by the wrong descriptor leaves it bound.
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     fn changing_listen_port_releases_the_old_port() {
-        use std::os::unix::io::IntoRawFd;
-        use std::os::unix::net::UnixStream;
-
-        const MOCK_MTU: usize = 1420;
-
-        // `_far` keeps the socket's peer end open; `near` backs the TunSocket.
-        // TUNGETIFF would reject a socket pair, so the fd is wrapped directly.
-        let (near, _far) = UnixStream::pair().unwrap();
-        let tun = TunSocket::new_mock_from_fd(near.into_raw_fd());
-
-        let config = DeviceConfig {
-            n_threads: 1,
-            use_connected_socket: false,
-            #[cfg(target_os = "linux")]
-            use_multi_queue: false,
-            open_uapi_socket: false,
-            protect: Arc::new(MakeExternalNeptunNoop),
-            firewall_process_inbound_callback: None,
-            firewall_process_outbound_callback: None,
-            skt_buffer_size: None,
-            inter_thread_channel_size: None,
-            max_inter_thread_batched_pkts: None,
-        };
-
-        let mut device = Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap();
+        let (mut device, _far) = mock_device(1);
 
         device.open_listen_socket(0).unwrap();
         let old_port = device.listen_port;
@@ -1596,5 +1687,20 @@ mod tests {
             "port {} is still bound, so the old socket outlived the rebind",
             old_port
         );
+    }
+
+    /// `listen_port` is a stored field, so it survives even a failed rebuild.
+    /// Binding the port from outside is what proves a live socket holds it.
+    /// Which socket that is comes from the `Weak` checks at the call site.
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    fn assert_port_held(port: u16) {
+        match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            Ok(_) => panic!("port {} is free, so nothing is listening on it", port),
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "binding port {port} failed for an unexpected reason: {e:?}"
+            ),
+        }
     }
 }
