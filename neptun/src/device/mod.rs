@@ -1610,25 +1610,48 @@ mod tests {
         }
         report.push_str(&format!("After closing A: B got {} of 4\n", got_b2));
 
-        // Phase 3: can a different uid join the port B still holds.
+        // Phase 3: the uid check. Secondary sources say BSD requires a matching
+        // effective uid to join a REUSEPORT port. The child reports its own
+        // uids next to the bind result, so a permissive answer cannot be
+        // blamed on the sudo used to change user. The same-uid child is the
+        // control: if it fails, the harness is wrong, not the kernel.
         let py = format!(
-            "import socket\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
+            "import os, socket\n\
+             print('uid', os.getuid(), 'euid', os.geteuid())\n\
+             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
              s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)\n\
              try:\n s.bind(('0.0.0.0',{}))\n print('BIND OK')\n\
              except OSError as e:\n print('BIND ERR', e)",
             port
         );
-        match std::process::Command::new("sudo")
-            .args(&["-n", "-u", "nobody", "python3", "-c", &py])
-            .output()
-        {
-            Ok(o) => report.push_str(&format!(
-                "Cross-uid bind as nobody: status={:?} stdout={:?} stderr={:?}\n",
-                o.status,
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            )),
-            Err(e) => report.push_str(&format!("Cross-uid attempt could not run: {}\n", e)),
+        for (label, argv) in [
+            ("same uid, no sudo", vec!["python3", "-c", &py]),
+            (
+                "different uid via sudo",
+                vec!["sudo", "-n", "-u", "nobody", "python3", "-c", &py],
+            ),
+        ] {
+            let out = std::process::Command::new(argv[0])
+                .args(&argv[1..])
+                .output();
+            match out {
+                Ok(o) => report.push_str(&format!(
+                    "Join attempt ({}): status={:?} stdout={:?} stderr={:?}\n",
+                    label,
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )),
+                Err(e) => {
+                    report.push_str(&format!("Join attempt ({}) could not run: {}\n", label, e))
+                }
+            }
+        }
+        if let Ok(o) = std::process::Command::new("id").arg("-u").output() {
+            report.push_str(&format!(
+                "Holder process uid: {}",
+                String::from_utf8_lossy(&o.stdout)
+            ));
         }
 
         panic!("REUSEPORT CI EXPERIMENT REPORT{}", report);
