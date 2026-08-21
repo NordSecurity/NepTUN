@@ -1522,135 +1522,173 @@ mod tests {
     }
 
     /// CI experiment for LLT-7623, not for merging. Panics by design so the
-    /// report lands in the job log on every platform. Questions it answers:
-    /// which second binds succeed against a holder with each reuse option,
-    /// where packets go while two sockets share the port, and whether another
-    /// uid can join the port.
+    /// report lands in the job log on every platform. Three questions: which
+    /// joiner flag combinations can share a port with which holder, how
+    /// packets are distributed while two sockets share one, and whether a
+    /// different uid can join. Every case is repeated or matrixed, because a
+    /// single sample of the delivery question gave opposite answers on two
+    /// runs of an earlier version of this test.
     #[test]
     fn ci_experiment_reuseport_semantics() {
         use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
         use std::time::Duration;
 
-        fn mk(reuse_addr: bool, reuse_port: bool) -> socket2::Socket {
-            let s = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-            s.set_reuse_address(reuse_addr).unwrap();
-            s.set_reuse_port(reuse_port).unwrap();
-            s
+        const ROUNDS: usize = 10;
+        const PKTS: usize = 8;
+
+        fn bind_new(reuse_addr: bool, reuse_port: bool, port: u16) -> io::Result<socket2::Socket> {
+            let s = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            s.set_reuse_address(reuse_addr)?;
+            s.set_reuse_port(reuse_port)?;
+            s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+            Ok(s)
         }
 
-        fn try_second(port: u16, reuse_addr: bool, reuse_port: bool) -> String {
-            let b = mk(reuse_addr, reuse_port);
-            match b.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into()) {
-                Ok(()) => "OK".to_owned(),
-                Err(e) => format!("ERR {}", e),
-            }
+        fn port_of(s: &socket2::Socket) -> u16 {
+            s.local_addr().unwrap().as_socket().unwrap().port()
         }
+
+        const FLAGS: [(bool, bool); 4] =
+            [(false, false), (true, false), (false, true), (true, true)];
 
         let mut report = format!("\ntarget_os={}\n", std::env::consts::OS);
 
-        // Phase 1: which second binds succeed. (true, false) is what neptun
-        // sets today; (true, true) is what the pre-socket2 code set on Apple.
-        for &(a_ra, a_rp) in &[(true, false), (true, true)] {
-            let a = mk(a_ra, a_rp);
-            a.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
-                .unwrap();
-            let port = a.local_addr().unwrap().as_socket().unwrap().port();
+        // Question 1: the join matrix. (true, false) is what neptun sets
+        // today; (true, true) is what the pre-socket2 code set on Apple.
+        report.push_str("\n== join matrix (holder -> joiner) ==\n");
+        for &(h_ra, h_rp) in &[(true, false), (true, true)] {
+            let holder = bind_new(h_ra, h_rp, 0).unwrap();
+            let port = port_of(&holder);
             report.push_str(&format!(
-                "\nA(reuse_addr={}, reuse_port={}) holds port {}\n",
-                a_ra, a_rp, port
+                "holder(reuse_addr={}, reuse_port={}) on port {}\n",
+                h_ra, h_rp, port
             ));
-            for &(b_ra, b_rp) in &[(false, false), (true, false), (false, true), (true, true)] {
+            for &(j_ra, j_rp) in FLAGS.iter() {
+                let r = match bind_new(j_ra, j_rp, port) {
+                    Ok(_) => "OK".to_owned(),
+                    Err(e) => format!("ERR {}", e),
+                };
                 report.push_str(&format!(
-                    "  B(reuse_addr={}, reuse_port={}): {}\n",
-                    b_ra,
-                    b_rp,
-                    try_second(port, b_ra, b_rp)
+                    "  joiner(reuse_addr={}, reuse_port={}): {}\n",
+                    j_ra, j_rp, r
                 ));
             }
         }
 
-        // Phase 2: delivery while two REUSEPORT sockets share the port, and
-        // after the older one closes.
-        let a = mk(true, true);
-        a.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
-            .unwrap();
-        let port = a.local_addr().unwrap().as_socket().unwrap().port();
-        let b = mk(true, true);
-        b.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())
-            .unwrap();
-        let a: UdpSocket = a.into();
-        let b: UdpSocket = b.into();
-        a.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        b.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut buf = [0u8; 16];
-        let (mut got_a, mut got_b) = (0, 0);
-        for i in 0..8u8 {
-            tx.send_to(&[i], ("127.0.0.1", port)).unwrap();
-            if a.recv_from(&mut buf).is_ok() {
-                got_a += 1;
-            }
-            if b.recv_from(&mut buf).is_ok() {
-                got_b += 1;
-            }
-        }
+        // Question 2: distribution over many rounds, with a fresh source port
+        // each round so any hashing of the 4-tuple shows up as variation.
         report.push_str(&format!(
-            "\nDelivery while A (older) and B share the port: A got {}, B got {} of 8\n",
-            got_a, got_b
+            "\n== delivery over {} rounds, {} packets each, A bound first ==\n",
+            ROUNDS, PKTS
         ));
-        drop(a);
-        let mut got_b2 = 0;
-        for i in 0..4u8 {
-            tx.send_to(&[i], ("127.0.0.1", port)).unwrap();
-            if b.recv_from(&mut buf).is_ok() {
-                got_b2 += 1;
-            }
-        }
-        report.push_str(&format!("After closing A: B got {} of 4\n", got_b2));
-
-        // Phase 3: the uid check. Secondary sources say BSD requires a matching
-        // effective uid to join a REUSEPORT port. The child reports its own
-        // uids next to the bind result, so a permissive answer cannot be
-        // blamed on the sudo used to change user. The same-uid child is the
-        // control: if it fails, the harness is wrong, not the kernel.
-        let py = format!(
-            "import os, socket\n\
-             print('uid', os.getuid(), 'euid', os.geteuid())\n\
-             s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n\
-             s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)\n\
-             try:\n s.bind(('0.0.0.0',{}))\n print('BIND OK')\n\
-             except OSError as e:\n print('BIND ERR', e)",
-            port
-        );
-        for (label, argv) in [
-            ("same uid, no sudo", vec!["python3", "-c", &py]),
-            (
-                "different uid via sudo",
-                vec!["sudo", "-n", "-u", "nobody", "python3", "-c", &py],
-            ),
-        ] {
-            let out = std::process::Command::new(argv[0])
-                .args(&argv[1..])
-                .output();
-            match out {
-                Ok(o) => report.push_str(&format!(
-                    "Join attempt ({}): status={:?} stdout={:?} stderr={:?}\n",
-                    label,
-                    o.status.code(),
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                )),
+        let mut tally = Vec::new();
+        for _ in 0..ROUNDS {
+            let a = bind_new(true, true, 0).unwrap();
+            let port = port_of(&a);
+            let b = match bind_new(true, true, port) {
+                Ok(b) => b,
                 Err(e) => {
-                    report.push_str(&format!("Join attempt ({}) could not run: {}\n", label, e))
+                    report.push_str(&format!("second bind failed: {}\n", e));
+                    break;
+                }
+            };
+            let a: UdpSocket = a.into();
+            let b: UdpSocket = b.into();
+            let t = Some(Duration::from_millis(120));
+            a.set_read_timeout(t).unwrap();
+            b.set_read_timeout(t).unwrap();
+            let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut buf = [0u8; 16];
+            let (mut ga, mut gb) = (0, 0);
+            for i in 0..PKTS {
+                tx.send_to(&[i as u8], ("127.0.0.1", port)).unwrap();
+                if a.recv_from(&mut buf).is_ok() {
+                    ga += 1;
+                }
+                if b.recv_from(&mut buf).is_ok() {
+                    gb += 1;
+                }
+            }
+            // Then close the older one and see whether the survivor takes over.
+            drop(a);
+            let mut after = 0;
+            for i in 0..4u8 {
+                tx.send_to(&[i], ("127.0.0.1", port)).unwrap();
+                if b.recv_from(&mut buf).is_ok() {
+                    after += 1;
+                }
+            }
+            tally.push((ga, gb, after));
+        }
+        for (i, (ga, gb, after)) in tally.iter().enumerate() {
+            report.push_str(&format!(
+                "  round {}: A(older)={} B(newer)={} of {}, after closing A: B={} of 4\n",
+                i, ga, gb, PKTS, after
+            ));
+        }
+
+        // Question 3: the uid check. Changing uid needs privilege, so only the
+        // sudo rows can vary it; the same-uid rows are the control. Joiner
+        // flags are varied explicitly, because adding SO_REUSEADDR to the
+        // joiner silently changed the answer in an earlier version.
+        report.push_str("\n== cross-uid joins ==\n");
+        for &(h_ra, h_rp) in &[(true, false), (true, true)] {
+            let holder = bind_new(h_ra, h_rp, 0).unwrap();
+            let port = port_of(&holder);
+            report.push_str(&format!(
+                "holder(reuse_addr={}, reuse_port={}) on port {}\n",
+                h_ra, h_rp, port
+            ));
+            for &(j_ra, j_rp) in &[(true, false), (false, true), (true, true)] {
+                let py = format!(
+                    r#"
+import os, socket
+print('uid', os.getuid(), 'euid', os.geteuid(), end=' ')
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if {ra}: s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+if {rp}: s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+try:
+    s.bind(('0.0.0.0', {port}))
+    print('BIND OK')
+except OSError as e:
+    print('BIND ERR', e)
+"#,
+                    ra = if j_ra { "True" } else { "False" },
+                    rp = if j_rp { "True" } else { "False" },
+                    port = port
+                );
+                for (who, argv) in [
+                    ("same uid", vec!["python3", "-c", &py]),
+                    (
+                        "other uid",
+                        vec!["sudo", "-n", "-u", "nobody", "python3", "-c", &py],
+                    ),
+                ] {
+                    let line = match std::process::Command::new(argv[0])
+                        .args(&argv[1..])
+                        .output()
+                    {
+                        Ok(o) if o.status.success() => {
+                            String::from_utf8_lossy(&o.stdout).trim().to_owned()
+                        }
+                        Ok(o) => format!(
+                            "child failed: status={:?} stderr={}",
+                            o.status.code(),
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        ),
+                        Err(e) => format!("could not run: {}", e),
+                    };
+                    report.push_str(&format!(
+                        "  joiner(reuse_addr={}, reuse_port={}) as {}: {}\n",
+                        j_ra, j_rp, who, line
+                    ));
                 }
             }
         }
-        if let Ok(o) = std::process::Command::new("id").arg("-u").output() {
+        if let Ok(o) = std::process::Command::new("id").args(["-u"]).output() {
             report.push_str(&format!(
-                "Holder process uid: {}",
-                String::from_utf8_lossy(&o.stdout)
+                "holder uid: {}\n",
+                String::from_utf8_lossy(&o.stdout).trim()
             ));
         }
 
