@@ -127,6 +127,15 @@ impl TunSocket {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_mock_from_fd(fd: RawFd) -> TunSocket {
+        TunSocket {
+            fd,
+            name: "mock".to_owned(),
+            already_closed: AtomicBool::new(false),
+        }
+    }
+
     pub fn new_from_fd(fd: RawFd) -> Result<TunSocket, Error> {
         let mut ifr = ifreq {
             ifr_name: [0; IFNAMSIZ],
