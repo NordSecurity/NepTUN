@@ -662,6 +662,9 @@ impl Device {
     }
 
     pub fn new_with_tun(tun: TunSocket, config: DeviceConfig) -> Result<Device, Error> {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let tun = tun.set_read_timeout(peer::DATA_SOCKET_READ_TIMEOUT)?;
+
         // Create a tunnel device
         let iface = Arc::new(tun);
         let mtu = iface.mtu()?;
@@ -674,6 +677,8 @@ impl Device {
         mtu: usize,
         config: DeviceConfig,
     ) -> Result<Device, Error> {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let tun = tun.set_read_timeout(peer::DATA_SOCKET_READ_TIMEOUT)?;
         let iface = Arc::new(tun);
         Self::new_with_iface(iface, mtu, config)
     }

@@ -10,6 +10,7 @@ use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 const CTRL_NAME: &[u8] = b"com.apple.net.utun_control";
 
@@ -212,6 +213,26 @@ impl TunSocket {
         }
     }
 
+    pub fn set_read_timeout(self, timeout: Duration) -> Result<TunSocket, Error> {
+        let tv = timeval {
+            tv_sec: timeout.as_secs() as time_t,
+            tv_usec: timeout.subsec_micros() as suseconds_t,
+        };
+
+        match unsafe {
+            setsockopt(
+                self.fd,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &tv as *const _ as *const c_void,
+                size_of::<timeval>() as socklen_t,
+            )
+        } {
+            -1 => Err(Error::SetSockOpt(io::Error::last_os_error().to_string())),
+            _ => Ok(self),
+        }
+    }
+
     pub fn name(&self) -> Result<String, Error> {
         let mut tunnel_name = [0u8; 256];
         let mut tunnel_name_len: socklen_t = tunnel_name.len() as u32;
@@ -320,6 +341,7 @@ impl TunSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn test_ip_version() {
@@ -327,5 +349,74 @@ mod tests {
         assert!(ip_version(&[4]).is_err());
         assert_eq!(ip_version(&[4 << 4]).unwrap(), AF_INET as u8);
         assert_eq!(ip_version(&[6 << 4]).unwrap(), AF_INET6 as u8);
+    }
+
+    #[test]
+    // TODO: change the gating so that this test runs with others that require sudo privileges
+    #[ignore]
+    fn test_tun_read_timeout() {
+        const TIMEOUT: Duration = Duration::from_millis(250);
+        const PKT_SIZE: usize = 1550;
+
+        // let the kernel pick
+        let tun = TunSocket::new("utun")
+            .expect("failed to create utun (requires sudo)")
+            .set_read_timeout(TIMEOUT)
+            .expect("SO_RCVTIMEO rejected on utun fd");
+
+        // assert that the kernel stored utun iface as expected
+        let mut tv = timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = size_of::<timeval>() as socklen_t;
+        assert_eq!(
+            unsafe {
+                getsockopt(
+                    tun.as_raw_fd(),
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    &mut tv as *mut _ as *mut c_void,
+                    &mut len,
+                )
+            },
+            0,
+            "getsockopt() failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(tv.tv_sec, 0);
+        assert_eq!(tv.tv_usec, TIMEOUT.subsec_micros() as suseconds_t);
+
+        // read on an idle tun iface returns after timeout instead of blocking indefinitely
+        let mut buf = [0u8; PKT_SIZE];
+        let start = Instant::now();
+
+        let result = tun.read(&mut buf);
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(Error::IfaceRead(e)) => assert!(
+                matches!(e.kind(), io::ErrorKind::WouldBlock),
+                "Expected WouldBlock from SO_RCVTIMEO expiry, got {:?}",
+                e
+            ),
+            Ok(pkt) => panic!("Unexpected packet of {} bytes on an idle tun", pkt.len()),
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
+
+        // check lower bound - read waited rather than failed immediately (like a non-blocking fd)
+        assert!(
+            elapsed >= TIMEOUT.mul_f32(0.9),
+            "read() returned after {:?}, expected to block for {:?}",
+            elapsed,
+            TIMEOUT,
+        );
+
+        // check upper bound (with a time margin applied) - no indefinite blocking
+        assert!(
+            elapsed < TIMEOUT * 8,
+            "read() returned after {:?}, timeout set on tun interface was not honored",
+            elapsed
+        );
     }
 }

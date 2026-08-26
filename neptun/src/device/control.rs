@@ -4,10 +4,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{
-    DispatchGroup, DispatchQueue, DispatchQueueGlobalPriority, DispatchRetained,
-    GlobalQueueIdentifier,
-};
+use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 
 use crate::device::{
     dev_lock::Lock, tun::TunSocket, Device, DeviceHandle, ThreadData, MAX_PKT_SIZE,
@@ -43,11 +40,8 @@ impl Control {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
             let group = DispatchGroup::new();
-            // TODO: check if it is better to use serial queue (rather than the global queue)
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-                DispatchQueueGlobalPriority::High,
-            ));
-
+            let queue = DispatchQueue::new("neptun-control", DispatchQueueAttr::SERIAL);
+            // TODO: ensure P-core preference for execution
             group.exec_async(&queue, move || Control::event_loop(thread_data, &device));
             group
         };

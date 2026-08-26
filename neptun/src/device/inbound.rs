@@ -12,10 +12,7 @@ use std::{
 use std::thread::{self, JoinHandle};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{
-    DispatchGroup, DispatchQueue, DispatchQueueGlobalPriority, DispatchRetained,
-    GlobalQueueIdentifier,
-};
+use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 
 use crate::{
     device::{dev_lock::Lock, peer::Peer, Device, MAX_PKT_SIZE},
@@ -34,11 +31,8 @@ impl Inbound {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
             let group = DispatchGroup::new();
-            // TODO: check if it is better to use serial queue (rather than the global queue)
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-                DispatchQueueGlobalPriority::High,
-            ));
-
+            let queue = DispatchQueue::new("neptun-in", DispatchQueueAttr::SERIAL);
+            // TODO: ensure P-core preference for execution
             group.exec_async(&queue, move || Inbound::data_thread(device, stop));
             group
         };

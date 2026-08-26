@@ -11,10 +11,7 @@ use std::{
 use std::thread::{self, JoinHandle};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{
-    DispatchGroup, DispatchQueue, DispatchQueueGlobalPriority, DispatchRetained,
-    GlobalQueueIdentifier,
-};
+use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained};
 
 use crate::{
     device::{
@@ -36,11 +33,8 @@ impl Outbound {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
             let group = DispatchGroup::new();
-            // TODO: check if it is better to use serial queue (rather than the global queue)
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-                DispatchQueueGlobalPriority::High,
-            ));
-
+            let queue = DispatchQueue::new("neptun-out", DispatchQueueAttr::SERIAL);
+            // TODO: ensure P-core preference for execution
             group.exec_async(&queue, move || Outbound::data_thread(device, stop));
             group
         };
@@ -57,6 +51,7 @@ impl Outbound {
     }
 
     fn data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
+        // TODO: set_iface() must restart the thread
         let (iface, mtu, fw_callback, udp4, udp6) = {
             let d = device.read();
             (
@@ -78,13 +73,11 @@ impl Outbound {
 
         let mut buf = [0u8; MAX_PKT_SIZE];
 
-        // Cached clone of the peer's connected socket (appears after the first handshake).
-        let mut conn: Option<socket2::Socket> = None;
-
         while !stop.load(Ordering::Relaxed) {
             let mtu = mtu.load(Ordering::Relaxed);
 
             let IfaceReadResult::Packet { payload, peer } =
+                // TODO: this is a blocking call, add exit notifier on Linux (timeout added on Darwin)
                 read_tun_packet(&iface, &mut buf, mtu, &device)
             else {
                 // TODO: ensure correct action on different IfaceReadResult variants
@@ -104,32 +97,27 @@ impl Outbound {
             }
 
             let session = {
-                match peer.tunnel.lock().current_session() {
+                // Bind to a local variable so that the tunnel MutexGuard is dropped
+                // immediately after acquiring the session
+                let current = peer.tunnel.lock().current_session();
+                match current {
                     Some(s) => s,
                     None => {
+                        // TODO: handle packet queueing on no session - previously done in Tunn::encapsulate_in_place()
+                        // TODO: want_handshake waits up to 250 ms for the timer state machine to tick, consider
+                        //  using trigger_yield() to raise a notification event instead
                         peer.request_handshake();
                         continue;
                     }
                 }
             };
 
-            // TODO: consider reversing logic - only use connected sockets if supposed to
-            //  if (use_conn_skt && !peer.endpoint.conn) -> continue
-
+            // TODO: Handle timers update - previously done in Tunn::encapsulate_in_place()
+            //  TimeLastPacketSent / TimeLastDataPacketSent
             match session.encrypt(payload_len, &mut buf) {
                 Ok(packet) => send_packet(&peer, packet, udp4, udp6),
                 Err(e) => tracing::trace!(message = "encrypt failed", error = ?e),
             }
-
-            // TODO: last sent packet should update timers accordingly as per protocol spec - how can this be achieved
-            // efficiently if the data plane does not know about timers?
-
-            // TODO: what about packet queueing prior to establishing a handshake (and how will they be dequeued and sent)?
-
-            // TODO: how should this thread be stopped and cleaned up? at the moment it must receive a new packet in order
-            // to be able to recheck its `stop` flag - a timeout on iface.read?
-
-            // TODO: handling multiple peers
         }
     }
 }
@@ -151,6 +139,7 @@ fn read_tun_packet<'a>(
         Ok(payload) => match Tunn::dst_address(payload) {
             None => IfaceReadResult::Skip,
             Some(dst_addr) => {
+                // TODO: Check if using ArcSwap can be used to fully remove read lock from the hot path and if it brings meaningful gain
                 let d = device.read();
                 match d.peers_by_ip.find(dst_addr) {
                     None => IfaceReadResult::Skip,

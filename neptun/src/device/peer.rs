@@ -22,7 +22,7 @@ use std::os::fd::AsRawFd;
 
 /// Coarse read timeout on the connected data socket so the IN data thread wakes periodically
 /// to check the shutdown flag (and lets the control thread drive timers independently).
-const DATA_SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(250);
+pub(crate) const DATA_SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
