@@ -352,6 +352,16 @@ impl Tunn {
         self.sessions[receiver_idx as usize % N_SESSIONS].clone()
     }
 
+    /// Advance timers related to sending a data packet
+    pub fn timer_tick_data_packet_sent(&mut self) {
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        self.timer_tick(TimerName::TimeLastDataPacketSent);
+    }
+
+    pub fn append_tx_bytes(&mut self, packet_len: usize) {
+        self.tx_bytes += packet_len as u64;
+    }
+
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///

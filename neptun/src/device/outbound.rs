@@ -18,7 +18,7 @@ use crate::{
         dev_lock::Lock, peer::Peer, tun::TunSocket, Device, Error, IfaceReadResult, MAX_PKT_SIZE,
         WG_HEADER_OFFSET,
     },
-    noise::Tunn,
+    noise::{Tunn, TunnResult},
 };
 
 pub struct Outbound;
@@ -84,12 +84,6 @@ impl Outbound {
                 continue;
             };
 
-            let payload_len = payload.len();
-
-            if payload_len == 0 {
-                continue;
-            }
-
             if let Some(callback) = &fw_callback {
                 if !callback(&peer.public_key.0, payload, &mut iface.as_ref()) {
                     continue;
@@ -97,8 +91,8 @@ impl Outbound {
             }
 
             let session = {
-                // Bind to a local variable so that the tunnel MutexGuard is dropped
-                // immediately after acquiring the session
+                // Bind to a local variable so that the tunnel MutexGuard is dropped immediately after
+                // acquiring the session
                 let current = peer.tunnel.lock().current_session();
                 match current {
                     Some(s) => s,
@@ -112,11 +106,25 @@ impl Outbound {
                 }
             };
 
-            // TODO: Handle timers update - previously done in Tunn::encapsulate_in_place()
-            //  TimeLastPacketSent / TimeLastDataPacketSent
+            let payload_len = payload.len();
             match session.encrypt(payload_len, &mut buf) {
-                Ok(packet) => send_packet(&peer, packet, udp4, udp6),
-                Err(e) => tracing::trace!(message = "encrypt failed", error = ?e),
+                TunnResult::WriteToNetwork(packet) => {
+                    // Advance timers and append tx_bytes
+                    {
+                        let mut tun = peer.tunnel.lock();
+                        tun.timer_tick_data_packet_sent();
+                        tun.append_tx_bytes(payload_len);
+                    }
+                    send_packet(&peer, packet, udp4, udp6);
+                }
+                TunnResult::Err(e) => {
+                    tracing::error!(message = "Encryption error",
+                        error = ?e,
+                        public_key = peer.public_key.1); // TODO: mask public key
+                }
+                _ => {
+                    tracing::error!("Unexpected result from encrypt");
+                }
             }
         }
     }

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::PacketData;
-use crate::noise::errors::WireGuardError;
+use crate::noise::{errors::WireGuardError, TunnResult};
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -304,12 +304,11 @@ impl Session {
     /// Encrypt a data packet (off-lock data path). The plaintext payload must already be
     /// at `packet_buffer[DATA_OFFSET..DATA_OFFSET + payload_len]`; returns the full WireGuard
     /// data packet. Takes `&self` so it can run on a shared `Arc<Session>` without the Tunn lock.
-    pub fn encrypt<'a>(
-        &self,
-        payload_len: usize,
-        packet_buffer: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
-        self.format_packet_data(payload_len, packet_buffer)
+    pub fn encrypt<'a>(&self, payload_len: usize, packet_buffer: &'a mut [u8]) -> TunnResult<'a> {
+        match self.format_packet_data(payload_len, packet_buffer) {
+            Ok(packet) => TunnResult::WriteToNetwork(packet),
+            Err(e) => TunnResult::Err(e),
+        }
     }
 
     /// Decrypt a parsed data packet (off-lock data path). Takes `&self` so it can run on
