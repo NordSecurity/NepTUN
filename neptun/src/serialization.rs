@@ -1,6 +1,69 @@
 use base64::{engine::general_purpose, Engine};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+/// Number of leading/trailing base64 characters kept when masking a public key.
+const MASK_KEEP: usize = 4;
+/// base64 length of a 32 byte key: `4 * ceil(32 / 3)`.
+const KEY_BASE64_LEN: usize = 44;
+
+/// Masked public key wrapper.
+///
+/// `Display` and `Debug` both render only the first and last four base64
+/// characters (`AQEB...AQE=`) — enough to tell which peer a log line belongs
+/// to, without putting a whole key in a log sink.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PubKey([u8; 32]);
+
+impl PubKey {
+    /// Raw key material.
+    // Only used by the firewall callbacks; gated to match `device` in lib.rs,
+    // which is unix-only - otherwise this is dead code on Windows.
+    #[cfg(all(unix, feature = "device"))]
+    pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for PubKey {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<crate::x25519::PublicKey> for PubKey {
+    fn from(key: crate::x25519::PublicKey) -> Self {
+        Self(key.to_bytes())
+    }
+}
+
+impl From<&crate::x25519::PublicKey> for PubKey {
+    fn from(key: &crate::x25519::PublicKey) -> Self {
+        Self(key.to_bytes())
+    }
+}
+
+impl std::fmt::Display for PubKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let encoded = general_purpose::STANDARD.encode(self.0);
+        match (
+            encoded.get(..MASK_KEEP),
+            encoded.get(KEY_BASE64_LEN - MASK_KEEP..),
+        ) {
+            (Some(head), Some(tail)) => write!(f, "{}...{}", head, tail),
+            _ => f.write_str("<unencodable key>"),
+        }
+    }
+}
+
+// Deliberately not derived: a derived Debug would print the raw bytes, and
+// `?key` in a log statement is an easy mistake to make. Debug == Display, so
+// both sigils are safe.
+impl std::fmt::Debug for PubKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct KeyBytes([u8; 32]);
@@ -54,6 +117,29 @@ impl std::str::FromStr for KeyBytes {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn pubkey_display_is_masked() {
+        // Known keys and the exact fragment each must render as. The full
+        // base64 is spelled out so the expected head and tail can be checked
+        // by eye:
+        //
+        //   [1u8; 32]   AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=
+        //   1..=32      AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+        //   [0xff; 32]  //////////////////////////////////////////8=
+        //
+        // The sequential key has a head and tail that differ, so it cannot
+        // pass by coincidence; the all-ones key covers the `/` end of the
+        // base64 alphabet.
+        let sequential: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
+
+        assert_eq!(PubKey::from([1u8; 32]).to_string(), "AQEB...AQE=");
+        assert_eq!(PubKey::from(sequential).to_string(), "AQID...HyA=");
+        assert_eq!(PubKey::from([0xffu8; 32]).to_string(), "////...//8=");
+
+        // Debug is masked too, so `?key` is as safe as `%key`.
+        assert_eq!(format!("{:?}", PubKey::from(sequential)), "AQID...HyA=");
+    }
 
     #[test]
     fn invalid_base64_44_chars_should_return_error() {
