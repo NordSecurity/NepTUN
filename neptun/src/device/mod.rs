@@ -34,6 +34,7 @@ mod packet_workers;
 use crate::device::control::Control;
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
+use crate::device::peer::DATA_SOCKET_READ_TIMEOUT;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -428,6 +429,7 @@ impl DeviceHandle {
     fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>) {
         loop {
             let mut device_lock = device.read();
+            tracing::info!("Entered event loop and obtained read lock on the device");
 
             if device_lock.update_seq != thread_local.update_seq {
                 // New threads are started when the tun interface is changed, so this
@@ -444,8 +446,12 @@ impl DeviceHandle {
                         let action = (*handler)(&mut device_lock, &mut thread_local);
                         match action {
                             Action::Continue => {}
-                            Action::Yield => break,
+                            Action::Yield => {
+                                tracing::info!("Yielding from inner event loop...");
+                                break;
+                            }
                             Action::Exit => {
+                                tracing::info!("Exiting event loop...");
                                 device_lock.try_writeable(
                                     |dev| dev.trigger_yield(),
                                     |dev| dev.closed = true,
@@ -750,14 +756,14 @@ impl Device {
         if let Some(s) = self.udp4.take() {
             // #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             // self.workers.shutdown();
-            unsafe {
-                // This is safe because the event loop is not running yet
-                self.queue.clear_event_by_fd(s.as_raw_fd());
-            }
+            // unsafe {
+            //     // This is safe because the event loop is not running yet
+            //     self.queue.clear_event_by_fd(s.as_raw_fd());
+            // }
         };
 
         if let Some(s) = self.udp6.take() {
-            unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
+            // unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
         }
 
         for peer in self.peers.values() {
@@ -768,7 +774,8 @@ impl Device {
         let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-        udp_sock4.set_nonblocking(true)?;
+        udp_sock4.set_nonblocking(false)?;
+        udp_sock4.set_read_timeout(Some(DATA_SOCKET_READ_TIMEOUT))?;
         self.config.protect.make_external(udp_sock4.as_raw_fd());
 
         if port == 0 {
@@ -781,7 +788,8 @@ impl Device {
         let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock6.set_reuse_address(true)?;
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-        udp_sock6.set_nonblocking(true)?;
+        udp_sock6.set_nonblocking(false)?;
+        udp_sock6.set_read_timeout(Some(DATA_SOCKET_READ_TIMEOUT))?;
         self.config.protect.make_external(udp_sock6.as_raw_fd());
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -791,8 +799,8 @@ impl Device {
             modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
 
-        self.register_udp_handler(udp_sock4.try_clone()?)?;
-        self.register_udp_handler(udp_sock6.try_clone()?)?;
+        // self.register_udp_handler(udp_sock4.try_clone()?)?;
+        // self.register_udp_handler(udp_sock6.try_clone()?)?;
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
