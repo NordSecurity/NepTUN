@@ -91,13 +91,18 @@ impl Outbound {
             }
 
             let session = {
-                // Bind to a local variable so that the tunnel MutexGuard is dropped immediately after
+                // Bind to a local variable, so that the tunnel's MutexGuard is dropped immediately after
                 // acquiring the session
                 let current = peer.tunnel.lock().current_session();
                 match current {
                     Some(s) => s,
                     None => {
-                        // TODO: handle packet queueing on no session - previously done in Tunn::encapsulate_in_place()
+                        // Queue packet if session is not yet established
+                        {
+                            let mut tun = peer.tunnel.lock();
+                            tun.queue_packet(payload);
+                        }
+
                         // TODO: want_handshake waits up to 250 ms for the timer state machine to tick, consider
                         //  using trigger_yield() to raise a notification event instead
                         peer.request_handshake();
