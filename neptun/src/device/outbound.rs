@@ -51,29 +51,31 @@ impl Outbound {
     }
 
     fn data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
-        // TODO: set_iface() must restart the thread
-        let (iface, mtu, fw_callback, udp4, udp6) = {
+        let (iface, mtu, fw_callback) = {
             let d = device.read();
             (
                 d.iface.clone(),
                 d.mtu.clone(),
                 d.config.firewall_process_outbound_callback.clone(),
-                d.udp4.clone(),
-                d.udp6.clone(),
             )
-        };
-
-        let (udp4, udp6) = match (udp4.as_ref(), udp6.as_ref()) {
-            (Some(udp4), Some(udp6)) => (udp4, udp6),
-            _ => {
-                tracing::error!("Not connected");
-                return; // TODO: Action::Continue
-            }
         };
 
         let mut buf = [0u8; MAX_PKT_SIZE];
 
         while !stop.load(Ordering::Relaxed) {
+            let (udp4, udp6) = {
+                let d = device.read();
+                (d.udp4.clone(), d.udp6.clone())
+            };
+
+            let (udp4, udp6) = match (udp4.as_ref(), udp6.as_ref()) {
+                (Some(udp4), Some(udp6)) => (udp4, udp6),
+                _ => {
+                    tracing::error!("Not connected");
+                    return; // TODO: Action::Continue
+                }
+            };
+
             let mtu = mtu.load(Ordering::Relaxed);
 
             let IfaceReadResult::Packet { payload, peer } =
