@@ -31,6 +31,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Packet, Tunn, TunnResult};
+use crate::serialization::PubKey;
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use dev_lock::{Lock, LockReadGuard};
@@ -66,6 +67,18 @@ use {
     std::os::fd::{AsFd, BorrowedFd},
     std::thread::{self, JoinHandle},
 };
+
+/// Entered span carrying a peer's masked id, so every log statement in the
+/// enclosing call inherits a `peer` field.
+///
+/// Accepts anything a [`PubKey`] can be built from - raw bytes, an
+/// `x25519::PublicKey`, or a `PubKey` itself.
+///
+/// `Level::ERROR` makes the span enabled under any filter.
+#[inline]
+pub(crate) fn peer_span(peer: impl Into<PubKey>) -> tracing::span::EnteredSpan {
+    tracing::span!(tracing::Level::ERROR, "tunn", peer = %peer.into()).entered()
+}
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
 
@@ -525,6 +538,7 @@ impl Device {
 
     fn remove_peer(&mut self, pub_key: &x25519::PublicKey) {
         if let Some(peer) = self.peers.remove(pub_key) {
+            let _span = peer_span(peer.public_key);
             // Found a peer to remove, now purge all references to it:
             {
                 peer.shutdown_endpoint(); // close open udp socket and free the closure
@@ -600,6 +614,7 @@ impl Device {
         preshared_key: Option<[u8; 32]>,
     ) -> Result<Arc<Peer>, Error> {
         let next_index = self.next_index();
+        let _span = peer_span(pub_key);
         let device_key_pair = self.key_pair.as_ref().ok_or_else(|| {
             tracing::error!("No device keypair specified for a peer");
             Error::InternalError("No device keypair specified for a peer".to_owned())
@@ -888,6 +903,7 @@ impl Device {
 
                 // Go over each peer and invoke the timer function
                 for peer in peer_map.values() {
+                    let _span = peer_span(peer.public_key);
                     let endpoint_addr = match peer.endpoint().addr {
                         Some(addr) => addr,
                         None => continue,
@@ -1028,6 +1044,7 @@ impl Device {
                         None => continue,
                         Some(peer) => peer,
                     };
+                    let _span = peer_span(peer.public_key);
 
                     let mut flush = false; // Are there packets to send from the queue?
                     let res = {
@@ -1048,7 +1065,7 @@ impl Device {
                         }
                         TunnResult::WriteToTunnel(packet, addr) => {
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
+                                if !callback(peer.public_key.as_bytes(), packet) {
                                     continue;
                                 }
                             }
@@ -1059,8 +1076,7 @@ impl Device {
                                     message = "Writing packet to tunnel",
                                     interface = ?t.iface.name(),
                                     packet_length = packet.len(),
-                                    src_addr = ?addr,
-                                    public_key = peer.public_key.1
+                                    src_addr = ?addr
                                 );
                             }
                         }
@@ -1121,6 +1137,7 @@ impl Device {
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
+                let _span = peer_span(peer.public_key);
                 // The conn_handler handles packet received from a connected UDP socket, associated
                 // with a known peer, this saves us the hustle of finding the right peer. If another
                 // peer gets the same ip, it will be ignored until the socket does not expire.
@@ -1154,13 +1171,11 @@ impl Device {
                                     WireGuardError::DuplicateCounter => {
                                         // TODO(LLT-6071): revert back to having error level for all error types
                                         tracing::debug!(message="Decapsulate error",
-                                            error=?e,
-                                            public_key=peer.public_key.1)
+                                            error=?e)
                                     }
                                     _ => {
                                         tracing::error!(message="Decapsulate error",
-                                        error=?e,
-                                        public_key = peer.public_key.1)
+                                        error=?e)
                                     }
                                 },
                                 TunnResult::WriteToNetwork(packet) => {
@@ -1278,8 +1293,13 @@ fn process_iface_inline(
             IfaceReadResult::Fatal => return Action::Exit,
             IfaceReadResult::Skip => continue,
             IfaceReadResult::Packet { payload, peer } => {
+                let _span = peer_span(peer.public_key);
                 if let Some(callback) = &device.config.firewall_process_outbound_callback {
-                    if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
+                    if !callback(
+                        peer.public_key.as_bytes(),
+                        payload,
+                        &mut thread_data.iface.as_ref(),
+                    ) {
                         continue;
                     }
                 }
@@ -1341,8 +1361,7 @@ fn encapsulate_and_send(
         TunnResult::Done => {}
         TunnResult::Err(e) => {
             tracing::error!(message = "Encapsulate error",
-                error = ?e,
-                public_key = peer.public_key.1);
+                error = ?e);
         }
         TunnResult::WriteToNetwork(packet) => {
             let endpoint = peer.endpoint();
@@ -1368,13 +1387,13 @@ fn encapsulate_and_send(
                 if let Err(err) = udp4.send_to(packet, &addr.into()) {
                     tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
                 } else {
-                    tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
+                    tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr);
                 }
             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
                 if let Err(err) = udp6.send_to(packet, &addr.into()) {
                     tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
                 } else {
-                    tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
+                    tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr);
                 }
             } else {
                 tracing::error!("No endpoint");
