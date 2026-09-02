@@ -28,6 +28,8 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
+pub mod waker;
+
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 mod packet_workers;
 
@@ -35,6 +37,7 @@ use crate::device::control::Control;
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
 use crate::device::peer::DATA_SOCKET_READ_TIMEOUT;
+use crate::device::waker::Waker;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -205,6 +208,8 @@ pub struct Device {
 
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     workers: PacketWorkers,
+
+    waker: Arc<Waker>,
 }
 
 struct ThreadData {
@@ -271,8 +276,11 @@ impl DeviceHandle {
 
         let stop_in = interface_lock.read().data_stop.clone();
         let stop_out = stop_in.clone();
+
         threads.push(Inbound::start(interface_lock.clone(), stop_in));
-        threads.push(Outbound::start(interface_lock.clone(), stop_out));
+
+        let waker = interface_lock.read().waker.clone();
+        threads.push(Outbound::start(interface_lock.clone(), stop_out, waker));
 
         Ok(DeviceHandle {
             device: interface_lock,
@@ -722,6 +730,8 @@ impl Device {
             data_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             workers,
+            // TODO: fix unwrap()
+            waker: Arc::new(Waker::new().unwrap()),
         };
 
         if device.config.open_uapi_socket {
@@ -806,6 +816,8 @@ impl Device {
         let udp6 = Arc::new(udp_sock6);
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
+
+        self.waker.wake();
 
         let _ = (&udp4, &udp6);
 

@@ -52,6 +52,7 @@ nix = { version = "0.31", default-features = false, features = [
     "time",
     "user",
     "socket",
+    "poll",
 ] }
 
 [dev-dependencies]

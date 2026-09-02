@@ -77,14 +77,7 @@ impl Inbound {
         let rcvbuf = [0u8; MAX_PKT_SIZE];
         let dstbuf = [0u8; MAX_PKT_SIZE];
 
-        handle_packet_loop(
-            device,
-            iface,
-            fw_callback,
-            rcvbuf,
-            dstbuf,
-            stop,
-        );
+        handle_packet_loop(device, iface, fw_callback, rcvbuf, dstbuf, stop);
 
         // let bound: Option<(Arc<Peer>, socket2::Socket)> = None;
         // handle_packet_loop_single_conn_peer(device, iface, rcvbuf, dstbuf, bound, stop);

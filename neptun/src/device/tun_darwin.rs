@@ -7,6 +7,7 @@ use libc::*;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::mem::size_of_val;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicBool;
@@ -60,6 +61,12 @@ pub struct TunSocket {
 impl Drop for TunSocket {
     fn drop(&mut self) {
         self.force_close();
+    }
+}
+
+impl AsFd for TunSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
     }
 }
 
