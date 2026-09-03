@@ -109,7 +109,7 @@ impl Outbound {
                     }
                 }
 
-                // TODO: any better way indstead of array and indexing? maybe a struct?
+                // TODO: any better way instead of array and indexing? maybe a struct?
                 let wake_revents = pfds[WAKE].revents().unwrap_or(PollFlags::empty());
                 let tun_revents = pfds[TUN].revents().unwrap_or(PollFlags::empty());
 
@@ -140,7 +140,6 @@ impl Outbound {
                         continue 'outer;
                     }
 
-                    // TODO: revert non-blocking call, remove timeout added previously on Darwin)
                     let (payload, peer) = match read_tun_packet(&iface, &mut buf, mtu, &device) {
                         IfaceReadResult::Packet { payload, peer } => (payload, peer),
                         IfaceReadResult::Skip => continue,

@@ -220,26 +220,6 @@ impl TunSocket {
         }
     }
 
-    pub fn set_read_timeout(self, timeout: Duration) -> Result<TunSocket, Error> {
-        let tv = timeval {
-            tv_sec: timeout.as_secs() as time_t,
-            tv_usec: timeout.subsec_micros() as suseconds_t,
-        };
-
-        match unsafe {
-            setsockopt(
-                self.fd,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                &tv as *const _ as *const c_void,
-                size_of::<timeval>() as socklen_t,
-            )
-        } {
-            -1 => Err(Error::SetSockOpt(io::Error::last_os_error().to_string())),
-            _ => Ok(self),
-        }
-    }
-
     pub fn name(&self) -> Result<String, Error> {
         let mut tunnel_name = [0u8; 256];
         let mut tunnel_name_len: socklen_t = tunnel_name.len() as u32;
