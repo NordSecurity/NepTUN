@@ -17,7 +17,7 @@ use nix::{
 use std::thread::{self, JoinHandle};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 
 use crate::{
     device::{
@@ -25,7 +25,7 @@ use crate::{
         peer::Peer,
         tun::TunSocket,
         waker::Waker,
-        Device,
+        DataPlane, Device,
         Error::{self},
         IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
@@ -43,14 +43,16 @@ const ERR_FLAGS: PollFlags = PollFlags::POLLERR
     .union(PollFlags::POLLHUP)
     .union(PollFlags::POLLNVAL);
 
-pub(super) struct Outbound;
+pub(super) struct Outbound {
+    thread: OutboundThread,
+}
 
 impl Outbound {
     pub fn start(
         device: Arc<Lock<Device>>,
         stop: Arc<AtomicBool>,
         waker: Arc<Waker>,
-    ) -> OutboundThread {
+    ) -> Result<Outbound, Error> {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
             let group = DispatchGroup::new();
@@ -64,14 +66,24 @@ impl Outbound {
         let thread = {
             thread::Builder::new()
                 .name("neptun-out ".to_string())
-                .spawn(move || Outbound::data_thread(device, stop, waker))
-                .unwrap()
+                .spawn(move || Outbound::data_thread(device, stop, waker))?
         };
 
-        thread
+        Ok(Self { thread })
     }
 
     fn data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>, waker: Arc<Waker>) {
+        if let Err(e) = Self::run(device.clone(), stop, waker) {
+            // On critical failure close the device, stop control and data plane loops and trigger exit
+            DataPlane::close_device(&device, e);
+        }
+    }
+
+    fn run(
+        device: Arc<Lock<Device>>,
+        stop: Arc<AtomicBool>,
+        waker: Arc<Waker>,
+    ) -> Result<(), Error> {
         let mut buf = [0u8; MAX_PKT_SIZE];
 
         'outer: while !stop.load(Ordering::Relaxed) {
@@ -88,9 +100,7 @@ impl Outbound {
 
             let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
                 tracing::debug!(message = "Not connected, parked until sockets are opened.");
-                if !park_on_waker(&waker) {
-                    return; // TODO: what's next? thread exits and.... ?
-                }
+                park_on_waker(&waker)?;
                 continue 'outer;
             };
 
@@ -102,11 +112,9 @@ impl Outbound {
             loop {
                 match poll(&mut pfds, PollTimeout::NONE) {
                     Ok(_) => {}
-                    Err(nix::errno::Errno::EINTR) => continue, // TODO: why continue on this error?
-                    Err(e) => {
-                        tracing::error!(message = "poll failed on TUN interface", error = ?e);
-                        return; // TODO: what's next? thread exits and.... ?
-                    }
+                    // Retry on interrupted syscall
+                    Err(Errno::EINTR) => continue,
+                    Err(e) => return Err(Error::Poll(e.into())),
                 }
 
                 // TODO: any better way instead of array and indexing? maybe a struct?
@@ -121,9 +129,7 @@ impl Outbound {
                 if tun_revents.intersects(ERR_FLAGS) {
                     // The current TUN iface is gone, park until a new iface config is signalled
                     tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents); // TODO: verify this logging
-                    if !park_on_waker(&waker) {
-                        return; // TODO: what's next? thread exits and.... ?
-                    }
+                    park_on_waker(&waker)?;
                     continue 'outer;
                 }
 
@@ -144,7 +150,7 @@ impl Outbound {
                         IfaceReadResult::Packet { payload, peer } => (payload, peer),
                         IfaceReadResult::Skip => continue,
                         IfaceReadResult::Exhausted => break,
-                        IfaceReadResult::Fatal => return, // TODO: what's next? thread exits and.... ?
+                        IfaceReadResult::Fatal(e) => return Err(e),
                     };
 
                     if let Some(callback) = &fw_callback {
@@ -197,24 +203,36 @@ impl Outbound {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) fn join(self) {
+        if let Err(e) = self.thread.join() {
+            tracing::error!(message = "Unable to gracefully clode outbound thread.", error = ?e);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    pub(crate) fn join(self) {
+        let _ = self.thread.wait(DispatchTime::FOREVER);
     }
 }
 
 /// Blocks until the waker receives a signal.
 /// Returns false on fatal error from poll.
-fn park_on_waker(waker: &Waker) -> bool {
+fn park_on_waker(waker: &Waker) -> Result<(), Error> {
     let mut pfds = [PollFd::new(waker.wait_fd(), PollFlags::POLLIN)];
     loop {
         match poll(&mut pfds, PollTimeout::NONE) {
             Ok(_) => {
                 waker.ack();
-                return true;
+                return Ok(());
             }
+            // Retry on interrupted syscall
             Err(Errno::EINTR) => continue,
-            Err(e) => {
-                tracing::error!(message = "poll failed on waker", error = ?e);
-                return false;
-            }
+            Err(e) => return Err(Error::Poll(e.into())),
         }
     }
 }
@@ -227,7 +245,9 @@ fn read_tun_packet<'a>(
 ) -> IfaceReadResult<'a> {
     if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
         tracing::error!("Insufficient packet buffer size");
-        return IfaceReadResult::Fatal;
+        return IfaceReadResult::Fatal(Error::InternalError(
+            "Insufficient packet buffer size".to_owned(),
+        ));
     }
 
     #[allow(clippy::indexing_slicing)]
@@ -251,12 +271,12 @@ fn read_tun_packet<'a>(
             io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => IfaceReadResult::Exhausted,
             _ => {
                 tracing::error!(message = "Fatal read error on tun interface: errno", error = ?e);
-                IfaceReadResult::Fatal
+                IfaceReadResult::Fatal(Error::IfaceRead(e))
             }
         },
         Err(e) => {
             tracing::error!(message = "Unexpected error on tun interface", error = ?e);
-            IfaceReadResult::Fatal
+            IfaceReadResult::Fatal(e)
         }
     }
 }

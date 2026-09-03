@@ -12,13 +12,15 @@ use std::{
 use std::thread::{self, JoinHandle};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained};
+use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 use nix::sys::socket;
 use socket2::Socket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
-    device::{dev_lock::Lock, peer::Peer, tun::TunSocket, Device, MAX_PKT_SIZE},
+    device::{
+        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, Error, MAX_PKT_SIZE,
+    },
     noise::{
         handshake::parse_handshake_anon,
         rate_limiter::{self, RateLimiter},
@@ -27,7 +29,9 @@ use crate::{
     x25519,
 };
 
-pub struct Inbound;
+pub struct Inbound {
+    thread: InboundThread,
+}
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 type InboundThread = JoinHandle<()>;
@@ -35,7 +39,11 @@ type InboundThread = JoinHandle<()>;
 type InboundThread = DispatchRetained<DispatchGroup>;
 
 impl Inbound {
-    pub fn start(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) -> InboundThread {
+    pub fn start(
+        device: Arc<Lock<Device>>,
+        stop: Arc<AtomicBool>,
+        waker: Arc<Waker>,
+    ) -> Result<Inbound, Error> {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
             let group = DispatchGroup::new();
@@ -49,11 +57,10 @@ impl Inbound {
         let thread = {
             thread::Builder::new()
                 .name("neptun-in".to_string())
-                .spawn(move || Inbound::data_thread(device, stop))
-                .unwrap()
+                .spawn(move || Inbound::data_thread(device, stop))?
         };
 
-        thread
+        Ok(Self { thread })
     }
 
     fn data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>) {
@@ -81,6 +88,18 @@ impl Inbound {
 
         // let bound: Option<(Arc<Peer>, socket2::Socket)> = None;
         // handle_packet_loop_single_conn_peer(device, iface, rcvbuf, dstbuf, bound, stop);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) fn join(self) {
+        if let Err(e) = self.thread.join() {
+            tracing::error!(message = "Unable to gracefully clode outbound thread.", error = ?e);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    pub(crate) fn join(self) {
+        let _ = self.thread.wait(DispatchTime::FOREVER);
     }
 }
 

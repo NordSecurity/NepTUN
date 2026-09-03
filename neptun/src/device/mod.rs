@@ -117,6 +117,8 @@ pub enum Error {
     SetTunnel,
     #[error("Internal error occured: {0}")]
     InternalError(String),
+    #[error("Poll error: {0}")]
+    Poll(io::Error),
 }
 
 // What the event loop should do after a handler returns
@@ -141,10 +143,8 @@ impl MakeExternalNeptun for MakeExternalNeptunNoop {
 
 pub struct DeviceHandle {
     pub device: Arc<Lock<Device>>, // The interface this handle owns
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    threads: Vec<thread::JoinHandle<()>>,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    threads: Vec<DispatchRetained<DispatchGroup>>,
+    control: Option<Control>,
+    data: Option<DataPlane>,
     sockets_to_close: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
 
@@ -196,10 +196,10 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    /// Set to stop the data plane threads. The control plane stops via its exit notifier.
+    /// Set to stop the data plane threads.
     data_stop: Arc<AtomicBool>,
-
-    waker: Arc<Waker>,
+    out_waker: Arc<Waker>,
+    in_waker: Arc<Waker>,
 }
 
 struct ThreadData {
@@ -215,20 +215,42 @@ enum IfaceReadResult<'a> {
         peer: Arc<Peer>,
     },
     Exhausted,
-    Fatal,
+    Fatal(Error),
     Skip,
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-type EventLoopThreads = Result<(Vec<JoinHandle<()>>, Arc<Lock<Vec<Arc<TunSocket>>>>), Error>;
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-type EventLoopThreads = Result<
-    (
-        DispatchRetained<DispatchGroup>,
-        Arc<Lock<Vec<Arc<TunSocket>>>>,
-    ),
-    Error,
->;
+pub struct DataPlane {
+    outbound: Outbound,
+    inbound: Inbound,
+}
+
+impl DataPlane {
+    fn start(device: &Arc<Lock<Device>>) -> Result<Self, Error> {
+        let (stop, out_waker, in_waker) = {
+            let d = device.read();
+            (d.data_stop.clone(), d.out_waker.clone(), d.in_waker.clone())
+        };
+
+        Ok(Self {
+            outbound: Outbound::start(device.clone(), stop.clone(), out_waker)?,
+            inbound: Inbound::start(device.clone(), stop, in_waker)?,
+        })
+    }
+
+    pub fn join(self) {
+        self.outbound.join();
+        self.inbound.join();
+    }
+
+    pub(crate) fn close_device(device: &Arc<Lock<Device>>, err: Error) {
+        tracing::error!(message = "Critical data plane failure, closing device", error = ?err);
+
+        // TODO: ensure stopping control plane's event loop
+        let mut d = device.read();
+        d.try_writeable(|dev| dev.trigger_yield(), |dev| dev.closed = true);
+        d.trigger_exit();
+    }
+}
 
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
@@ -242,69 +264,61 @@ impl DeviceHandle {
 
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
-        let mut threads = vec![];
+        let (control, sockets) = Control::start(interface_lock.clone());
 
-        let Control { thread, sockets } = Control::start(interface_lock.clone());
-        threads.push(thread);
-
-        let stop_in = interface_lock.read().data_stop.clone();
-        let stop_out = stop_in.clone();
-
-        threads.push(Inbound::start(interface_lock.clone(), stop_in));
-
-        let waker = interface_lock.read().waker.clone();
-        threads.push(Outbound::start(interface_lock.clone(), stop_out, waker));
+        let data = DataPlane::start(&interface_lock)?;
 
         Ok(DeviceHandle {
             device: interface_lock,
-            threads,
+            control: Some(control),
+            data: Some(data),
             sockets_to_close: sockets,
         })
     }
 
-    fn start_event_loop_threads(
-        n_threads: usize,
-        interface_lock: Arc<Lock<Device>>,
-    ) -> EventLoopThreads {
-        let sockets_to_close = Arc::new(Lock::new(vec![]));
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-        let threads = {
-            let group = DispatchGroup::new();
-            // `global_queue` returns a shared singleton, so fetch it once.
-            let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-                DispatchQueueGlobalPriority::High,
-            ));
-            for i in 0..n_threads {
-                let dev = Arc::clone(&interface_lock);
-                let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
-                sockets_to_close
-                    .read()
-                    .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
-            }
-            group
-        };
+    // fn start_event_loop_threads(
+    //     n_threads: usize,
+    //     interface_lock: Arc<Lock<Device>>,
+    // ) -> EventLoopThreads {
+    //     let sockets_to_close = Arc::new(Lock::new(vec![]));
+    //     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    //     let threads = {
+    //         let group = DispatchGroup::new();
+    //         // `global_queue` returns a shared singleton, so fetch it once.
+    //         let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
+    //             DispatchQueueGlobalPriority::High,
+    //         ));
+    //         for i in 0..n_threads {
+    //             let dev = Arc::clone(&interface_lock);
+    //             let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
+    //             sockets_to_close
+    //                 .read()
+    //                 .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
+    //             group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
+    //         }
+    //         group
+    //     };
 
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let threads = {
-            let mut threads = vec![];
-            for i in 0..n_threads {
-                threads.push({
-                    let dev = Arc::clone(&interface_lock);
-                    let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
-                    sockets_to_close
-                        .read()
-                        .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-                    thread::Builder::new()
-                        .name("neptun".to_string())
-                        .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
-                });
-            }
-            threads
-        };
+    //     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    //     let threads = {
+    //         let mut threads = vec![];
+    //         for i in 0..n_threads {
+    //             threads.push({
+    //                 let dev = Arc::clone(&interface_lock);
+    //                 let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
+    //                 sockets_to_close
+    //                     .read()
+    //                     .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
+    //                 thread::Builder::new()
+    //                     .name("neptun".to_string())
+    //                     .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
+    //             });
+    //         }
+    //         threads
+    //     };
 
-        Ok((threads, sockets_to_close))
-    }
+    //     Ok((threads, sockets_to_close))
+    // }
 
     pub fn send_uapi_cmd(&self, cmd: &str) -> String {
         let mut response = Vec::<u8>::new();
@@ -329,12 +343,12 @@ impl DeviceHandle {
         self.device.read().drop_connected_sockets();
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     pub fn wait(&mut self) {
-        while let Some(thread) = self.threads.pop() {
-            if let Err(e) = thread.join() {
-                tracing::error!("Unable to gracefully close thread. {:?}", e);
-            }
+        if let Some(data) = self.data.take() {
+            data.join();
+        }
+        if let Some(control) = self.control.take() {
+            control.join();
         }
     }
 
@@ -342,15 +356,7 @@ impl DeviceHandle {
     pub fn is_event_loop_active(&self) -> bool {
         // A zero-timeout wait succeeds only once the group is empty, so a
         // timeout means event loop tasks are still running.
-        self.thread.wait(DispatchTime::NOW).is_err()
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    pub fn wait(&mut self) {
-        while let Some(queue) = self.threads.pop() {
-            // TODO: double check if this is also correct in case of a serial queue
-            let _ = queue.wait(DispatchTime::FOREVER);
-        }
+        self.control.wait(DispatchTime::NOW).is_err()
     }
 
     pub fn clean(&mut self) {
@@ -364,11 +370,6 @@ impl DeviceHandle {
         // Even though device struct is not being written to, we still take a write lock on device to stop the event loop
         // The event loop must be stopped so that the old iface event handler can be safely cleared.
         // See clear_event_by_fd() function description
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        {
-            let mut threads = vec![];
-            swap(&mut threads, &mut self.threads);
-        }
         self.device
             .read()
             .try_writeable(
@@ -400,17 +401,15 @@ impl DeviceHandle {
                 },
             )
             .ok_or(Error::SetTunnel)??;
-        // TODO: handle restart of data plane threads
-        let Control { thread, sockets } = Control::start(self.device.clone());
-        // self.threads = threads;
+        let (control, sockets) = Control::start(self.device.clone());
+        self.control = Some(control);
         self.sockets_to_close = sockets;
-        Ok(())
+        self.restart_data_plane()
     }
 
     fn event_loop(mut thread_local: ThreadData, device: &Lock<Device>) {
         loop {
             let mut device_lock = device.read();
-            tracing::info!("Entered event loop and obtained read lock on the device");
 
             if device_lock.update_seq != thread_local.update_seq {
                 // New threads are started when the tun interface is changed, so this
@@ -459,18 +458,34 @@ impl DeviceHandle {
         }
     }
 
-    fn new_thread_local(
-        _thread_id: usize,
-        device_lock: &LockReadGuard<Device>,
-    ) -> Result<ThreadData, Error> {
-        let t_local = ThreadData {
-            src_buf: [0u8; MAX_PKT_SIZE],
-            dst_buf: [0u8; MAX_PKT_SIZE],
-            iface: Arc::clone(&device_lock.iface),
-            update_seq: device_lock.update_seq,
-        };
+    // fn new_thread_local(
+    //     _thread_id: usize,
+    //     device_lock: &LockReadGuard<Device>,
+    // ) -> Result<ThreadData, Error> {
+    //     let t_local = ThreadData {
+    //         src_buf: [0u8; MAX_PKT_SIZE],
+    //         dst_buf: [0u8; MAX_PKT_SIZE],
+    //         iface: Arc::clone(&device_lock.iface),
+    //         update_seq: device_lock.update_seq,
+    //     };
 
-        Ok(t_local)
+    //     Ok(t_local)
+    // }
+
+    fn restart_data_plane(&mut self) -> Result<(), Error> {
+        self.device.read().stop_data_plane();
+
+        if let Some(data) = self.data.take() {
+            // Lock must not be held across the join
+            data.join();
+        }
+
+        let data = DataPlane::start(&self.device)?;
+
+        self.device.read().resume_data_plane();
+        self.data = Some(data);
+
+        Ok(())
     }
 }
 
@@ -671,7 +686,8 @@ impl Device {
             rate_limiter: None,
             update_seq: 0,
             data_stop: Arc::new(AtomicBool::new(false)),
-            waker: Arc::new(Waker::new().map_err(Error::from)?),
+            out_waker: Arc::new(Waker::new().map_err(Error::from)?),
+            in_waker: Arc::new(Waker::new().map_err(Error::from)?),
         };
 
         if device.config.open_uapi_socket {
@@ -703,11 +719,9 @@ impl Device {
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket
-        if let Some(_) = self.udp4.take() {
-        };
+        if let Some(_) = self.udp4.take() {};
 
-        if let Some(_) = self.udp6.take() {
-        }
+        if let Some(_) = self.udp6.take() {}
 
         for peer in self.peers.values() {
             peer.shutdown_endpoint();
@@ -747,7 +761,7 @@ impl Device {
         self.udp4 = Some(udp4.clone());
         self.udp6 = Some(udp6.clone());
 
-        self.waker.wake();
+        self.notify_data_plane();
 
         let _ = (&udp4, &udp6);
 
@@ -922,8 +936,7 @@ impl Device {
     }
 
     pub(crate) fn trigger_exit(&self) {
-        // Stop the data-plane threads
-        self.data_stop.store(true, Ordering::Relaxed);
+        self.stop_data_plane();
 
         match self.exit_notice.as_ref() {
             Some(notice) => self.queue.trigger_notification(notice),
@@ -950,6 +963,20 @@ impl Device {
 
     pub fn iface(&self) -> &TunSocket {
         &self.iface
+    }
+
+    pub(crate) fn notify_data_plane(&self) {
+        self.out_waker.wake();
+        self.in_waker.wake();
+    }
+
+    pub(crate) fn stop_data_plane(&self) {
+        self.data_stop.store(true, Ordering::Relaxed);
+        self.notify_data_plane();
+    }
+
+    pub(crate) fn resume_data_plane(&self) {
+        self.data_stop.store(false, Ordering::Relaxed);
     }
 }
 

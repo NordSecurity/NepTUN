@@ -47,7 +47,6 @@ impl Waker {
     }
 
     pub fn is_pending(&self) -> bool {
-        // TODO: is Ordering::Relaxed appropriate here?
         self.pending.load(Ordering::Relaxed)
     }
 }
