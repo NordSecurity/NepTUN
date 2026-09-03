@@ -30,30 +30,25 @@ pub mod tun;
 
 pub mod waker;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-mod packet_workers;
-
 use crate::device::control::Control;
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
 use crate::device::peer::DATA_SOCKET_READ_TIMEOUT;
 use crate::device::waker::Waker;
 use crate::noise::errors::WireGuardError;
-use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::{Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use dev_lock::{Lock, LockReadGuard};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter};
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::mem::swap;
-use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
@@ -72,8 +67,6 @@ use dispatch2::{
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use {
     nix::sys::socket as NixSocket,
-    packet_workers::{PacketWorkers, TunnelWorkerData},
-    std::net::IpAddr,
     std::os::fd::{AsFd, BorrowedFd},
     std::thread::{self, JoinHandle},
 };
@@ -203,11 +196,8 @@ pub struct Device {
 
     rate_limiter: Option<Arc<RateLimiter>>,
 
-    /// Set to stop the OUT/IN data threads. The control plane stops via its exit notifier.
+    /// Set to stop the data plane threads. The control plane stops via its exit notifier.
     data_stop: Arc<AtomicBool>,
-
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    workers: PacketWorkers,
 
     waker: Arc<Waker>,
 }
@@ -227,23 +217,6 @@ enum IfaceReadResult<'a> {
     Exhausted,
     Fatal,
     Skip,
-}
-
-struct CheckedMtu(usize);
-
-impl CheckedMtu {
-    fn new(mtu: usize) -> Option<Self> {
-        if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
-            tracing::error!("Insufficient packet buffer size");
-            None
-        } else {
-            Some(Self(mtu))
-        }
-    }
-
-    fn get(&self) -> usize {
-        self.0
-    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -490,28 +463,6 @@ impl DeviceHandle {
         _thread_id: usize,
         device_lock: &LockReadGuard<Device>,
     ) -> Result<ThreadData, Error> {
-        #[cfg(target_os = "linux")]
-        let t_local = ThreadData {
-            src_buf: [0u8; MAX_PKT_SIZE],
-            dst_buf: [0u8; MAX_PKT_SIZE],
-            iface: if _thread_id == 0 || !device_lock.config.use_multi_queue {
-                // For the first thread use the original iface
-                Arc::clone(&device_lock.iface)
-            } else {
-                // For for the rest create a new iface queue
-                let iface_local =
-                    Arc::new(TunSocket::new(&device_lock.iface.name()?)?.set_non_blocking()?);
-
-                device_lock
-                    .register_read_iface_handler(Arc::clone(&iface_local))
-                    .ok();
-
-                iface_local
-            },
-            update_seq: device_lock.update_seq,
-        };
-
-        #[cfg(not(target_os = "linux"))]
         let t_local = ThreadData {
             src_buf: [0u8; MAX_PKT_SIZE],
             dst_buf: [0u8; MAX_PKT_SIZE],
@@ -699,9 +650,6 @@ impl Device {
     ) -> Result<Device, Error> {
         let poll = EventPoll::<Handler>::new()?;
 
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let workers = PacketWorkers::new(&config);
-
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
@@ -723,10 +671,7 @@ impl Device {
             rate_limiter: None,
             update_seq: 0,
             data_stop: Arc::new(AtomicBool::new(false)),
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            workers,
-            // TODO: fix unwrap()
-            waker: Arc::new(Waker::new().unwrap()),
+            waker: Arc::new(Waker::new().map_err(Error::from)?),
         };
 
         if device.config.open_uapi_socket {
@@ -757,18 +702,11 @@ impl Device {
 
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
-        // First close any existing open socket, and remove them from the event loop
-        if let Some(s) = self.udp4.take() {
-            // #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-            // self.workers.shutdown();
-            // unsafe {
-            //     // This is safe because the event loop is not running yet
-            //     self.queue.clear_event_by_fd(s.as_raw_fd());
-            // }
+        // First close any existing open socket
+        if let Some(_) = self.udp4.take() {
         };
 
-        if let Some(s) = self.udp6.take() {
-            // unsafe { self.queue.clear_event_by_fd(s.as_raw_fd()) };
+        if let Some(_) = self.udp6.take() {
         }
 
         for peer in self.peers.values() {
@@ -803,9 +741,6 @@ impl Device {
             modify_skt_buffer_size(udp_sock4.as_fd(), buffer_size);
             modify_skt_buffer_size(udp_sock6.as_fd(), buffer_size);
         }
-
-        // self.register_udp_handler(udp_sock4.try_clone()?)?;
-        // self.register_udp_handler(udp_sock6.try_clone()?)?;
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
@@ -1013,428 +948,8 @@ impl Device {
         }
     }
 
-    fn register_udp_handler(&self, udp: socket2::Socket) -> Result<(), Error> {
-        self.queue.new_event(
-            udp.as_raw_fd(),
-            Box::new(move |d, t| {
-                // Handler that handles anonymous packets over UDP
-                let mut iter = MAX_ITR;
-                let (private_key, public_key) = if let Some((sk, pk)) = d.key_pair.as_ref() {
-                    (sk, pk)
-                } else {
-                    tracing::error!("Empty key pair");
-                    return Action::Exit;
-                };
-
-                let rate_limiter = d.rate_limiter.as_ref();
-
-                // Loop while we have packets on the anonymous connection
-
-                // Safety: the `recv_from` implementation promises not to write uninitialised
-                // bytes to the buffer, so this casting is safe.
-                let src_buf =
-                    unsafe { &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-                while let Ok((packet_len, addr)) = udp.recv_from(src_buf) {
-                    let packet = match t.src_buf.get(..packet_len) {
-                        Some(p) => p,
-                        None => {tracing::error!("Buffer size different from packet length"); continue;},
-                    };
-
-                    let sock = match addr.as_socket() {
-                        Some(s) => s,
-                        None => {tracing::warn!("Invalid socket address family"); continue;}
-                    };
-                    // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-                    let parsed_packet = match rate_limiter {
-                        Some(rate_limiter) => {
-                            match rate_limiter.verify_packet(Some(sock.ip()), packet, &mut t.dst_buf) {
-                                Ok(packet) => packet,
-                                Err(TunnResult::WriteToNetwork(cookie)) => {
-                                    if let Err(err) = udp.send_to(cookie, &addr) {
-                                        tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
-                                    }
-                                    continue;
-                                }
-                                Err(_) => continue,
-                            }
-                        },
-                        None => {
-                            match Tunn::parse_incoming_packet(packet) {
-                                Ok(packet) => packet,
-                                Err(_) => continue,
-                            }
-                        }
-                    };
-
-                    let peer = match &parsed_packet {
-                        Packet::HandshakeInit(p) => {
-                            parse_handshake_anon(private_key, public_key, p)
-                                .ok()
-                                .and_then(|hh| {
-                                    d.peers.get(&x25519::PublicKey::from(hh.peer_static_public))
-                                })
-                        }
-                        Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                    };
-
-                    let peer = match peer {
-                        None => continue,
-                        Some(peer) => peer,
-                    };
-
-                    let mut flush = false; // Are there packets to send from the queue?
-                    let res = {
-                        let mut tun = peer.tunnel.lock();
-                        tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
-                    };
-                    match res {
-                        TunnResult::Done => {}
-                        TunnResult::Err(err) => {
-                            tracing::warn!(message = "Failed to handle packet", error = ?err);
-                            continue;
-                        },
-                        TunnResult::WriteToNetwork(packet) => {
-                            flush = true;
-                            if let Err(err) = udp.send_to(packet, &addr) {
-                                tracing::warn!(message = "Failed to send packet", error = ?err, dst = ?addr);
-                            }
-                        }
-                        TunnResult::WriteToTunnel(packet, addr) => {
-                            if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(&peer.public_key.0, packet) {
-                                    continue;
-                                }
-                            }
-
-                            if peer.is_allowed_ip(addr) {
-                                _ = t.iface.as_ref().write(packet);
-                                tracing::trace!(
-                                    message = "Writing packet to tunnel",
-                                    interface = ?t.iface.name(),
-                                    packet_length = packet.len(),
-                                    src_addr = ?addr,
-                                    public_key = peer.public_key.1
-                                );
-                            }
-                        }
-                    };
-
-                    if flush {
-                        // Flush pending queue
-                        loop {
-                            let res = {
-                                let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, &[], &mut t.dst_buf[..])
-                            };
-
-                            let TunnResult::WriteToNetwork(packet) = res else {
-                                break;
-                            };
-
-                            if let Err(err) = udp.send_to(packet, &addr) {
-                                tracing::warn!(message = "Failed to flush queue", error = ?err, dst = ?addr);
-                            }
-                        }
-                    }
-
-                    peer.set_endpoint(sock);
-
-                    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-                    {
-                        if d.config.use_connected_socket {
-                            // No need for additional checking, as from this point all packets will arrive to connected socket handler
-                            if let Err(e) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
-                                tracing::error!("Failed to create connected socket {}", e);
-                                // peer.shutdown_endpoint();
-                            }
-                        }
-                    }
-
-                    iter -= 1;
-                    if iter == 0 {
-                        break;
-                    }
-                }
-                Action::Continue
-            }),
-        )?;
-        Ok(())
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    fn register_read_conn_skt_handler(
-        &self,
-        peer: Arc<Peer>,
-        udp: socket2::Socket,
-        peer_addr: IpAddr,
-    ) -> Result<(), Error> {
-        self.queue.new_event(
-            udp.as_raw_fd(),
-            Box::new(move |d, t| {
-                // The conn_handler handles packet received from a connected UDP socket, associated
-                // with a known peer, this saves us the hustle of finding the right peer. If another
-                // peer gets the same ip, it will be ignored until the socket does not expire.
-                let max_batched_pkts = d.workers.max_batched_pkts;
-                loop {
-                    let mut batched_pkts = Vec::with_capacity(max_batched_pkts);
-                    let mut socket_buffer_exhausted = false;
-                    for _ in 0..batched_pkts.capacity() {
-                        // Safety: the `recv_from` implementation promises not to write uninitialised
-                        // bytes to the buffer, so this casting is safe.
-                        let src_buf = unsafe {
-                            &mut *(&mut t.src_buf[..] as *mut [u8] as *mut [MaybeUninit<u8>])
-                        };
-
-                        if let Ok(read_bytes) = udp.recv(src_buf) {
-                            let mut flush = false;
-                            let mut buffer = [0u8; MAX_PKT_SIZE];
-                            let res = {
-                                let mut tun = peer.tunnel.lock();
-                                #[allow(clippy::indexing_slicing)]
-                                tun.decapsulate(
-                                    Some(peer_addr),
-                                    t.src_buf[..read_bytes].as_ref(),
-                                    &mut buffer[..],
-                                )
-                            };
-
-                            match res {
-                                TunnResult::Done => {}
-                                TunnResult::Err(e) => match e {
-                                    WireGuardError::DuplicateCounter => {
-                                        // TODO(LLT-6071): revert back to having error level for all error types
-                                        tracing::debug!(message="Decapsulate error",
-                                            error=?e,
-                                            public_key=peer.public_key.1)
-                                    }
-                                    _ => {
-                                        tracing::error!(message="Decapsulate error",
-                                        error=?e,
-                                        public_key = peer.public_key.1)
-                                    }
-                                },
-                                TunnResult::WriteToNetwork(packet) => {
-                                    // Respond to handshake packets
-                                    flush = true;
-                                    if let Err(err) = udp.send(packet) {
-                                        tracing::warn!(message="Failed to write packet", error = ?err);
-                                    }
-                                }
-                                TunnResult::WriteToTunnel(packet, addr) => {
-                                    let worker_data = TunnelWorkerData {
-                                        buf_len: packet.len(),
-                                        addr,
-                                        buffer,
-                                        iface: t.iface.clone(),
-                                        peer: peer.clone(),
-                                    };
-                                    batched_pkts.push(worker_data);
-                                }
-                            }
-
-                            if flush {
-                                // Flush pending queue
-                                loop {
-                                    let mut dst_buf = [0u8; MAX_PKT_SIZE];
-                                    let res = {
-                                        let mut tun = peer.tunnel.lock();
-                                        tun.decapsulate(None, &[], &mut dst_buf[..])
-                                    };
-                                    let TunnResult::WriteToNetwork(packet) = res else {
-                                        break;
-                                    };
-                                    if let Err(err) = udp.send(packet) {
-                                        tracing::warn!(message="Failed to flush queue", error = ?err);
-                                    }
-                                }
-                            }
-                        } else {
-                            // If the queue is empty break out of the loop
-                            socket_buffer_exhausted = true;
-                            break;
-                        }
-                    }
-
-                    d.workers.submit_inbound(batched_pkts);
-
-                    if socket_buffer_exhausted {
-                        break;
-                    }
-                }
-                Action::Continue
-            }),
-        )?;
-        Ok(())
-    }
-
-    fn register_read_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
-        self.queue.new_event(
-            iface.as_raw_fd(),
-            Box::new(move |d, _t| {
-                // The iface_handler handles packets received from the WireGuard virtual network
-                // interface. The flow is as follows:
-                // * Read a packet
-                // * Determine peer based on packet destination ip
-                // * Encapsulate the packet for the given peer
-                // * Send encapsulated packet to the peer's endpoint
-
-                let mtu = match CheckedMtu::new(d.mtu.load(Ordering::Relaxed)) {
-                    Some(m) => m,
-                    None => return Action::Exit,
-                };
-
-                let peers = &d.peers_by_ip;
-
-                // On Apple platforms, process the packets inline
-                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-                {
-                    process_iface_inline(d, _t, &iface, &mtu, peers)
-                }
-
-                // On non-Apple platforms, batch packets and send them to a worker thread for processing
-                #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-                {
-                    d.workers.dispatch_iface_read(&iface, &mtu, peers)
-                }
-            }),
-        )?;
-        Ok(())
-    }
-
     pub fn iface(&self) -> &TunSocket {
         &self.iface
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-fn process_iface_inline(
-    device: &Device,
-    thread_data: &mut ThreadData,
-    iface: &Arc<TunSocket>,
-    mtu: &CheckedMtu,
-    peers: &AllowedIps<Arc<Peer>>,
-) -> Action {
-    let (udp4, udp6) = match (device.udp4.as_ref(), device.udp6.as_ref()) {
-        (Some(udp4), Some(udp6)) => (udp4, udp6),
-        _ => {
-            tracing::error!("Not connected");
-            return Action::Continue;
-        }
-    };
-
-    for _ in 0..MAX_ITR {
-        match read_packet(iface, &mut thread_data.dst_buf, mtu, peers) {
-            IfaceReadResult::Exhausted => break,
-            IfaceReadResult::Fatal => return Action::Exit,
-            IfaceReadResult::Skip => continue,
-            IfaceReadResult::Packet { payload, peer } => {
-                if let Some(callback) = &device.config.firewall_process_outbound_callback {
-                    if !callback(&peer.public_key.0, payload, &mut thread_data.iface.as_ref()) {
-                        continue;
-                    }
-                }
-
-                let len = payload.len();
-                encapsulate_and_send(&peer, &mut thread_data.dst_buf[..], len, udp4, udp6);
-            }
-        }
-    }
-    Action::Continue
-}
-
-fn read_packet<'a>(
-    iface: &Arc<TunSocket>,
-    buf: &'a mut [u8; MAX_PKT_SIZE],
-    mtu: &CheckedMtu,
-    peers: &AllowedIps<Arc<Peer>>,
-) -> IfaceReadResult<'a> {
-    // buf is [u8; MAX_PKT_SIZE] and CheckedMtu guarantees mtu + WG_HEADER_OFFSET <= MAX_PKT_SIZE
-    #[allow(clippy::indexing_slicing)]
-    match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu.get()]) {
-        Ok(payload) => match Tunn::dst_address(payload) {
-            None => IfaceReadResult::Skip,
-            Some(dst_addr) => match peers.find(dst_addr) {
-                None => IfaceReadResult::Skip,
-                Some(peer) => IfaceReadResult::Packet {
-                    payload,
-                    peer: peer.clone(),
-                },
-            },
-        },
-        Err(Error::IfaceRead(e)) => match e.kind() {
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => IfaceReadResult::Exhausted,
-            _ => {
-                tracing::error!(message = "Fatal read error on tun interface: errno", error = ?e);
-                IfaceReadResult::Fatal
-            }
-        },
-        Err(e) => {
-            tracing::error!(message = "Unexpected error on tun interface", error = ?e);
-            IfaceReadResult::Fatal
-        }
-    }
-}
-
-fn encapsulate_and_send(
-    peer: &Arc<Peer>,
-    buf: &mut [u8],
-    payload_len: usize,
-    udp4: &socket2::Socket,
-    udp6: &socket2::Socket,
-) {
-    let res = {
-        let mut tun = peer.tunnel.lock();
-        tun.encapsulate_in_place(payload_len, buf)
-    };
-
-    match res {
-        TunnResult::Done => {}
-        TunnResult::Err(e) => {
-            tracing::error!(message = "Encapsulate error",
-                error = ?e,
-                public_key = peer.public_key.1);
-        }
-        TunnResult::WriteToNetwork(packet) => {
-            let endpoint = peer.endpoint();
-            if let Some(conn) = endpoint.conn.as_ref() {
-                match conn.send(packet) {
-                    Ok(_) => {
-                        tracing::trace!(
-                            "Pkt -> ConnSock ({:?}), len: {}",
-                            endpoint.addr,
-                            packet.len()
-                        );
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
-                    }
-                    Err(err) => {
-                        tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                        drop(endpoint);
-                        peer.shutdown_endpoint();
-                    }
-                }
-            } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-                if let Err(err) = udp4.send_to(packet, &addr.into()) {
-                    tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-                } else {
-                    tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
-                }
-            } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                if let Err(err) = udp6.send_to(packet, &addr.into()) {
-                    tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-                } else {
-                    tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
-                }
-            } else {
-                tracing::error!("No endpoint");
-            }
-        }
-        _ => {
-            tracing::error!("Unexpected result from encapsulate");
-        }
     }
 }
 
@@ -1506,25 +1021,6 @@ mod tests {
         // According to `man 7 socket` linux doubles the buffer size
         // internally as it assumes half is for internal kernel structures
         assert!(get_buf == (BUFFER_SIZE * 2) as usize);
-    }
-
-    #[test]
-    fn checked_mtu_accepts_mtu_within_bounds() {
-        let mtu = MAX_PKT_SIZE - WG_HEADER_OFFSET;
-        assert!(CheckedMtu::new(mtu).is_some());
-    }
-
-    #[test]
-    fn checked_mtu_boundary_over_limit_is_rejected() {
-        let mtu = MAX_PKT_SIZE - WG_HEADER_OFFSET + 1;
-        assert!(CheckedMtu::new(mtu).is_none());
-    }
-
-    #[test]
-    fn checked_mtu_get_returns_original_value() {
-        let mtu = 1420;
-        let checked = CheckedMtu::new(mtu).unwrap();
-        assert_eq!(checked.get(), mtu);
     }
 
     #[test]

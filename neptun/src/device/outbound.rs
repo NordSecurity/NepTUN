@@ -43,7 +43,7 @@ const ERR_FLAGS: PollFlags = PollFlags::POLLERR
     .union(PollFlags::POLLHUP)
     .union(PollFlags::POLLNVAL);
 
-pub struct Outbound;
+pub(super) struct Outbound;
 
 impl Outbound {
     pub fn start(
