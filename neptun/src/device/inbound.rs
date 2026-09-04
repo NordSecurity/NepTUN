@@ -8,19 +8,13 @@ use std::{
     time::Duration,
 };
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::{self, JoinHandle};
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 use nix::sys::socket;
 use socket2::Socket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     device::{
-        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, DeviceThread, Error,
-        MAX_PKT_SIZE,
+        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, Error, MAX_PKT_SIZE,
     },
     noise::{
         handshake::parse_handshake_anon,

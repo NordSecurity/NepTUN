@@ -10,19 +10,16 @@ use std::{
     },
 };
 
-use nix::poll::{PollFd, PollFlags};
+use nix::{
+    errno::Errno,
+    poll::{PollFd, PollFlags, PollTimeout},
+};
 use socket2::Socket;
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::{self};
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 
 use crate::{
     device::{
-        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, DataPlane, Device, DeviceThread,
-        Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
+        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, DeviceHandle, Error,
+        IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
     noise::{Tunn, TunnResult},
 };
@@ -49,9 +46,12 @@ impl Outbound {
     }
 
     pub fn run(self) {
-        let d = self.device.clone();
+        let device_clone = self.device.clone();
+
         if let Err(e) = self.run_inner() {
-            DataPlane::close_device(&d, e);
+            tracing::error!(message = "Critical outbound thread failure, closing device", error = ?e);
+            let mut d = device_clone.read();
+            DeviceHandle::close_device(&mut d);
         }
     }
 
@@ -72,7 +72,7 @@ impl Outbound {
 
             let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
                 tracing::debug!(message = "Not connected, parked until sockets are opened.");
-                poll_waker(&self.waker)?;
+                Poll::poll_waker(&self.waker)?;
                 continue;
             };
 
@@ -82,7 +82,7 @@ impl Outbound {
             ];
 
             loop {
-                DataPlane::poll(&mut pfds)?;
+                Poll::poll(&mut pfds)?;
 
                 // TODO: any better way instead of array and indexing? maybe a struct?
                 let wake_revents = pfds[WAKE].revents().unwrap_or(PollFlags::empty());
@@ -97,7 +97,7 @@ impl Outbound {
                     // The current TUN iface is gone, park until a new iface config is signalled
                     tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
                     // TODO: what if this never happens? would setting a timeout increase robustness?
-                    poll_waker(&self.waker)?;
+                    Poll::poll_waker(&self.waker)?;
                     break;
                 }
 
@@ -281,10 +281,25 @@ fn send_packet(
     }
 }
 
-/// Blocks until the waker receives a signal.
-fn poll_waker(waker: &Waker) -> Result<(), Error> {
-    let mut pfds = [PollFd::new(waker.wait_fd(), PollFlags::POLLIN)];
-    DataPlane::poll(&mut pfds)?;
-    waker.ack();
-    Ok(())
+pub struct Poll;
+
+impl Poll {
+    pub(crate) fn poll(pfds: &mut [PollFd<'_>]) -> Result<(), Error> {
+        loop {
+            match nix::poll::poll(pfds, PollTimeout::NONE) {
+                Ok(_) => return Ok(()),
+                // Retry on interrupted syscall
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(Error::Poll(e.into())),
+            }
+        }
+    }
+
+    /// Blocks until the waker receives a signal.
+    fn poll_waker(waker: &Waker) -> Result<(), Error> {
+        let mut pfds = [PollFd::new(waker.wait_fd(), PollFlags::POLLIN)];
+        Self::poll(&mut pfds)?;
+        waker.ack();
+        Ok(())
+    }
 }

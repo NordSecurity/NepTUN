@@ -392,8 +392,8 @@ fn test_event_loop_active_directly_after_device_creation() {
     let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
 
     assert!(
-        wg.device.is_event_loop_active(),
-        "Device event loop's dispatch group is empty immediately after `DeviceHandle::new` returned. \
+        wg.device.are_device_threads_active(),
+        "At least one of device threads' dispatch groups is empty immediately after `DeviceHandle::new` returned. \
         A call to `DeviceHandle::wait()` would return instantly."
     );
 }
