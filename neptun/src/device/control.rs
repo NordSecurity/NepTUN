@@ -1,26 +1,19 @@
 use std::sync::Arc;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::{self, JoinHandle};
+use std::thread::{self};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 
 use crate::device::{
-    dev_lock::Lock, tun::TunSocket, Device, DeviceHandle, ThreadData, MAX_PKT_SIZE,
+    dev_lock::Lock, tun::TunSocket, Device, DeviceHandle, DeviceThread, ThreadData, MAX_PKT_SIZE,
 };
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-type ControlThread = JoinHandle<()>;
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-type ControlThread = DispatchRetained<DispatchGroup>;
-
-pub struct Control {
-    pub thread: ControlThread,
-}
+pub(super) struct Control;
 
 impl Control {
-    pub fn start(device: Arc<Lock<Device>>) -> (Self, Arc<Lock<Vec<Arc<TunSocket>>>>) {
+    pub fn start(device: Arc<Lock<Device>>) -> (DeviceThread, Arc<Lock<Vec<Arc<TunSocket>>>>) {
         let sockets = Arc::new(Lock::new(vec![]));
         let thread_data = {
             let d = &device.read();
@@ -53,7 +46,7 @@ impl Control {
                 .unwrap()
         };
 
-        (Self { thread }, sockets)
+        (DeviceThread { thread }, sockets)
     }
 
     /// Responsible for handling:
@@ -63,17 +56,5 @@ impl Control {
     /// - socket lifecycle
     fn event_loop(thread_data: ThreadData, device: &Lock<Device>) {
         DeviceHandle::event_loop(thread_data, device);
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    pub(crate) fn join(self) {
-        if let Err(e) = self.thread.join() {
-            tracing::error!(message = "Unable to gracefully clode outbound thread.", error = ?e);
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    pub(crate) fn join(self) {
-        let _ = self.thread.wait(DispatchTime::FOREVER);
     }
 }

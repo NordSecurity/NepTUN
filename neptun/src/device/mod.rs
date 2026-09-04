@@ -145,7 +145,7 @@ impl MakeExternalNeptun for MakeExternalNeptunNoop {
 
 pub struct DeviceHandle {
     pub device: Arc<Lock<Device>>, // The interface this handle owns
-    control: Option<Control>,
+    control: Option<DeviceThread>,
     data: Option<DataPlane>,
     sockets_to_close: Arc<Lock<Vec<Arc<TunSocket>>>>,
 }
@@ -221,9 +221,53 @@ enum IfaceReadResult<'a> {
     Skip,
 }
 
+struct DeviceThread {
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    thread: JoinHandle<()>,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    thread: DispatchRetained<DispatchGroup>,
+}
+
+impl DeviceThread {
+    pub(crate) fn start<F>(name: &str, runner: F) -> Result<Self, Error>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        let thread = {
+            let group = DispatchGroup::new();
+            let queue = DispatchQueue::new(name, DispatchQueueAttr::SERIAL);
+            // TODO: ensure P-core preference for execution
+            group.exec_async(&queue, runner);
+            group
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        let thread = {
+            thread::Builder::new()
+                .name(name.to_string())
+                .spawn(runner)?
+        };
+
+        Ok(Self { thread })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+    pub(crate) fn join(self) {
+        if let Err(e) = self.thread.join() {
+            tracing::error!(message = "Unable to gracefully close a thread.", error = ?e);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    pub(crate) fn join(self) {
+        let _ = self.thread.wait(DispatchTime::FOREVER);
+    }
+}
+
 pub struct DataPlane {
-    outbound: Outbound,
-    inbound: Inbound,
+    outbound: DeviceThread,
+    inbound: DeviceThread,
 }
 
 impl DataPlane {
@@ -233,9 +277,12 @@ impl DataPlane {
             (d.data_stop.clone(), d.out_waker.clone(), d.in_waker.clone())
         };
 
+        let outbound = Outbound::new(device.clone(), stop.clone(), out_waker);
+        let inbound = Inbound::new(device.clone(), stop, in_waker);
+
         Ok(Self {
-            outbound: Outbound::start(device.clone(), stop.clone(), out_waker)?,
-            inbound: Inbound::start(device.clone(), stop, in_waker)?,
+            outbound: DeviceThread::start("neptun-out", move || outbound.run())?,
+            inbound: DeviceThread::start("neptun-in", move || inbound.run())?,
         })
     }
 
@@ -287,50 +334,6 @@ impl DeviceHandle {
             sockets_to_close: sockets,
         })
     }
-
-    // fn start_event_loop_threads(
-    //     n_threads: usize,
-    //     interface_lock: Arc<Lock<Device>>,
-    // ) -> EventLoopThreads {
-    //     let sockets_to_close = Arc::new(Lock::new(vec![]));
-    //     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    //     let threads = {
-    //         let group = DispatchGroup::new();
-    //         // `global_queue` returns a shared singleton, so fetch it once.
-    //         let queue = DispatchQueue::global_queue(GlobalQueueIdentifier::Priority(
-    //             DispatchQueueGlobalPriority::High,
-    //         ));
-    //         for i in 0..n_threads {
-    //             let dev = Arc::clone(&interface_lock);
-    //             let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
-    //             sockets_to_close
-    //                 .read()
-    //                 .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-    //             group.exec_async(&queue, move || DeviceHandle::event_loop(thread_local, &dev));
-    //         }
-    //         group
-    //     };
-
-    //     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    //     let threads = {
-    //         let mut threads = vec![];
-    //         for i in 0..n_threads {
-    //             threads.push({
-    //                 let dev = Arc::clone(&interface_lock);
-    //                 let thread_local = DeviceHandle::new_thread_local(i, &dev.read())?;
-    //                 sockets_to_close
-    //                     .read()
-    //                     .try_writeable(|_| {}, |fds| fds.push(thread_local.iface.clone()));
-    //                 thread::Builder::new()
-    //                     .name("neptun".to_string())
-    //                     .spawn(move || DeviceHandle::event_loop(thread_local, &dev))?
-    //             });
-    //         }
-    //         threads
-    //     };
-
-    //     Ok((threads, sockets_to_close))
-    // }
 
     pub fn send_uapi_cmd(&self, cmd: &str) -> String {
         let mut response = Vec::<u8>::new();
@@ -469,20 +472,6 @@ impl DeviceHandle {
             }
         }
     }
-
-    // fn new_thread_local(
-    //     _thread_id: usize,
-    //     device_lock: &LockReadGuard<Device>,
-    // ) -> Result<ThreadData, Error> {
-    //     let t_local = ThreadData {
-    //         src_buf: [0u8; MAX_PKT_SIZE],
-    //         dst_buf: [0u8; MAX_PKT_SIZE],
-    //         iface: Arc::clone(&device_lock.iface),
-    //         update_seq: device_lock.update_seq,
-    //     };
-
-    //     Ok(t_local)
-    // }
 
     fn restart_data_plane(&mut self) -> Result<(), Error> {
         self.device.read().stop_data_plane();

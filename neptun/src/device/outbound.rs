@@ -1,4 +1,5 @@
 use std::{
+    i128::MAX,
     io,
     net::SocketAddr,
     ops::ControlFlow,
@@ -13,23 +14,18 @@ use nix::poll::{PollFd, PollFlags};
 use socket2::Socket;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::thread::{self, JoinHandle};
+use std::thread::{self};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
 
 use crate::{
     device::{
-        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, DataPlane, Device, Error,
-        IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
+        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, DataPlane, Device, DeviceThread,
+        Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
     noise::{Tunn, TunnResult},
 };
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-type OutboundThread = JoinHandle<()>;
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-type OutboundThread = DispatchRetained<DispatchGroup>;
 
 const TUN: usize = 0;
 const WAKE: usize = 1;
@@ -38,50 +34,33 @@ const ERR_FLAGS: PollFlags = PollFlags::POLLERR
     .union(PollFlags::POLLNVAL);
 
 pub(super) struct Outbound {
-    thread: OutboundThread,
+    device: Arc<Lock<Device>>,
+    stop: Arc<AtomicBool>,
+    waker: Arc<Waker>,
 }
 
 impl Outbound {
-    pub fn start(
-        device: Arc<Lock<Device>>,
-        stop: Arc<AtomicBool>,
-        waker: Arc<Waker>,
-    ) -> Result<Outbound, Error> {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-        let thread = {
-            let group = DispatchGroup::new();
-            let queue = DispatchQueue::new("neptun-out", DispatchQueueAttr::SERIAL);
-            // TODO: ensure P-core preference for execution
-            group.exec_async(&queue, move || Outbound::data_thread(device, stop, waker));
-            group
-        };
-
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        let thread = {
-            thread::Builder::new()
-                .name("neptun-out".to_string())
-                .spawn(move || Outbound::data_thread(device, stop, waker))?
-        };
-
-        Ok(Self { thread })
-    }
-
-    fn data_thread(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>, waker: Arc<Waker>) {
-        if let Err(e) = Self::run(device.clone(), stop, waker) {
-            DataPlane::close_device(&device, e);
+    pub fn new(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>, waker: Arc<Waker>) -> Self {
+        Self {
+            device,
+            stop,
+            waker,
         }
     }
 
-    fn run(
-        device: Arc<Lock<Device>>,
-        stop: Arc<AtomicBool>,
-        waker: Arc<Waker>,
-    ) -> Result<(), Error> {
+    pub fn run(self) {
+        let d = self.device.clone();
+        if let Err(e) = self.run_inner() {
+            DataPlane::close_device(&d, e);
+        }
+    }
+
+    fn run_inner(self) -> Result<(), Error> {
         let mut buf = [0u8; MAX_PKT_SIZE];
 
-        while !stop.load(Ordering::Relaxed) {
+        while !self.stop.load(Ordering::Relaxed) {
             let (iface, mtu, fw_callback, udp4, udp6) = {
-                let d = device.read();
+                let d = self.device.read();
                 (
                     d.iface.clone(),
                     d.mtu.clone(),
@@ -93,13 +72,13 @@ impl Outbound {
 
             let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
                 tracing::debug!(message = "Not connected, parked until sockets are opened.");
-                poll_waker(&waker)?;
+                poll_waker(&self.waker)?;
                 continue;
             };
 
             let mut pfds = [
                 PollFd::new(iface.as_fd(), PollFlags::POLLIN),
-                PollFd::new(waker.wait_fd(), PollFlags::POLLIN),
+                PollFd::new(self.waker.wait_fd(), PollFlags::POLLIN),
             ];
 
             loop {
@@ -110,7 +89,7 @@ impl Outbound {
                 let tun_revents = pfds[TUN].revents().unwrap_or(PollFlags::empty());
 
                 if !wake_revents.is_empty() {
-                    waker.ack();
+                    self.waker.ack();
                     break;
                 }
 
@@ -118,7 +97,7 @@ impl Outbound {
                     // The current TUN iface is gone, park until a new iface config is signalled
                     tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
                     // TODO: what if this never happens? would setting a timeout increase robustness?
-                    poll_waker(&waker)?;
+                    poll_waker(&self.waker)?;
                     break;
                 }
 
@@ -127,17 +106,9 @@ impl Outbound {
                     continue;
                 }
 
-                if drain_tun(
-                    &device,
-                    &iface,
-                    &mtu,
-                    &mut buf,
-                    &fw_callback,
-                    &udp4,
-                    &udp6,
-                    &waker,
-                )?
-                .is_break()
+                if self
+                    .drain_tun(&iface, &mtu, &mut buf, &fw_callback, &udp4, &udp6)?
+                    .is_break()
                 {
                     break;
                 }
@@ -147,91 +118,78 @@ impl Outbound {
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-    pub(crate) fn join(self) {
-        if let Err(e) = self.thread.join() {
-            tracing::error!(message = "Unable to gracefully close outbound thread.", error = ?e);
-        }
-    }
+    fn drain_tun(
+        &self,
+        iface: &Arc<TunSocket>,
+        mtu: &Arc<AtomicUsize>,
+        buf: &mut [u8; MAX_PKT_SIZE],
+        fw_callback: &Option<
+            Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
+        >,
+        udp4: &Arc<Socket>,
+        udp6: &Arc<Socket>,
+    ) -> Result<ControlFlow<()>, Error> {
+        let mtu = mtu.load(Ordering::Relaxed);
 
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    pub(crate) fn join(self) {
-        let _ = self.thread.wait(DispatchTime::FOREVER);
-    }
-}
-
-fn drain_tun(
-    device: &Arc<Lock<Device>>,
-    iface: &Arc<TunSocket>,
-    mtu: &Arc<AtomicUsize>,
-    buf: &mut [u8; MAX_PKT_SIZE],
-    fw_callback: &Option<
-        Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>,
-    >,
-    udp4: &Arc<Socket>,
-    udp6: &Arc<Socket>,
-    waker: &Arc<Waker>,
-) -> Result<ControlFlow<()>, Error> {
-    let mtu = mtu.load(Ordering::Relaxed);
-
-    loop {
-        if waker.is_pending() {
-            waker.ack();
-            return Ok(ControlFlow::Break(()));
-        }
-
-        let (payload, peer) = match read_tun_packet(iface, buf, mtu, device) {
-            IfaceReadResult::Packet { payload, peer } => (payload, peer),
-            IfaceReadResult::Skip => continue,
-            IfaceReadResult::Exhausted => return Ok(ControlFlow::Continue(())),
-            IfaceReadResult::Fatal(e) => return Err(e),
-        };
-
-        if let Some(callback) = fw_callback {
-            if !callback(&peer.public_key.0, payload, &mut iface.as_ref()) {
-                continue;
+        loop {
+            if self.waker.is_pending() {
+                self.waker.ack();
+                return Ok(ControlFlow::Break(()));
             }
-        }
 
-        let session = {
-            // Bind to a local variable, so that the tunnel's MutexGuard is dropped immediately after
-            // acquiring the session
-            let current = peer.tunnel.lock().current_session();
-            match current {
-                Some(s) => s,
-                None => {
-                    // Queue packet if session is not yet established
-                    {
-                        let mut tun = peer.tunnel.lock();
-                        tun.queue_packet(payload);
-                    }
+            let (payload, peer) = match read_tun_packet(iface, buf, mtu, &self.device) {
+                IfaceReadResult::Packet { payload, peer } => (payload, peer),
+                IfaceReadResult::Skip => continue,
+                IfaceReadResult::Exhausted => return Ok(ControlFlow::Continue(())),
+                IfaceReadResult::Fatal(e) => return Err(e),
+            };
 
-                    // TODO: want_handshake waits up to 250 ms for the timer state machine to tick, consider
-                    //  using trigger_yield() to raise a notification event instead
-                    peer.request_handshake();
+            if let Some(callback) = fw_callback {
+                if !callback(&peer.public_key.0, payload, &mut iface.as_ref()) {
                     continue;
                 }
             }
-        };
 
-        let payload_len = payload.len();
-        match session.encrypt(payload_len, buf) {
-            TunnResult::WriteToNetwork(packet) => {
-                // Advance timers and append tx_bytes
-                {
-                    let mut tun = peer.tunnel.lock();
-                    tun.timer_tick_data_packet_sent();
-                    tun.append_tx_bytes(payload_len);
+            let session = {
+                // Bind to a local variable, so that the tunnel's MutexGuard is dropped immediately after
+                // acquiring the session
+                let current = peer.tunnel.lock().current_session();
+                match current {
+                    Some(s) => s,
+                    None => {
+                        // Queue packet if session is not yet established
+                        {
+                            let mut tun = peer.tunnel.lock();
+                            tun.queue_packet(payload);
+                        }
+
+                        // TODO: want_handshake waits up to 250 ms for the timer state machine to tick, consider
+                        //  using trigger_yield() to raise a notification event instead
+                        peer.request_handshake();
+                        continue;
+                    }
                 }
-                send_packet(&peer, packet, udp4, udp6);
-            }
-            TunnResult::Err(e) => {
-                tracing::error!(message = "Encryption error",
-                    error = ?e,
-                    public_key = peer.public_key.1); // TODO: mask public key
-            }
-            _ => {
-                tracing::error!("Unexpected result from encrypt");
+            };
+
+            let payload_len = payload.len();
+            match session.encrypt(payload_len, buf) {
+                TunnResult::WriteToNetwork(packet) => {
+                    // Advance timers and append tx_bytes
+                    {
+                        let mut tun = peer.tunnel.lock();
+                        tun.timer_tick_data_packet_sent();
+                        tun.append_tx_bytes(payload_len);
+                    }
+                    send_packet(&peer, packet, udp4, udp6);
+                }
+                TunnResult::Err(e) => {
+                    tracing::error!(message = "Encryption error",
+                        error = ?e,
+                        public_key = peer.public_key.1); // TODO: mask public key
+                }
+                _ => {
+                    tracing::error!("Unexpected result from encrypt");
+                }
             }
         }
     }

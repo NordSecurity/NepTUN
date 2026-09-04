@@ -9,7 +9,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::device::{DataPlane, Error};
+use crate::device::Error;
 
 pub struct Waker {
     reader: PipeReader,
