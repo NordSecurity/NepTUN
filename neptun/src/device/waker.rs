@@ -3,12 +3,13 @@
 //! Implemented with a pipe for portability (eventfd is not available on Darwin).
 
 use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
+use nix::poll::{PollFd, PollFlags};
 use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::device::Error;
+use crate::device::{DataPlane, Error};
 
 pub struct Waker {
     reader: PipeReader,

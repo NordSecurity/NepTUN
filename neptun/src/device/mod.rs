@@ -41,14 +41,16 @@ use crate::noise::{Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use dev_lock::{Lock, LockReadGuard};
+use nix::{
+    errno::Errno,
+    poll::{PollFd, PollFlags, PollTimeout},
+};
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter};
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::mem::swap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
 #[cfg(not(target_os = "windows"))]
@@ -237,6 +239,17 @@ impl DataPlane {
         })
     }
 
+    pub(crate) fn poll(pfds: &mut [PollFd<'_>]) -> Result<(), Error> {
+        loop {
+            match nix::poll::poll(pfds, PollTimeout::NONE) {
+                Ok(_) => return Ok(()),
+                // Retry on interrupted syscall
+                Err(Errno::EINTR) => continue,
+                Err(e) => return Err(Error::Poll(e.into())),
+            }
+        }
+    }
+
     pub fn join(self) {
         self.outbound.join();
         self.inbound.join();
@@ -245,7 +258,6 @@ impl DataPlane {
     pub(crate) fn close_device(device: &Arc<Lock<Device>>, err: Error) {
         tracing::error!(message = "Critical data plane failure, closing device", error = ?err);
 
-        // TODO: ensure stopping control plane's event loop
         let mut d = device.read();
         d.try_writeable(|dev| dev.trigger_yield(), |dev| dev.closed = true);
         d.trigger_exit();
