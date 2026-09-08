@@ -463,22 +463,6 @@ impl DeviceHandle {
             }
         }
     }
-
-    // fn restart_device_threads(&mut self) -> Result<(), Error> {
-    //     self.device.read().stop_data_plane();
-
-    //     if let Some(data) = self.data.take() {
-    //         // Lock must not be held across the join
-    //         data.join();
-    //     }
-
-    //     let data = DataPlane::start(&self.device)?;
-
-    //     self.device.read().resume_data_plane();
-    //     self.data = Some(data);
-
-    //     Ok(())
-    // }
 }
 
 impl Drop for DeviceHandle {

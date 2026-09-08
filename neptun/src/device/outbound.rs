@@ -1,5 +1,4 @@
 use std::{
-    i128::MAX,
     io,
     net::SocketAddr,
     ops::ControlFlow,
@@ -10,25 +9,14 @@ use std::{
     },
 };
 
-use nix::{
-    errno::Errno,
-    poll::{PollFd, PollFlags, PollTimeout},
-};
+use nix::poll::{PollFd, PollFlags};
 use socket2::Socket;
 
 use crate::{
     device::{
-        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, DeviceHandle, Error,
-        IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
-    },
-    noise::{Tunn, TunnResult},
+        Device, DeviceHandle, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET, dev_lock::Lock, peer::Peer, tun::TunSocket, waker::{self, Waker, poll_retry},
+    }, noise::{Tunn, TunnResult},
 };
-
-const TUN: usize = 0;
-const WAKE: usize = 1;
-const ERR_FLAGS: PollFlags = PollFlags::POLLERR
-    .union(PollFlags::POLLHUP)
-    .union(PollFlags::POLLNVAL);
 
 pub(super) struct Outbound {
     device: Arc<Lock<Device>>,
@@ -45,17 +33,15 @@ impl Outbound {
         }
     }
 
-    pub fn run(self) {
-        let device_clone = self.device.clone();
-
+    pub fn run(&self) {
         if let Err(e) = self.run_inner() {
             tracing::error!(message = "Critical outbound thread failure, closing device", error = ?e);
-            let mut d = device_clone.read();
+            let mut d = self.device.read();
             DeviceHandle::close_device(&mut d);
         }
     }
 
-    fn run_inner(self) -> Result<(), Error> {
+    fn run_inner(&self) -> Result<(), Error> {
         let mut buf = [0u8; MAX_PKT_SIZE];
 
         while !self.stop.load(Ordering::Relaxed) {
@@ -72,40 +58,19 @@ impl Outbound {
 
             let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
                 tracing::debug!(message = "Not connected, parked until sockets are opened.");
-                Poll::poll_waker(&self.waker)?;
+                self.waker.wait()?;
                 continue;
             };
 
-            let mut pfds = [
-                PollFd::new(iface.as_fd(), PollFlags::POLLIN),
-                PollFd::new(self.waker.wait_fd(), PollFlags::POLLIN),
-            ];
+            let mut pfds = new_pfds(&iface, &self.waker);
 
             loop {
-                Poll::poll(&mut pfds)?;
-
-                // TODO: any better way instead of array and indexing? maybe a struct?
-                let wake_revents = pfds[WAKE].revents().unwrap_or(PollFlags::empty());
-                let tun_revents = pfds[TUN].revents().unwrap_or(PollFlags::empty());
-
-                if !wake_revents.is_empty() {
-                    self.waker.ack();
+                // Park the thread while waiting for the packets to arrive
+                if self.wait_for_tun(&mut pfds)?.is_break() {
                     break;
                 }
 
-                if tun_revents.intersects(ERR_FLAGS) {
-                    // The current TUN iface is gone, park until a new iface config is signalled
-                    tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
-                    // TODO: what if this never happens? would setting a timeout increase robustness?
-                    Poll::poll_waker(&self.waker)?;
-                    break;
-                }
-
-                // TODO: what is the exact meaning of this?
-                if !tun_revents.contains(PollFlags::POLLIN) {
-                    continue;
-                }
-
+                // Process TUN packets
                 if self
                     .drain_tun(&iface, &mtu, &mut buf, &fw_callback, &udp4, &udp6)?
                     .is_break()
@@ -137,7 +102,7 @@ impl Outbound {
                 return Ok(ControlFlow::Break(()));
             }
 
-            let (payload, peer) = match read_tun_packet(iface, buf, mtu, &self.device) {
+            let (payload, peer) = match self.read_tun_packet(iface, buf, mtu) {
                 IfaceReadResult::Packet { payload, peer } => (payload, peer),
                 IfaceReadResult::Skip => continue,
                 IfaceReadResult::Exhausted => return Ok(ControlFlow::Continue(())),
@@ -193,48 +158,75 @@ impl Outbound {
             }
         }
     }
-}
 
-fn read_tun_packet<'a>(
-    iface: &Arc<TunSocket>,
-    buf: &'a mut [u8; MAX_PKT_SIZE],
-    mtu: usize,
-    device: &Arc<Lock<Device>>,
-) -> IfaceReadResult<'a> {
-    if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
-        tracing::error!("Insufficient packet buffer size");
-        return IfaceReadResult::Fatal(Error::InternalError(
-            "Insufficient packet buffer size".to_owned(),
-        ));
+    fn wait_for_tun(&self, pfds: &mut Pfds<'_>) -> Result<ControlFlow<()>, Error> {
+        poll_retry(pfds.as_mut_slice())?;
+
+        if !pfds.get_revents(PfdIndex::Waker).is_empty() {
+            self.waker.ack();
+            return Ok(ControlFlow::Break(()));
+        }
+
+        let tun_revents = pfds.get_revents(PfdIndex::Tun);
+
+        if tun_revents.contains(PollFlags::POLLNVAL) {
+            return Err(Error::InternalError(
+                "Polled an invalid TUN fd (fd not open)".to_owned(),
+            ));
+        }
+
+        if tun_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+            tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
+            self.waker.wait()?;
+            return Ok(ControlFlow::Break(()));
+        }
+
+        Ok(ControlFlow::Continue(()))
     }
 
-    #[allow(clippy::indexing_slicing)]
-    // guaranteed by the above check
-    match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
-        Ok(payload) => match Tunn::dst_address(payload) {
-            None => IfaceReadResult::Skip,
-            Some(dst_addr) => {
-                // TODO: Check if using ArcSwap can be used to fully remove read lock from the hot path and if it brings meaningful gain
-                let d = device.read();
-                match d.peers_by_ip.find(dst_addr) {
-                    None => IfaceReadResult::Skip,
-                    Some(peer) => IfaceReadResult::Packet {
-                        payload,
-                        peer: peer.clone(),
-                    },
+    fn read_tun_packet<'a>(
+        &self,
+        iface: &Arc<TunSocket>,
+        buf: &'a mut [u8; MAX_PKT_SIZE],
+        mtu: usize,
+    ) -> IfaceReadResult<'a> {
+        if mtu + WG_HEADER_OFFSET > MAX_PKT_SIZE {
+            tracing::error!("Insufficient packet buffer size");
+            return IfaceReadResult::Fatal(Error::InternalError(
+                "Insufficient packet buffer size".to_owned(),
+            ));
+        }
+
+        #[allow(clippy::indexing_slicing)]
+        // guaranteed by the above check
+        match iface.read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu]) {
+            Ok(payload) => match Tunn::dst_address(payload) {
+                None => IfaceReadResult::Skip,
+                Some(dst_addr) => {
+                    // TODO: Check if using ArcSwap can be used to fully remove read lock from the hot path and if it brings meaningful gain
+                    let d = self.device.read();
+                    match d.peers_by_ip.find(dst_addr) {
+                        None => IfaceReadResult::Skip,
+                        Some(peer) => IfaceReadResult::Packet {
+                            payload,
+                            peer: peer.clone(),
+                        },
+                    }
                 }
+            },
+            Err(Error::IfaceRead(e)) => match e.kind() {
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => {
+                    IfaceReadResult::Exhausted
+                }
+                _ => {
+                    tracing::error!(message = "Fatal read error on tun interface: errno", error = ?e);
+                    IfaceReadResult::Fatal(Error::IfaceRead(e))
+                }
+            },
+            Err(e) => {
+                tracing::error!(message = "Unexpected error on tun interface", error = ?e);
+                IfaceReadResult::Fatal(e)
             }
-        },
-        Err(Error::IfaceRead(e)) => match e.kind() {
-            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => IfaceReadResult::Exhausted,
-            _ => {
-                tracing::error!(message = "Fatal read error on tun interface: errno", error = ?e);
-                IfaceReadResult::Fatal(Error::IfaceRead(e))
-            }
-        },
-        Err(e) => {
-            tracing::error!(message = "Unexpected error on tun interface", error = ?e);
-            IfaceReadResult::Fatal(e)
         }
     }
 }
@@ -281,25 +273,28 @@ fn send_packet(
     }
 }
 
-pub struct Poll;
+/// Exhaustive list of outbound [`PollFd`]s
+enum PfdIndex {
+    Tun,
+    Waker,
+}
 
-impl Poll {
-    pub(crate) fn poll(pfds: &mut [PollFd<'_>]) -> Result<(), Error> {
-        loop {
-            match nix::poll::poll(pfds, PollTimeout::NONE) {
-                Ok(_) => return Ok(()),
-                // Retry on interrupted syscall
-                Err(Errno::EINTR) => continue,
-                Err(e) => return Err(Error::Poll(e.into())),
-            }
-        }
+impl Into<usize> for PfdIndex {
+    fn into(self) -> usize {
+        self as usize
     }
+}
 
-    /// Blocks until the waker receives a signal.
-    fn poll_waker(waker: &Waker) -> Result<(), Error> {
-        let mut pfds = [PollFd::new(waker.wait_fd(), PollFlags::POLLIN)];
-        Self::poll(&mut pfds)?;
-        waker.ack();
-        Ok(())
-    }
+/// Wrapper over a set of outbound [`PollFd`]s (TUN iface and waker)
+type Pfds<'a> = waker::Pfds<'a, PfdIndex, 2>;
+
+/// Create a set of outbound [`PollFd`]s ([`TunSocket`] and [`Waker`])
+fn new_pfds<'a>(tun: &'a Arc<TunSocket>, waker: &'a Arc<Waker>) -> Pfds<'a> {
+    let tun_pfd = PollFd::new(tun.as_fd(), PollFlags::POLLIN);
+    let waker_pfd = PollFd::new(waker.wait_fd(), PollFlags::POLLIN);
+
+    Pfds::new([
+        tun_pfd,   // PfdIndex::Tun
+        waker_pfd, // PfdIndex::Waker
+    ])
 }
