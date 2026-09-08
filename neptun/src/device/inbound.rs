@@ -48,11 +48,6 @@ impl Inbound {
         }
     }
 
-    // TODO: add proper multi-peer support / conn skt's peer sharding (demuxing)
-    // TODO: add firewall support
-    // TODO: ensure tunn packet queue flushing
-    // TODO: (2nd step) consider moving anonymous socket data processing here (Apple!)
-
     pub fn run(&self) {
         if let Err(e) = self.run_inner() {
             tracing::error!(message = "Critical inbound thread failure, closing device", error = ?e);
@@ -66,71 +61,111 @@ impl Inbound {
         let mut dstbuf = [0u8; MAX_PKT_SIZE];
 
         while !self.stop.load(Ordering::Relaxed) {
-            let (iface, fw_callback, key_pair, rate_limiter, udp4, udp6) = {
-                let d = self.device.read();
-                (
-                    d.iface.clone(),
-                    d.config.firewall_process_inbound_callback.clone(),
-                    d.key_pair.clone(),
-                    d.rate_limiter.clone(),
-                    d.udp4.clone(),
-                    d.udp6.clone(),
-                )
-            };
-
-            let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
-                tracing::debug!(message = "Not connected, parked until sockets are opened.");
-                self.waker.wait()?;
+            let Some(snap) = self.take_snapshot()? else {
                 continue;
             };
 
-            let Some(key_pair) = key_pair.as_ref() else {
-                tracing::trace!("Empty key pair");
-                self.waker.wait()?;
-                continue;
-            };
-
-            let mut pfds = new_pfds(&udp4, &udp6, &self.waker);
+            let mut poll_set = PollSet::new(&snap, &self.waker);
 
             loop {
-                if self.wait_for_sockets(&mut pfds)?.is_break() {
+                poll_retry(poll_set.as_mut_slice())?;
+
+                if poll_set.woken() {
+                    self.waker.ack();
                     break;
                 }
 
-                if self
-                    .handle_packet_loop(
-                        &iface,
-                        &fw_callback,
-                        &mut rcvbuf,
-                        &mut dstbuf,
-                        &key_pair,
-                        &rate_limiter,
-                        &udp4,
-                        &udp6,
-                    )?
-                    .is_break()
-                {
-                    break;
-                };
-            }
+                let mut resnapshot = false;
 
-            // let bound: Option<(Arc<Peer>, socket2::Socket)> = None;
-            // handle_packet_loop_single_conn_peer(device, iface, rcvbuf, dstbuf, bound, stop);
+                for (slot, revents) in poll_set.ready() {
+                    if revents.contains(PollFlags::POLLNVAL) {
+                        return Err(Error::InternalError(format!(
+                            "Polled an invalid fd on {}",
+                            slot.kind()
+                        )));
+                    }
+
+                    if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                        match slot {
+                            Slot::Conn(peer, _) => {
+                                tracing::debug!(message = "Connected socket failed", revents = ?revents);
+                                peer.shutdown_endpoint();
+                                resnapshot = true;
+                            }
+                            Slot::Anon(_) => {
+                                tracing::warn!(message = "UDP socket invalidated", revents = ?revents);
+                                resnapshot = true;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if revents.contains(PollFlags::POLLIN) {
+                        let _ = match slot {
+                            Slot::Anon(sock) => {
+                                self.drain_anon(sock, &snap, &mut rcvbuf, &mut dstbuf)?
+                            }
+                            Slot::Conn(peer, sock) => {
+                                // self.drain_conn(&peer, sock, &snap, &mut rcvbuf, &mut dstbuf)?
+                                return Err(Error::InternalError(
+                                    "TODO: Conn skts not yet handled".to_owned(),
+                                ));
+                            }
+                        };
+                    }
+                }
+
+                if resnapshot {
+                    break;
+                }
+            }
         }
 
         Ok(())
     }
 
-    fn handle_packet_loop(
+    fn take_snapshot(&self) -> Result<Option<Snapshot>, Error> {
+        let (iface, fw_callback, key_pair, rate_limiter, udp4, udp6) = {
+            let d = self.device.read();
+            (
+                d.iface.clone(),
+                d.config.firewall_process_inbound_callback.clone(),
+                d.key_pair.clone(),
+                d.rate_limiter.clone(),
+                d.udp4.clone(),
+                d.udp6.clone(),
+            )
+        };
+
+        let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
+            tracing::debug!(message = "Not connected, parked until sockets are opened.");
+            self.waker.wait()?;
+            return Ok(None);
+        };
+
+        let Some(key_pair) = key_pair else {
+            tracing::trace!("Empty key pair");
+            self.waker.wait()?;
+            return Ok(None);
+        };
+
+        Ok(Some(Snapshot {
+            iface,
+            fw_callback,
+            key_pair,
+            rate_limiter,
+            udp4,
+            udp6,
+            conns: vec![],
+        }))
+    }
+
+    fn drain_anon(
         &self,
-        iface: &Arc<TunSocket>,
-        fw_callback: &Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
+        sock: &Socket,
+        snap: &Snapshot,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
-        key_pair: &(StaticSecret, PublicKey),
-        rate_limiter: &Option<Arc<RateLimiter>>,
-        udp4: &Arc<Socket>,
-        _udp6: &Arc<Socket>,
     ) -> Result<ControlFlow<()>, Error> {
         loop {
             if self.waker.is_pending() {
@@ -142,7 +177,7 @@ impl Inbound {
             // bytes to the buffer, so this casting is safe.
             let src_buf = unsafe { &mut *(&mut rcvbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
-            let Ok((packet_len, addr)) = udp4.recv_from(src_buf) else {
+            let Ok((packet_len, addr)) = sock.recv_from(src_buf) else {
                 break;
             };
 
@@ -150,7 +185,7 @@ impl Inbound {
                 Some(p) => p,
                 None => {
                     tracing::error!("Buffer size different from packet length");
-                    break;
+                    continue;
                 }
             };
 
@@ -158,32 +193,32 @@ impl Inbound {
                 Some(s) => s,
                 None => {
                     tracing::warn!("Invalid socket address family");
-                    break;
+                    continue;
                 }
             };
             // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-            let parsed_packet = match rate_limiter {
+            let parsed_packet = match snap.rate_limiter {
                 Some(ref rate_limiter) => {
                     match rate_limiter.verify_packet(Some(sock.ip()), packet, dstbuf) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
-                            if let Err(err) = udp4.send_to(cookie, &addr) {
+                            if let Err(err) = snap.udp4.send_to(cookie, &addr) {
                                 tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
                             }
-                            break;
+                            continue;
                         }
-                        Err(_) => break,
+                        Err(_) => continue,
                     }
                 }
                 None => match Tunn::parse_incoming_packet(packet) {
                     Ok(packet) => packet,
-                    Err(_) => break,
+                    Err(_) => continue,
                 },
             };
 
             let peer = match &parsed_packet {
                 Packet::HandshakeInit(p) => {
-                    let (private_key, public_key) = key_pair;
+                    let (private_key, public_key) = &snap.key_pair;
                     parse_handshake_anon(private_key, public_key, p)
                         .ok()
                         .and_then(|hh| {
@@ -214,7 +249,7 @@ impl Inbound {
             };
 
             let peer = match peer {
-                None => break,
+                None => continue,
                 Some(peer) => peer,
             };
 
@@ -227,26 +262,26 @@ impl Inbound {
                 TunnResult::Done => {}
                 TunnResult::Err(err) => {
                     tracing::warn!(message = "Failed to handle packet", error = ?err);
-                    break;
+                    continue;
                 }
                 TunnResult::WriteToNetwork(packet) => {
                     flush = true;
-                    if let Err(err) = udp4.send_to(packet, &addr) {
+                    if let Err(err) = snap.udp4.send_to(packet, &addr) {
                         tracing::warn!(message = "Failed to send packet", error = ?err, dst = ?addr);
                     }
                 }
                 TunnResult::WriteToTunnel(packet, addr) => {
-                    if let Some(ref callback) = fw_callback {
+                    if let Some(ref callback) = snap.fw_callback {
                         if !callback(&peer.public_key.0, packet) {
-                            break;
+                            continue;
                         }
                     }
 
                     if peer.is_allowed_ip(addr) {
-                        _ = iface.as_ref().write(packet);
+                        _ = snap.iface.as_ref().write(packet);
                         tracing::trace!(
                             message = "Writing packet to tunnel",
-                            interface = ?iface.name(),
+                            interface = ?snap.iface.name(),
                             packet_length = packet.len(),
                             src_addr = ?addr,
                             public_key = peer.public_key.1
@@ -267,7 +302,7 @@ impl Inbound {
                         break;
                     };
 
-                    if let Err(err) = udp4.send_to(packet, &addr) {
+                    if let Err(err) = snap.udp4.send_to(packet, &addr) {
                         tracing::warn!(message = "Failed to flush queue", error = ?err, dst = ?addr);
                     }
                 }
@@ -279,13 +314,15 @@ impl Inbound {
         Ok(ControlFlow::Continue(()))
     }
 
-    fn handle_packet_loop_single_conn_peer(
-        self,
-        iface: Arc<TunSocket>,
+    /* TODO
+    fn drain_conn(
+        &self,
+        peer: &Peer,
+        sock: &Socket,
+        snap: &Snapshot,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
-        mut bound: Option<(Arc<Peer>, socket2::Socket)>,
-    ) -> () {
+    ) -> Result<ControlFlow<()>, Error> {
         while !self.stop.load(Ordering::Relaxed) {
             if bound.is_none() {
                 bound = {
@@ -389,74 +426,85 @@ impl Inbound {
             }
         }
     }
+    */
+}
 
-    fn wait_for_sockets(&self, pfds: &mut Pfds<'_>) -> Result<ControlFlow<()>, Error> {
-        poll_retry(pfds.as_mut_slice())?;
+struct Snapshot {
+    iface: Arc<TunSocket>,
+    fw_callback: Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
+    key_pair: (StaticSecret, PublicKey),
+    rate_limiter: Option<Arc<RateLimiter>>,
+    udp4: Arc<Socket>,
+    udp6: Arc<Socket>,
+    conns: Vec<(Arc<Peer>, Socket)>,
+}
 
-        // On waker signal sent, this breaks out of UDP socket waiting loop
-        // causing the thread to re-evaluate its stop flag
-        if !pfds.get_revents(PfdIndex::Waker).is_empty() {
-            self.waker.ack();
-            return Ok(ControlFlow::Break(()));
+enum Slot<'a> {
+    Anon(&'a Socket),
+    Conn(&'a Peer, &'a Socket),
+}
+
+impl Slot<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            Slot::Anon(_) => "anonymous UDP socket",
+            Slot::Conn(..) => "connected peer socket",
         }
-
-        let udp4_revents = pfds.get_revents(PfdIndex::Udp4);
-
-        if udp4_revents.contains(PollFlags::POLLNVAL) {
-            return Err(Error::InternalError(
-                "Polled an invalid UDP IPv4 fd (fd not open)".to_owned(),
-            ));
-        }
-
-        if udp4_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            tracing::warn!(message = "UDP IPv4 socket invalidated", revents = ?udp4_revents);
-            self.waker.wait()?;
-            return Ok(ControlFlow::Break(()));
-        }
-
-        let udp6_revents = pfds.get_revents(PfdIndex::Udp6);
-
-        if udp6_revents.contains(PollFlags::POLLNVAL) {
-            return Err(Error::InternalError(
-                "Polled an invalid UDP IPv6 fd (fd not open)".to_owned(),
-            ));
-        }
-
-        if udp6_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            tracing::warn!(message = "UDP IPv6 socket invalidated", revents = ?udp6_revents);
-            self.waker.wait()?;
-            return Ok(ControlFlow::Break(()));
-        }
-
-        Ok(ControlFlow::Continue(()))
     }
 }
 
-// Exhaustive list of inbound PollFd Indices
-enum PfdIndex {
-    Udp4,
-    Udp6,
-    Waker,
+struct PollSet<'a> {
+    // pfds[0] is always the waker
+    pfds: Vec<PollFd<'a>>,
+    slots: Vec<Slot<'a>>,
 }
 
-impl From<PfdIndex> for usize {
-    fn from(value: PfdIndex) -> Self {
-        value as usize
+impl<'a> PollSet<'a> {
+    fn new(snap: &'a Snapshot, waker: &'a Waker) -> Self {
+        // 3 pfds are always present: a waker and two anonymous UDP sockets
+        let capacity = 3 + snap.conns.len();
+        let mut pfds = Vec::with_capacity(capacity);
+        let mut slots = Vec::with_capacity(capacity);
+
+        // Push Waker's PollFd first, it has no corresponding slot
+        pfds.push(PollFd::new(waker.wait_fd(), PollFlags::POLLIN));
+
+        // Push anonymous UDP sockets' PollFds and their corresponding anon slots
+        for sock in [&snap.udp4, &snap.udp6] {
+            pfds.push(PollFd::new(sock.as_fd(), PollFlags::POLLIN));
+            slots.push(Slot::Anon(sock));
+        }
+        
+        // Push connected UDP sockets' PollFds and their corresponding conn slots
+        for (peer, sock) in &snap.conns {
+            pfds.push(PollFd::new(sock.as_fd(), PollFlags::POLLIN));
+            slots.push(Slot::Conn(peer, sock));
+        }
+
+        Self { pfds, slots }
     }
-}
 
-/// Wrapper over a set of inbound [`PollFd`]s (UDP sockets and waker)
-type Pfds<'a> = waker::Pfds<'a, PfdIndex, 3>;
+    fn as_mut_slice(&mut self) -> &mut [PollFd<'a>] {
+        &mut self.pfds
+    }
 
-/// Create a set of [`PollFd`]s for UDP IPv4 and IPv6 [`Socket`]s and [`Waker`]
-fn new_pfds<'a>(udp4: &'a Arc<Socket>, udp6: &'a Arc<Socket>, waker: &'a Arc<Waker>) -> Pfds<'a> {
-    let udp4_pfd = PollFd::new(udp4.as_fd(), PollFlags::POLLIN);
-    let udp6_pfd = PollFd::new(udp6.as_fd(), PollFlags::POLLIN);
-    let waker_pfd = PollFd::new(waker.wait_fd(), PollFlags::POLLIN);
+    // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?
+    fn woken(&self) -> bool {
+        self.pfds
+        .first() // pfds[0] is Waker's PollFd
+        .and_then(|pfd| pfd.revents())
+        .is_some_and(|revents| !revents.is_empty())
+    }
 
-    Pfds::new([
-        udp4_pfd,  // PfdIndex::Udp4
-        udp6_pfd,  // PfdIndex::Udp6
-        waker_pfd, // PfdIndex::Waker
-    ])
+    // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?
+    fn ready(&self) -> impl Iterator<Item = (&Slot<'a>, PollFlags)> + '_ {
+        self.pfds
+            .iter()
+            .skip(1) // skip waker's PollFd
+            .zip(&self.slots)
+            .filter_map(|(pfd, slot)| {
+                let revents = pfd.revents().unwrap_or(PollFlags::empty());
+                (!revents.is_empty()).then_some((slot, revents))
+            })
+    }
 }

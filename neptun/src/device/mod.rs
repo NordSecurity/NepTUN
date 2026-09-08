@@ -31,7 +31,6 @@ pub mod waker;
 
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
-use crate::device::peer::DATA_SOCKET_READ_TIMEOUT;
 use crate::device::waker::Waker;
 use crate::noise::errors::WireGuardError;
 use crate::noise::rate_limiter::RateLimiter;
@@ -707,8 +706,7 @@ impl Device {
         let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-        udp_sock4.set_nonblocking(false)?;
-        udp_sock4.set_read_timeout(Some(DATA_SOCKET_READ_TIMEOUT))?;
+        udp_sock4.set_nonblocking(true)?;
         self.config.protect.make_external(udp_sock4.as_raw_fd());
 
         if port == 0 {
@@ -721,8 +719,7 @@ impl Device {
         let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock6.set_reuse_address(true)?;
         udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-        udp_sock6.set_nonblocking(false)?;
-        udp_sock6.set_read_timeout(Some(DATA_SOCKET_READ_TIMEOUT))?;
+        udp_sock6.set_nonblocking(true)?;
         self.config.protect.make_external(udp_sock6.as_raw_fd());
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
