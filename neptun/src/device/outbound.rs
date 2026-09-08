@@ -14,8 +14,13 @@ use socket2::Socket;
 
 use crate::{
     device::{
-        Device, DeviceHandle, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET, dev_lock::Lock, peer::Peer, tun::TunSocket, waker::{self, Waker, poll_retry},
-    }, noise::{Tunn, TunnResult},
+        dev_lock::Lock,
+        peer::Peer,
+        tun::TunSocket,
+        waker::{self, poll_retry, Waker},
+        Device, DeviceHandle, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
+    },
+    noise::{Tunn, TunnResult},
 };
 
 pub(super) struct Outbound {
@@ -64,6 +69,7 @@ impl Outbound {
 
             let mut pfds = new_pfds(&iface, &self.waker);
 
+            // TUN waiting loop
             loop {
                 // Park the thread while waiting for the packets to arrive
                 if self.wait_for_tun(&mut pfds)?.is_break() {
@@ -162,6 +168,8 @@ impl Outbound {
     fn wait_for_tun(&self, pfds: &mut Pfds<'_>) -> Result<ControlFlow<()>, Error> {
         poll_retry(pfds.as_mut_slice())?;
 
+        // On waker signal sent, this breaks out of TUN waiting loop
+        // causing the thread to re-evaluate its stop flag
         if !pfds.get_revents(PfdIndex::Waker).is_empty() {
             self.waker.ack();
             return Ok(ControlFlow::Break(()));
@@ -175,6 +183,7 @@ impl Outbound {
             ));
         }
 
+        // On TUN iface change break out of TUN waiting loop to re-read the Device config
         if tun_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
             tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
             self.waker.wait()?;
@@ -279,9 +288,9 @@ enum PfdIndex {
     Waker,
 }
 
-impl Into<usize> for PfdIndex {
-    fn into(self) -> usize {
-        self as usize
+impl From<PfdIndex> for usize {
+    fn from(value: PfdIndex) -> Self {
+        value as usize
     }
 }
 

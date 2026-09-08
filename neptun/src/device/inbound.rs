@@ -1,6 +1,8 @@
 use std::{
     io::{self, Write},
     mem::MaybeUninit,
+    ops::ControlFlow,
+    os::fd::AsFd,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -8,13 +10,20 @@ use std::{
     time::Duration,
 };
 
-use nix::sys::socket;
+use nix::{
+    poll::{PollFd, PollFlags},
+    sys::socket,
+};
 use socket2::Socket;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     device::{
-        dev_lock::Lock, peer::Peer, tun::TunSocket, waker::Waker, Device, Error, MAX_PKT_SIZE,
+        dev_lock::Lock,
+        peer::Peer,
+        tun::TunSocket,
+        waker::{self, poll_retry, Waker},
+        Device, DeviceHandle, Error, MAX_PKT_SIZE,
     },
     noise::{
         handshake::parse_handshake_anon,
@@ -39,75 +48,109 @@ impl Inbound {
         }
     }
 
-    pub fn run(self) {
-        // for now this only handles data coming from connected socket on a single peer it happens to obtain first,
-        // relying on the bootstrapping performed in the handler registered with register_udp_handler(),
-        // replaces connected socket handler from register_read_conn_skt_handler()
+    // TODO: add proper multi-peer support / conn skt's peer sharding (demuxing)
+    // TODO: add firewall support
+    // TODO: ensure tunn packet queue flushing
+    // TODO: (2nd step) consider moving anonymous socket data processing here (Apple!)
 
-        // TODO: add proper multi-peer support / conn skt's peer sharding (demuxing)
-        // TODO: add firewall support
-        // TODO: ensure tunn packet queue flushing
-        // TODO: (2nd step) consider moving anonymous socket data processing here (Apple!)
-
-        let (iface, fw_callback) = {
-            let d = self.device.read();
-            (
-                d.iface.clone(),
-                d.config.firewall_process_inbound_callback.clone(),
-            )
-        };
-
-        let rcvbuf = [0u8; MAX_PKT_SIZE];
-        let dstbuf = [0u8; MAX_PKT_SIZE];
-
-        self.handle_packet_loop(iface, fw_callback, rcvbuf, dstbuf);
-
-        // let bound: Option<(Arc<Peer>, socket2::Socket)> = None;
-        // handle_packet_loop_single_conn_peer(device, iface, rcvbuf, dstbuf, bound, stop);
+    pub fn run(&self) {
+        if let Err(e) = self.run_inner() {
+            tracing::error!(message = "Critical inbound thread failure, closing device", error = ?e);
+            let mut d = self.device.read();
+            DeviceHandle::close_device(&mut d);
+        }
     }
 
-    fn handle_packet_loop(
-        self,
-        iface: Arc<TunSocket>,
-        fw_callback: Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
-        mut rcvbuf: [u8; MAX_PKT_SIZE],
-        mut dstbuf: [u8; MAX_PKT_SIZE],
-    ) {
+    fn run_inner(&self) -> Result<(), Error> {
+        let mut rcvbuf = [0u8; MAX_PKT_SIZE];
+        let mut dstbuf = [0u8; MAX_PKT_SIZE];
+
         while !self.stop.load(Ordering::Relaxed) {
-            let udp4 = {
+            let (iface, fw_callback, key_pair, rate_limiter, udp4, udp6) = {
                 let d = self.device.read();
-                d.udp4.clone()
+                (
+                    d.iface.clone(),
+                    d.config.firewall_process_inbound_callback.clone(),
+                    d.key_pair.clone(),
+                    d.rate_limiter.clone(),
+                    d.udp4.clone(),
+                    d.udp6.clone(),
+                )
             };
 
-            let Some(udp4) = udp4 else {
-                tracing::error!("Not connected");
+            let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
+                tracing::debug!(message = "Not connected, parked until sockets are opened.");
+                self.waker.wait()?;
                 continue;
-            };
-
-            let (key_pair, rate_limiter) = {
-                let d = self.device.read();
-                (d.key_pair.clone(), d.rate_limiter.clone())
             };
 
             let Some(key_pair) = key_pair.as_ref() else {
                 tracing::trace!("Empty key pair");
-                std::thread::sleep(Duration::from_millis(100));
-                continue; // return Action::Exit;
+                self.waker.wait()?;
+                continue;
             };
+
+            let mut pfds = new_pfds(&udp4, &udp6, &self.waker);
+
+            loop {
+                if self.wait_for_sockets(&mut pfds)?.is_break() {
+                    break;
+                }
+
+                if self
+                    .handle_packet_loop(
+                        &iface,
+                        &fw_callback,
+                        &mut rcvbuf,
+                        &mut dstbuf,
+                        &key_pair,
+                        &rate_limiter,
+                        &udp4,
+                        &udp6,
+                    )?
+                    .is_break()
+                {
+                    break;
+                };
+            }
+
+            // let bound: Option<(Arc<Peer>, socket2::Socket)> = None;
+            // handle_packet_loop_single_conn_peer(device, iface, rcvbuf, dstbuf, bound, stop);
+        }
+
+        Ok(())
+    }
+
+    fn handle_packet_loop(
+        &self,
+        iface: &Arc<TunSocket>,
+        fw_callback: &Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
+        rcvbuf: &mut [u8; MAX_PKT_SIZE],
+        dstbuf: &mut [u8; MAX_PKT_SIZE],
+        key_pair: &(StaticSecret, PublicKey),
+        rate_limiter: &Option<Arc<RateLimiter>>,
+        udp4: &Arc<Socket>,
+        _udp6: &Arc<Socket>,
+    ) -> Result<ControlFlow<()>, Error> {
+        loop {
+            if self.waker.is_pending() {
+                self.waker.ack();
+                return Ok(ControlFlow::Break(()));
+            }
 
             // Safety: the `recv_from` implementation promises not to write uninitialised
             // bytes to the buffer, so this casting is safe.
             let src_buf = unsafe { &mut *(&mut rcvbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
             let Ok((packet_len, addr)) = udp4.recv_from(src_buf) else {
-                continue;
+                break;
             };
 
             let packet = match rcvbuf.get(..packet_len) {
                 Some(p) => p,
                 None => {
                     tracing::error!("Buffer size different from packet length");
-                    continue;
+                    break;
                 }
             };
 
@@ -115,26 +158,26 @@ impl Inbound {
                 Some(s) => s,
                 None => {
                     tracing::warn!("Invalid socket address family");
-                    continue;
+                    break;
                 }
             };
             // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
             let parsed_packet = match rate_limiter {
                 Some(ref rate_limiter) => {
-                    match rate_limiter.verify_packet(Some(sock.ip()), packet, &mut dstbuf) {
+                    match rate_limiter.verify_packet(Some(sock.ip()), packet, dstbuf) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
                             if let Err(err) = udp4.send_to(cookie, &addr) {
                                 tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
                             }
-                            continue;
+                            break;
                         }
-                        Err(_) => continue,
+                        Err(_) => break,
                     }
                 }
                 None => match Tunn::parse_incoming_packet(packet) {
                     Ok(packet) => packet,
-                    Err(_) => continue,
+                    Err(_) => break,
                 },
             };
 
@@ -171,7 +214,7 @@ impl Inbound {
             };
 
             let peer = match peer {
-                None => continue,
+                None => break,
                 Some(peer) => peer,
             };
 
@@ -184,7 +227,7 @@ impl Inbound {
                 TunnResult::Done => {}
                 TunnResult::Err(err) => {
                     tracing::warn!(message = "Failed to handle packet", error = ?err);
-                    continue;
+                    break;
                 }
                 TunnResult::WriteToNetwork(packet) => {
                     flush = true;
@@ -195,7 +238,7 @@ impl Inbound {
                 TunnResult::WriteToTunnel(packet, addr) => {
                     if let Some(ref callback) = fw_callback {
                         if !callback(&peer.public_key.0, packet) {
-                            continue;
+                            break;
                         }
                     }
 
@@ -232,13 +275,15 @@ impl Inbound {
 
             peer.set_endpoint(sock);
         }
+
+        Ok(ControlFlow::Continue(()))
     }
 
     fn handle_packet_loop_single_conn_peer(
         self,
         iface: Arc<TunSocket>,
-        mut rcvbuf: [u8; MAX_PKT_SIZE],
-        mut dstbuf: [u8; MAX_PKT_SIZE],
+        rcvbuf: &mut [u8; MAX_PKT_SIZE],
+        dstbuf: &mut [u8; MAX_PKT_SIZE],
         mut bound: Option<(Arc<Peer>, socket2::Socket)>,
     ) -> () {
         while !self.stop.load(Ordering::Relaxed) {
@@ -291,7 +336,7 @@ impl Inbound {
                             // Off-lock decrypt, short lock just to clone the session
                             let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
                             if let Some(session) = session {
-                                match session.decrypt(p, &mut dstbuf) {
+                                match session.decrypt(p, dstbuf) {
                                     Ok(plain) if !plain.is_empty() => {
                                         if let Some(len) = Tunn::decapsulated_packet_len(plain) {
                                             let _ = iface.as_ref().write(&plain[..len]);
@@ -308,7 +353,7 @@ impl Inbound {
                         Ok(_) => {
                             let res = {
                                 let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, datagram, &mut dstbuf)
+                                tun.decapsulate(None, datagram, dstbuf)
                             };
                             match res {
                                 TunnResult::WriteToNetwork(packet) => {
@@ -344,4 +389,74 @@ impl Inbound {
             }
         }
     }
+
+    fn wait_for_sockets(&self, pfds: &mut Pfds<'_>) -> Result<ControlFlow<()>, Error> {
+        poll_retry(pfds.as_mut_slice())?;
+
+        // On waker signal sent, this breaks out of UDP socket waiting loop
+        // causing the thread to re-evaluate its stop flag
+        if !pfds.get_revents(PfdIndex::Waker).is_empty() {
+            self.waker.ack();
+            return Ok(ControlFlow::Break(()));
+        }
+
+        let udp4_revents = pfds.get_revents(PfdIndex::Udp4);
+
+        if udp4_revents.contains(PollFlags::POLLNVAL) {
+            return Err(Error::InternalError(
+                "Polled an invalid UDP IPv4 fd (fd not open)".to_owned(),
+            ));
+        }
+
+        if udp4_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+            tracing::warn!(message = "UDP IPv4 socket invalidated", revents = ?udp4_revents);
+            self.waker.wait()?;
+            return Ok(ControlFlow::Break(()));
+        }
+
+        let udp6_revents = pfds.get_revents(PfdIndex::Udp6);
+
+        if udp6_revents.contains(PollFlags::POLLNVAL) {
+            return Err(Error::InternalError(
+                "Polled an invalid UDP IPv6 fd (fd not open)".to_owned(),
+            ));
+        }
+
+        if udp6_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+            tracing::warn!(message = "UDP IPv6 socket invalidated", revents = ?udp6_revents);
+            self.waker.wait()?;
+            return Ok(ControlFlow::Break(()));
+        }
+
+        Ok(ControlFlow::Continue(()))
+    }
+}
+
+// Exhaustive list of inbound PollFd Indices
+enum PfdIndex {
+    Udp4,
+    Udp6,
+    Waker,
+}
+
+impl From<PfdIndex> for usize {
+    fn from(value: PfdIndex) -> Self {
+        value as usize
+    }
+}
+
+/// Wrapper over a set of inbound [`PollFd`]s (UDP sockets and waker)
+type Pfds<'a> = waker::Pfds<'a, PfdIndex, 3>;
+
+/// Create a set of [`PollFd`]s for UDP IPv4 and IPv6 [`Socket`]s and [`Waker`]
+fn new_pfds<'a>(udp4: &'a Arc<Socket>, udp6: &'a Arc<Socket>, waker: &'a Arc<Waker>) -> Pfds<'a> {
+    let udp4_pfd = PollFd::new(udp4.as_fd(), PollFlags::POLLIN);
+    let udp6_pfd = PollFd::new(udp6.as_fd(), PollFlags::POLLIN);
+    let waker_pfd = PollFd::new(waker.wait_fd(), PollFlags::POLLIN);
+
+    Pfds::new([
+        udp4_pfd,  // PfdIndex::Udp4
+        udp6_pfd,  // PfdIndex::Udp6
+        waker_pfd, // PfdIndex::Waker
+    ])
 }

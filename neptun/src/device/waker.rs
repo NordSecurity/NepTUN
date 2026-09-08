@@ -42,6 +42,7 @@ impl Waker {
         let _ = (&self.writer).write(&[1u8]);
     }
 
+    // Acknowledges reception of a sent signal
     pub fn ack(&self) {
         self.pending.store(false, Ordering::Release);
 
@@ -49,6 +50,7 @@ impl Waker {
         let _ = (&self.reader).read(&mut buf);
     }
 
+    // Checks if the waker signal was already sent and not yet read
     pub fn is_pending(&self) -> bool {
         self.pending.load(Ordering::Relaxed)
     }
@@ -101,7 +103,9 @@ impl<'a, Idx: Into<usize>, const N: usize> Pfds<'a, Idx, N> {
 
     /// Reads return events from the [`PollFd`] set
     pub(crate) fn get_revents(&self, idx: Idx) -> PollFlags {
-        self.pfds[idx.into()].revents().unwrap_or(PollFlags::empty())
+        self.pfds[idx.into()]
+            .revents()
+            .unwrap_or(PollFlags::empty())
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [PollFd<'a>] {
