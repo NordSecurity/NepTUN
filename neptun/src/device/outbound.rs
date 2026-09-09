@@ -71,7 +71,7 @@ impl Outbound {
 
             let mut pfds = new_pfds(&iface, &self.waker);
 
-            // TUN waiting loop
+            // TUN readiness loop
             loop {
                 // Park the thread while waiting for the packets to arrive
                 if self.wait_for_tun(&mut pfds)?.is_break() {
