@@ -50,6 +50,8 @@ impl Outbound {
         let mut buf = [0u8; MAX_PKT_SIZE];
 
         while !self.stop.load(Ordering::Relaxed) {
+            // TODO: refactor to snapshot as for inbound
+            // TODO: ensure every change to any of the snaphot data notifies inbound
             let (iface, mtu, fw_callback, udp4, udp6) = {
                 let d = self.device.read();
                 (
@@ -151,7 +153,7 @@ impl Outbound {
                         tun.timer_tick_data_packet_sent();
                         tun.append_tx_bytes(payload_len);
                     }
-                    send_packet(&peer, packet, udp4, udp6);
+                    self.send_packet(&peer, packet, udp4, udp6);
                 }
                 TunnResult::Err(e) => {
                     tracing::error!(message = "Encryption error",
@@ -238,47 +240,50 @@ impl Outbound {
             }
         }
     }
-}
 
-fn send_packet(
-    peer: &Arc<Peer>,
-    packet: &mut [u8],
-    udp4: &socket2::Socket,
-    udp6: &socket2::Socket,
-) {
-    let endpoint = peer.endpoint();
-    if let Some(conn) = endpoint.conn.as_ref() {
-        match conn.send(packet) {
-            Ok(_) => {
-                tracing::trace!(
-                    "Pkt -> ConnSock ({:?}), len: {}",
-                    endpoint.addr,
-                    packet.len()
-                );
+    fn send_packet(
+        &self,
+        peer: &Arc<Peer>,
+        packet: &mut [u8],
+        udp4: &socket2::Socket,
+        udp6: &socket2::Socket,
+    ) {
+        let endpoint = peer.endpoint();
+        if let Some(conn) = endpoint.conn.as_ref() {
+            match conn.send(packet) {
+                Ok(_) => {
+                    tracing::trace!(
+                        "Pkt -> ConnSock ({:?}), len: {}",
+                        endpoint.addr,
+                        packet.len()
+                    );
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
+                }
+                Err(err) => {
+                    tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
+                    drop(endpoint);
+                    if peer.shutdown_endpoint() {
+                        self.device.read().notify_inbound();
+                    }
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
+        } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
+            if let Err(err) = udp4.send_to(packet, &addr.into()) {
+                tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
+            } else {
+                tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
             }
-            Err(err) => {
-                tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                drop(endpoint);
-                peer.shutdown_endpoint();
+        } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
+            if let Err(err) = udp6.send_to(packet, &addr.into()) {
+                tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
+            } else {
+                tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
             }
-        }
-    } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-        if let Err(err) = udp4.send_to(packet, &addr.into()) {
-            tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
         } else {
-            tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
+            tracing::error!("No endpoint");
         }
-    } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-        if let Err(err) = udp6.send_to(packet, &addr.into()) {
-            tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-        } else {
-            tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, public_key = peer.public_key.1);
-        }
-    } else {
-        tracing::error!("No endpoint");
     }
 }
 

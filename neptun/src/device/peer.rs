@@ -108,26 +108,41 @@ impl Peer {
         self.endpoint.read()
     }
 
-    pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
-            tracing::info!("Disconnecting from endpoint");
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+    /// Removes the peer's connected socket.
+    /// Returns `false` if the peer didn't have a connected socket.
+    pub fn shutdown_endpoint(&self) -> bool {
+        match self.endpoint.write().conn.take() {
+            Some(conn) => {
+                tracing::info!("Disconnecting from endpoint");
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
+            None => false,
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    // TODO: fix the return type for clearer intent
+    /// Sets an endpoint on the peer.
+    /// Returns `true` if the peer had a connected socket and it was removed, `false` otherwise.
+    pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
         let mut endpoint = self.endpoint.write();
         if endpoint.addr == Some(addr) {
-            return;
+            return false;
         }
-        if let Some(conn) = endpoint.conn.take() {
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+        let had_conn = match endpoint.conn.take() {
+            Some(conn) => {
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
-        }
+            None => false,
+        };
+
         endpoint.addr = Some(addr);
+        had_conn
     }
 
     /// On Apple platforms, it is optimal to rely on the kernel autotuning of the socket size.

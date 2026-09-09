@@ -101,15 +101,19 @@ impl Inbound {
                     }
 
                     if revents.contains(PollFlags::POLLIN) {
-                        let _ = match slot {
+                        match slot {
                             Slot::Anon(sock) => {
-                                self.drain_anon(sock, &snap, &mut rcvbuf, &mut dstbuf)?
+                                if self
+                                    .drain_anon(sock, &snap, &mut rcvbuf, &mut dstbuf)?
+                                    .is_break()
+                                {
+                                    resnapshot = true;
+                                    break;
+                                }
                             }
                             Slot::Conn(peer, sock) => {
-                                // self.drain_conn(&peer, sock, &snap, &mut rcvbuf, &mut dstbuf)?
-                                return Err(Error::InternalError(
-                                    "TODO: Conn skts not yet handled".to_owned(),
-                                ));
+                                let _ =
+                                    self.drain_conn(&peer, sock, &snap, &mut rcvbuf, &mut dstbuf)?;
                             }
                         };
                     }
@@ -124,6 +128,7 @@ impl Inbound {
         Ok(())
     }
 
+    // TODO: ensure every change to any of the snaphot data notifies inbound
     fn take_snapshot(&self) -> Result<Option<Snapshot>, Error> {
         let (iface, fw_callback, key_pair, rate_limiter, udp4, udp6) = {
             let d = self.device.read();
@@ -160,6 +165,8 @@ impl Inbound {
         }))
     }
 
+    // TODO: ensure off-lock decrypt on anon skt processing
+    // TODO: refactor into dedicated methods like for outbound
     fn drain_anon(
         &self,
         sock: &Socket,
@@ -170,7 +177,7 @@ impl Inbound {
         loop {
             if self.waker.is_pending() {
                 self.waker.ack();
-                return Ok(ControlFlow::Break(()));
+                return Ok(ControlFlow::Continue(()));
             }
 
             // Safety: the `recv_from` implementation promises not to write uninitialised
@@ -308,13 +315,15 @@ impl Inbound {
                 }
             }
 
-            peer.set_endpoint(sock);
+            if peer.set_endpoint(sock) {
+                // peer has changed, must resnapshot the device
+                return Ok(ControlFlow::Break(()));
+            }
         }
 
         Ok(ControlFlow::Continue(()))
     }
 
-    /* TODO
     fn drain_conn(
         &self,
         peer: &Peer,
@@ -323,110 +332,84 @@ impl Inbound {
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
-        while !self.stop.load(Ordering::Relaxed) {
-            if bound.is_none() {
-                bound = {
-                    let d = self.device.read();
-                    d.peers.values().next().and_then(|p| {
-                        p.endpoint()
-                            .conn
-                            .as_ref()
-                            .and_then(|c| c.try_clone().ok())
-                            .map(|c| (p.clone(), c))
-                    })
-                };
+        loop {
+            // Safety: socket2 promises not to write uninitialised bytes into the buffer.
+            let recv_buf =
+                unsafe { &mut *(&mut rcvbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
-                if bound.is_none() {
-                    std::thread::sleep(Duration::from_millis(50)); // TODO: fix magic number
-                    continue;
-                }
-            }
-
-            let mut reset = false;
-
-            {
-                let Some((peer, conn)) = bound.as_ref() else {
-                    continue;
-                };
-
-                // Safety: socket2 promises not to write uninitialised bytes into the buffer.
-                let recv_buf =
-                    unsafe { &mut *(&mut rcvbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
-
-                let n = match conn.recv(recv_buf) {
-                    Ok(n) => n,
-                    Err(e) => match e.kind() {
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-                            0 // SO_RCVTIMEO fired: re-check `stop`
-                        }
-                        _ => {
-                            reset = true;
-                            0
-                        }
-                    },
-                };
-
-                if n > 0 {
-                    let datagram = &rcvbuf[..n];
-                    match Tunn::parse_incoming_packet(datagram) {
-                        Ok(Packet::PacketData(p)) => {
-                            // Off-lock decrypt, short lock just to clone the session
-                            let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
-                            if let Some(session) = session {
-                                match session.decrypt(p, dstbuf) {
-                                    Ok(plain) if !plain.is_empty() => {
-                                        if let Some(len) = Tunn::decapsulated_packet_len(plain) {
-                                            let _ = iface.as_ref().write(&plain[..len]);
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        tracing::trace!(message = "decrypt failed", error = ?e)
-                                    }
-                                }
-                            }
-                        }
-                        // Handshake / cookie
-                        Ok(_) => {
-                            let res = {
-                                let mut tun = peer.tunnel.lock();
-                                tun.decapsulate(None, datagram, dstbuf)
-                            };
-                            match res {
-                                TunnResult::WriteToNetwork(packet) => {
-                                    let _ = conn.send(packet);
-                                    // drain pre-handshake queued packets
-                                    loop {
-                                        let mut out = [0u8; MAX_PKT_SIZE];
-                                        let r = {
-                                            let mut tun = peer.tunnel.lock();
-                                            tun.decapsulate(None, &[], &mut out)
-                                        };
-                                        match r {
-                                            TunnResult::WriteToNetwork(p2) => {
-                                                let _ = conn.send(p2);
-                                            }
-                                            _ => break,
-                                        }
-                                    }
-                                }
-                                TunnResult::WriteToTunnel(packet, _addr) => {
-                                    let _ = iface.as_ref().write(packet);
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(_) => {}
+            let n = match sock.recv(recv_buf) {
+                Ok(n) => n,
+                Err(e) => match e.kind() {
+                    io::ErrorKind::WouldBlock => break,
+                    io::ErrorKind::Interrupted => continue,
+                    io::ErrorKind::ConnectionRefused => {
+                        tracing::debug!(message = "Connected socket refused", error = ?e);
+                        break;
                     }
-                }
-            }
+                    _ => {
+                        tracing::warn!(message = "Connected socket read failed", error = ?e);
+                        break;
+                    }
+                },
+            };
 
-            if reset {
-                bound = None;
+            if n > 0 {
+                let datagram = &rcvbuf[..n];
+                match Tunn::parse_incoming_packet(datagram) {
+                    Ok(Packet::PacketData(p)) => {
+                        // Off-lock decrypt, short lock just to clone the session
+                        let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
+                        if let Some(session) = session {
+                            match session.decrypt(p, dstbuf) {
+                                Ok(plain) if !plain.is_empty() => {
+                                    if let Some(len) = Tunn::decapsulated_packet_len(plain) {
+                                        let _ = snap.iface.as_ref().write(&plain[..len]);
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::trace!(message = "decrypt failed", error = ?e)
+                                }
+                            }
+                        }
+                    }
+                    // Handshake / cookie
+                    Ok(_) => {
+                        let res = {
+                            let mut tun = peer.tunnel.lock();
+                            tun.decapsulate(None, datagram, dstbuf)
+                        };
+                        match res {
+                            TunnResult::WriteToNetwork(packet) => {
+                                let _ = sock.send(packet);
+                                // drain pre-handshake queued packets
+                                loop {
+                                    let mut out = [0u8; MAX_PKT_SIZE];
+                                    let r = {
+                                        let mut tun = peer.tunnel.lock();
+                                        tun.decapsulate(None, &[], &mut out)
+                                    };
+                                    match r {
+                                        TunnResult::WriteToNetwork(p2) => {
+                                            let _ = sock.send(p2);
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            TunnResult::WriteToTunnel(packet, _addr) => {
+                                let _ = snap.iface.as_ref().write(packet);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {}
+                }
             }
         }
+
+        Ok(ControlFlow::Continue(()))
     }
-    */
 }
 
 struct Snapshot {
@@ -474,7 +457,7 @@ impl<'a> PollSet<'a> {
             pfds.push(PollFd::new(sock.as_fd(), PollFlags::POLLIN));
             slots.push(Slot::Anon(sock));
         }
-        
+
         // Push connected UDP sockets' PollFds and their corresponding conn slots
         for (peer, sock) in &snap.conns {
             pfds.push(PollFd::new(sock.as_fd(), PollFlags::POLLIN));
@@ -491,9 +474,9 @@ impl<'a> PollSet<'a> {
     // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?
     fn woken(&self) -> bool {
         self.pfds
-        .first() // pfds[0] is Waker's PollFd
-        .and_then(|pfd| pfd.revents())
-        .is_some_and(|revents| !revents.is_empty())
+            .first() // pfds[0] is Waker's PollFd
+            .and_then(|pfd| pfd.revents())
+            .is_some_and(|revents| !revents.is_empty())
     }
 
     // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?

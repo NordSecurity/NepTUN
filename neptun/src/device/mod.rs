@@ -505,6 +505,9 @@ impl Device {
             self.peers_by_ip
                 .remove(&|p: &Arc<Peer>| Arc::ptr_eq(&peer, p));
 
+            self.notify_inbound();
+            ();
+
             tracing::info!("Peer removed");
         }
     }
@@ -529,7 +532,9 @@ impl Device {
 
         if let Some(peer) = self.peers.get(&pub_key) {
             if let Some(endpoint) = endpoint {
-                peer.set_endpoint(endpoint);
+                if peer.set_endpoint(endpoint) {
+                    self.notify_inbound();
+                }
             }
 
             if replace_ips {
@@ -776,6 +781,7 @@ impl Device {
 
         self.key_pair = key_pair;
         self.rate_limiter = Some(rate_limiter);
+        self.notify_inbound();
     }
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -858,7 +864,10 @@ impl Device {
                     match res {
                         TunnResult::Done => {}
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
-                            peer.shutdown_endpoint(); // close open udp socket
+                            // close open udp socket and notify inbound
+                            if peer.shutdown_endpoint() {
+                                d.notify_inbound();
+                            }
                         }
                         TunnResult::Err(e) => tracing::error!(message = "Timer error", error = ?e),
                         TunnResult::WriteToNetwork(packet) => {
@@ -918,12 +927,19 @@ impl Device {
     }
 
     pub(crate) fn drop_connected_sockets(&self) {
+        let mut conn_skts_changed = false;
+
         for peer in self.peers.values() {
             let endpoint = peer.endpoint();
             if endpoint.conn.is_some() {
                 drop(endpoint);
-                peer.shutdown_endpoint();
+                conn_skts_changed |= peer.shutdown_endpoint();
             }
+        }
+
+        if conn_skts_changed {
+            // Inbound data plane uses connected sockets, so must be notified about the change
+            self.notify_inbound();
         }
     }
 
@@ -938,9 +954,17 @@ impl Device {
         &self.iface
     }
 
-    pub(crate) fn notify_data_plane(&self) {
-        self.out_waker.wake();
+    pub(crate) fn notify_inbound(&self) {
         self.in_waker.wake();
+    }
+
+    pub(crate) fn notify_outbound(&self) {
+        self.out_waker.wake();
+    }
+
+    pub(crate) fn notify_data_plane(&self) {
+        self.notify_inbound();
+        self.notify_outbound();
     }
 
     pub(crate) fn stop_data_plane(&self) {
