@@ -202,24 +202,28 @@ impl Tunn {
         self.handshake.is_expired()
     }
 
-    pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
+    fn address(packet: &[u8], ipv4_offset: usize, ipv6_offset: usize) -> Option<IpAddr> {
+        fn addr<const S: usize>(packet: &[u8], offset: usize) -> Option<IpAddr>
+        where
+            [u8; S]: Into<IpAddr>,
+        {
+            let addr_bytes: [u8; S] = packet.get(offset..offset + S)?.try_into().ok()?;
+            Some(addr_bytes.into())
+        }
+
         match packet.first()? >> 4 {
-            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    .get(IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
-            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    .get(IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
+            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => addr::<IPV4_IP_SZ>(packet, ipv4_offset),
+            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => addr::<IPV6_IP_SZ>(packet, ipv6_offset),
             _ => None,
         }
+    }
+
+    pub fn src_address(packet: &[u8]) -> Option<IpAddr> {
+        Self::address(packet, IPV4_SRC_IP_OFF, IPV6_SRC_IP_OFF)
+    }
+
+    pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
+        Self::address(packet, IPV4_DST_IP_OFF, IPV6_DST_IP_OFF)
     }
 
     /// Create a new tunnel using own private key and the peer public key

@@ -48,6 +48,8 @@ impl Inbound {
         }
     }
 
+    // TODO: add missing timers handling
+
     fn run_inner(&self) -> Result<(), Error> {
         let mut rcvbuf = [0u8; MAX_PKT_SIZE];
         let mut dstbuf = [0u8; MAX_PKT_SIZE];
@@ -375,14 +377,10 @@ impl Inbound {
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock => break,
                     io::ErrorKind::Interrupted => continue,
-                    io::ErrorKind::ConnectionRefused => {
-                        tracing::debug!(message = "Connected socket refused", error = ?e);
-                        peer.shutdown_endpoint();
-                        return Ok(ControlFlow::Break(()));
-                    }
                     _ => {
-                        tracing::warn!(message = "Connected socket read failed", error = ?e);
-                        break;
+                        tracing::warn!(message = "Connected socket recv failed", error = ?e);
+                        let _ = peer.shutdown_endpoint();
+                        return Ok(ControlFlow::Break(()));
                     }
                 },
             };
@@ -397,7 +395,26 @@ impl Inbound {
                             match session.decrypt(p, dstbuf) {
                                 Ok(plain) if !plain.is_empty() => {
                                     if let Some(len) = Tunn::decapsulated_packet_len(plain) {
-                                        let _ = snap.iface.as_ref().write(&plain[..len]);
+                                        let packet = &mut plain[..len];
+
+                                        if let Some(ref callback) = snap.fw_callback {
+                                            if !callback(&peer.public_key.0, packet) {
+                                                continue;
+                                            }
+                                        }
+
+                                        let Some(src_addr) = Tunn::src_address(packet) else {
+                                            continue;
+                                        };
+
+                                        if peer.is_allowed_ip(src_addr) {
+                                            _ = snap.iface.as_ref().write(packet);
+                                            tracing::trace!(
+                                                message = "Writing packet to tunnel",
+                                                packet_length = len,
+                                                src_addr = ?src_addr,
+                                            );
+                                        }
                                     }
                                 }
                                 Ok(_) => {}
@@ -418,10 +435,9 @@ impl Inbound {
                                 let _ = sock.send(packet);
                                 // drain pre-handshake queued packets
                                 loop {
-                                    let mut out = [0u8; MAX_PKT_SIZE];
                                     let r = {
                                         let mut tun = peer.tunnel.lock();
-                                        tun.decapsulate(None, &[], &mut out)
+                                        tun.decapsulate(None, &[], dstbuf)
                                     };
                                     match r {
                                         TunnResult::WriteToNetwork(p2) => {
@@ -431,14 +447,16 @@ impl Inbound {
                                     }
                                 }
                             }
-                            TunnResult::WriteToTunnel(packet, _addr) => {
-                                let _ = snap.iface.as_ref().write(packet);
+                            oth => {
+                                tracing::warn!(message = "Unexpected result from decapsulate", result = ?oth)
                             }
-                            _ => {}
                         }
                     }
                     Err(_) => {}
                 }
+            } else {
+                // Avoid spin in case of the EOF on a shutdown socket
+                return Ok(ControlFlow::Break(()));
             }
         }
 
