@@ -48,6 +48,8 @@ impl Inbound {
         }
     }
 
+    // TODO: add missing timers handling
+
     fn run_inner(&self) -> Result<(), Error> {
         let mut rcvbuf = [0u8; MAX_PKT_SIZE];
         let mut dstbuf = [0u8; MAX_PKT_SIZE];
@@ -242,6 +244,7 @@ impl Inbound {
                                 .map(|p| p.clone())
                         })
                 }
+                // TODO: three branches handled in the same way
                 Packet::HandshakeResponse(p) => {
                     let d = self.device.read();
                     d.peers_by_idx
@@ -285,22 +288,24 @@ impl Inbound {
                     }
                 }
                 TunnResult::WriteToTunnel(packet, addr) => {
+                    if !peer.is_allowed_ip(addr) {
+                        continue;
+                    }
+
                     if let Some(ref callback) = snap.fw_callback {
                         if !callback(&peer.public_key.0, packet) {
                             continue;
                         }
                     }
 
-                    if peer.is_allowed_ip(addr) {
-                        _ = snap.iface.as_ref().write(packet);
-                        tracing::trace!(
-                            message = "Writing packet to tunnel",
-                            interface = ?snap.iface.name(),
-                            packet_length = packet.len(),
-                            src_addr = ?addr,
-                            public_key = peer.public_key.1
-                        );
-                    }
+                    _ = snap.iface.as_ref().write(packet);
+                    tracing::trace!(
+                        message = "Writing packet to tunnel",
+                        interface = ?snap.iface.name(),
+                        packet_length = packet.len(),
+                        src_addr = ?addr,
+                        public_key = peer.public_key.1
+                    );
                 }
             };
 
@@ -375,14 +380,10 @@ impl Inbound {
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock => break,
                     io::ErrorKind::Interrupted => continue,
-                    io::ErrorKind::ConnectionRefused => {
-                        tracing::debug!(message = "Connected socket refused", error = ?e);
-                        peer.shutdown_endpoint();
-                        return Ok(ControlFlow::Break(()));
-                    }
                     _ => {
-                        tracing::warn!(message = "Connected socket read failed", error = ?e);
-                        break;
+                        tracing::warn!(message = "Connected socket recv failed", error = ?e);
+                        let _ = peer.shutdown_endpoint();
+                        return Ok(ControlFlow::Break(()));
                     }
                 },
             };
@@ -392,15 +393,51 @@ impl Inbound {
                 match Tunn::parse_incoming_packet(datagram) {
                     Ok(Packet::PacketData(p)) => {
                         // Off-lock decrypt, short lock just to clone the session
-                        let session = peer.tunnel.lock().session_for_index(p.receiver_idx);
+                        let receiver_idx = p.receiver_idx;
+                        let session = peer.tunnel.lock().session_for_index(receiver_idx);
                         if let Some(session) = session {
                             match session.decrypt(p, dstbuf) {
-                                Ok(plain) if !plain.is_empty() => {
-                                    if let Some(len) = Tunn::decapsulated_packet_len(plain) {
-                                        let _ = snap.iface.as_ref().write(&plain[..len]);
+                                Ok(plain_text) if !plain_text.is_empty() => {
+                                    if let Some(len) = Tunn::decapsulated_packet_len(plain_text) {
+                                        // Advance timers and append rx_bytes
+                                        // TODO: consider restructuring these calls
+                                        {
+                                            let mut tun = peer.tunnel.lock();
+                                            tun.timer_tick_data_packet_received(receiver_idx);
+                                            tun.append_rx_bytes(len);
+                                        }
+
+                                        let packet = &mut plain_text[..len];
+
+                                        let Some(src_addr) = Tunn::src_address(packet) else {
+                                            continue;
+                                        };
+
+                                        if !peer.is_allowed_ip(src_addr) {
+                                            continue;
+                                        }
+
+                                        if let Some(ref callback) = snap.fw_callback {
+                                            if !callback(&peer.public_key.0, packet) {
+                                                continue;
+                                            }
+                                        }
+
+                                        _ = snap.iface.as_ref().write(packet);
+                                        tracing::trace!(
+                                            message = "Writing packet to tunnel",
+                                            packet_length = len,
+                                            src_addr = ?src_addr,
+                                        );
                                     }
                                 }
-                                Ok(_) => {}
+                                Ok(_) => {
+                                    // keepalive packet received
+                                    // TODO: consider restructuring these calls
+                                    let mut tun = peer.tunnel.lock();
+                                    tun.timer_tick_keepalive_packet_received(receiver_idx);
+                                    tun.append_rx_bytes(0);
+                                }
                                 Err(e) => {
                                     tracing::trace!(message = "decrypt failed", error = ?e)
                                 }
@@ -418,10 +455,9 @@ impl Inbound {
                                 let _ = sock.send(packet);
                                 // drain pre-handshake queued packets
                                 loop {
-                                    let mut out = [0u8; MAX_PKT_SIZE];
                                     let r = {
                                         let mut tun = peer.tunnel.lock();
-                                        tun.decapsulate(None, &[], &mut out)
+                                        tun.decapsulate(None, &[], dstbuf)
                                     };
                                     match r {
                                         TunnResult::WriteToNetwork(p2) => {
@@ -431,14 +467,16 @@ impl Inbound {
                                     }
                                 }
                             }
-                            TunnResult::WriteToTunnel(packet, _addr) => {
-                                let _ = snap.iface.as_ref().write(packet);
+                            oth => {
+                                tracing::warn!(message = "Unexpected result from decapsulate", result = ?oth)
                             }
-                            _ => {}
                         }
                     }
                     Err(_) => {}
                 }
+            } else {
+                // Avoid spin in case of the EOF on a shutdown socket
+                return Ok(ControlFlow::Break(()));
             }
         }
 

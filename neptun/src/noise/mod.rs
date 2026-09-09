@@ -202,24 +202,28 @@ impl Tunn {
         self.handshake.is_expired()
     }
 
-    pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
+    fn address(packet: &[u8], ipv4_offset: usize, ipv6_offset: usize) -> Option<IpAddr> {
+        fn addr<const S: usize>(packet: &[u8], offset: usize) -> Option<IpAddr>
+        where
+            [u8; S]: Into<IpAddr>,
+        {
+            let addr_bytes: [u8; S] = packet.get(offset..offset + S)?.try_into().ok()?;
+            Some(addr_bytes.into())
+        }
+
         match packet.first()? >> 4 {
-            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    .get(IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
-            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    .get(IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
+            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => addr::<IPV4_IP_SZ>(packet, ipv4_offset),
+            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => addr::<IPV6_IP_SZ>(packet, ipv6_offset),
             _ => None,
         }
+    }
+
+    pub fn src_address(packet: &[u8]) -> Option<IpAddr> {
+        Self::address(packet, IPV4_SRC_IP_OFF, IPV6_SRC_IP_OFF)
+    }
+
+    pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
+        Self::address(packet, IPV4_DST_IP_OFF, IPV6_DST_IP_OFF)
     }
 
     /// Create a new tunnel using own private key and the peer public key
@@ -352,14 +356,28 @@ impl Tunn {
         self.sessions[receiver_idx as usize % N_SESSIONS].clone()
     }
 
-    /// Advance timers related to sending a data packet
     pub fn timer_tick_data_packet_sent(&mut self) {
         self.timer_tick(TimerName::TimeLastPacketSent);
         self.timer_tick(TimerName::TimeLastDataPacketSent);
     }
 
+    pub fn timer_tick_keepalive_packet_received(&mut self, receiver_idx: u32) {
+        self.set_current_session(receiver_idx as usize);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+    }
+
+    pub fn timer_tick_data_packet_received(&mut self, receiver_idx: u32) {
+        self.set_current_session(receiver_idx as usize);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeLastDataPacketReceived);
+    }
+
     pub fn append_tx_bytes(&mut self, packet_len: usize) {
         self.tx_bytes += packet_len as u64;
+    }
+
+    pub fn append_rx_bytes(&mut self, plain_text_len: usize) {
+        self.rx_bytes += message_data_len(plain_text_len) as u64;
     }
 
     /// Receives a UDP datagram from the network and parses it.
