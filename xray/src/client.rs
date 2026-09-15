@@ -184,11 +184,12 @@ impl Client {
                     self.sock.send_to(p, from).await?;
                     bytes_read = 0;
                 }
-                TunnResult::WriteToTunnel(p, _) => {
-                    let (_, payload_start, payload_end) = Self::parse_udp_packet(p)?;
+                TunnResult::WriteToTunnel(p) => {
+                    let payload = p.payload();
+                    let (_, payload_start, payload_end) = Self::parse_udp_packet(payload)?;
                     assert!(buf.len() >= payload_end - payload_start);
                     buf[0..payload_end - payload_start]
-                        .copy_from_slice(&p[payload_start..payload_end]);
+                        .copy_from_slice(&payload[payload_start..payload_end]);
                     ret = RecvType::Data {
                         length: payload_end - payload_start,
                     };
