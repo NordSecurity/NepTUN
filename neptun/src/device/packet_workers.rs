@@ -8,8 +8,6 @@
 //!
 //! Apple targets process packets inline and do not use this module at all.
 
-use std::io::Write;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::thread;
 
@@ -22,7 +20,9 @@ use super::{
 use crate::device::allowed_ips::AllowedIps;
 use crate::device::peer::Peer;
 use crate::device::peer_span;
+use crate::device::routing::RoutableIp;
 use crate::device::tun::TunSocket;
+use crate::noise::packet::DetachedIp;
 
 const CHANNEL_SIZE: usize = 500;
 const MAX_INTERTHREAD_BATCHED_PKTS: usize = 50;
@@ -49,10 +49,9 @@ struct NetworkTaskData {
 
 pub(super) struct TunnelWorkerData {
     pub buffer: [u8; MAX_PKT_SIZE],
+    pub packet: DetachedIp,
     pub peer: Arc<Peer>,
     pub iface: Arc<TunSocket>,
-    pub addr: IpAddr,
-    pub buf_len: usize,
 }
 
 enum BatchResult {
@@ -254,29 +253,45 @@ fn write_to_tun_worker(
         crossbeam_channel::select! {
             recv(socket_to_tunnel_rx) -> batched_pkts => {
                 if let Ok(batched_pkts) = batched_pkts {
-                    for mut t in batched_pkts {
-                        let peer = t.peer;
+                    for t in batched_pkts {
+                        let TunnelWorkerData {
+                            mut buffer,
+                            packet,
+                            peer,
+                            iface,
+                        } = t;
+
                         let _span = peer_span(peer.public_key);
 
-                        let buffer = match t.buffer.get_mut(..t.buf_len) {
-                            Some(b) => b,
-                            None => {
+                        let mut packet = match packet.reattach(&mut buffer) {
+                            Ok(p) => p,
+                            Err(_) => {
                                 tracing::warn!("Length is greater than buffer space");
                                 continue
                             },
                         };
+
                         if let Some(callback) = &firewall_process_inbound_callback {
-                            if !callback(peer.public_key.as_bytes(), buffer) {
+                            if !callback(peer.public_key.as_bytes(), packet.payload_mut()) {
                                 continue;
                             }
                         }
-                        if peer.is_allowed_ip(t.addr) {
-                            _ = t.iface.as_ref().write(buffer);
-                            tracing::trace!(
-                                message = "Writing packet to tunnel",
-                                packet_length = t.buf_len,
-                                src_addr = ?t.addr,
-                            );
+
+                        match RoutableIp::check(packet, &peer) {
+                            Ok(packet) => {
+                                _ = packet.write_to(iface.as_ref());
+                                tracing::trace!(
+                                    message = "Writing packet to tunnel",
+                                    packet_length = packet.len(),
+                                    src_addr = ?packet.src_addr(),
+                                );
+                            }
+                            Err(packet) => {
+                                tracing::debug!(
+                                    message = "Dropping packet from outside of allowed IPs",
+                                    src_addr = ?packet.src_addr(),
+                                );
+                            }
                         }
                     }
                 }

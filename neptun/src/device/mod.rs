@@ -7,6 +7,7 @@ pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
 pub mod peer;
+pub mod routing;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
@@ -27,6 +28,7 @@ pub mod tun;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 mod packet_workers;
 
+use crate::device::routing::RoutableIp;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -40,7 +42,7 @@ use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter};
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::mem::swap;
 use std::mem::MaybeUninit;
@@ -1121,21 +1123,29 @@ impl Device {
                                 tracing::warn!(message = "Failed to send packet", error = ?err, dst = ?addr);
                             }
                         }
-                        TunnResult::WriteToTunnel(packet, addr) => {
+                        TunnResult::WriteToTunnel(mut packet) => {
                             if let Some(callback) = &d.config.firewall_process_inbound_callback {
-                                if !callback(peer.public_key.as_bytes(), packet) {
+                                if !callback(peer.public_key.as_bytes(), packet.payload_mut()) {
                                     continue;
                                 }
                             }
 
-                            if peer.is_allowed_ip(addr) {
-                                _ = t.iface.as_ref().write(packet);
-                                tracing::trace!(
-                                    message = "Writing packet to tunnel",
-                                    interface = ?t.iface.name(),
-                                    packet_length = packet.len(),
-                                    src_addr = ?addr
-                                );
+                            match RoutableIp::check(packet, peer) {
+                                Ok(packet) => {
+                                    _ = packet.write_to(t.iface.as_ref());
+                                    tracing::trace!(
+                                        message = "Writing packet to tunnel",
+                                        interface = ?t.iface.name(),
+                                        packet_length = packet.len(),
+                                        src_addr = ?packet.src_addr(),
+                                    );
+                                }
+                                Err(packet) => {
+                                    tracing::debug!(
+                                        message = "Dropping packet from outside of allowed IPs",
+                                        src_addr = ?packet.src_addr(),
+                                    );
+                                }
                             }
                         }
                     };
@@ -1246,10 +1256,9 @@ impl Device {
                                         tracing::warn!(message="Failed to write packet", error = ?err);
                                     }
                                 }
-                                TunnResult::WriteToTunnel(packet, addr) => {
+                                TunnResult::WriteToTunnel(packet) => {
                                     let worker_data = TunnelWorkerData {
-                                        buf_len: packet.len(),
-                                        addr,
+                                        packet: packet.detach(),
                                         buffer,
                                         iface: t.iface.clone(),
                                         peer: peer.clone(),
