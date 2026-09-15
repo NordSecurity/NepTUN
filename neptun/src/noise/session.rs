@@ -4,6 +4,7 @@
 
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
+use crate::noise::packet::Plaintext;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -266,7 +267,7 @@ impl Session {
         &self,
         packet: PacketData,
         dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
+    ) -> Result<Plaintext<'a>, WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
@@ -298,7 +299,7 @@ impl Session {
 
         // After decryption is done, check counter again, and mark as received
         self.receiving_counter_mark(packet.counter)?;
-        Ok(ret)
+        Ok(Plaintext::new(ret))
     }
 
     /// Returns the estimated downstream packet loss for this session
@@ -317,7 +318,7 @@ impl Session {
         &self,
         packet: PacketData,
         dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
+    ) -> Result<Plaintext<'a>, WireGuardError> {
         let ct_len = packet.encrypted_encapsulated_packet.len();
         if dst.len() < ct_len {
             // This is a very incorrect use of the library, therefore panic and not error
@@ -349,7 +350,7 @@ impl Session {
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
         };
 
-        Ok(ret)
+        Ok(Plaintext::new(ret))
     }
 }
 
