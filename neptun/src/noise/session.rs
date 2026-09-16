@@ -203,7 +203,7 @@ impl Session {
     /// payload_len - length of data available in packet_buffer
     /// packet_buffer - pre-allocated space containing the payload, to be replaced by encrypted UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(
+    pub(crate) fn format_packet_data<'a>(
         &self,
         payload_len: usize,
         packet_buffer: &'a mut [u8],
@@ -263,7 +263,7 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
-    pub(super) fn receive_packet_data<'a>(
+    pub(crate) fn receive_packet_data<'a>(
         &self,
         packet: PacketData,
         dst: &'a mut [u8],

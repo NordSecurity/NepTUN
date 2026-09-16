@@ -9,14 +9,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, S
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crate::device::modify_skt_buffer_size;
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 use crate::serialization::PubKey;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::AsFd;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::device::modify_skt_buffer_size;
+
 use std::os::fd::AsRawFd;
 
 #[derive(Default, Debug)]
