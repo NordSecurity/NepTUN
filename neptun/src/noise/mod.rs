@@ -8,7 +8,7 @@ pub mod packet;
 pub mod rate_limiter;
 pub mod safe_duration;
 
-mod session;
+pub(crate) mod session;
 mod timers;
 
 use session::DATA_OFFSET;
@@ -23,6 +23,7 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
+use std::mem::ManuallyDrop;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,12 +49,48 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum TxIntent {
+    Ready(Arc<session::Session>),
+    RequiresHandshake,
+}
+
+#[must_use = "timers and byte counters must be updated after a packet is encapsulated"]
+#[derive(Debug)]
+pub(crate) struct TxCommit {
+    wire_len: usize,
+    was_data: bool,
+}
+
+impl TxCommit {
+    #[inline]
+    pub(crate) fn for_packet(wire_len: usize, payload_len: usize) -> Self {
+        Self {
+            wire_len,
+            was_data: payload_len != 0,
+        }
+    }
+}
+
+#[must_use = "timers and byte counters must be updated after a packet is decrypted"]
+#[derive(Debug)]
+pub(crate) struct RxCommit {
+    session_idx: usize,
+}
+
+impl RxCommit {
+    #[inline]
+    pub(crate) fn discard(self) {
+        drop(self);
+    }
+}
+
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     /// The handshake currently in progress
     handshake: handshake::Handshake,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
-    sessions: [Option<session::Session>; N_SESSIONS],
+    sessions: [Option<Arc<session::Session>>; N_SESSIONS],
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
@@ -75,7 +112,7 @@ const DATA: MessageType = 4;
 
 pub const HANDSHAKE_INIT_SZ: u64 = 148;
 pub const HANDSHAKE_RESP_SZ: u64 = 92;
-const COOKIE_REPLY_SZ: u64 = 64;
+pub const COOKIE_REPLY_SZ: u64 = 64;
 const DATA_OVERHEAD_SZ: u64 = 32;
 
 #[derive(Debug)]
@@ -231,6 +268,72 @@ impl Tunn {
         Ok(tunn)
     }
 
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn begin_tx(&self) -> TxIntent {
+        match self.sessions[self.current % N_SESSIONS].as_ref() {
+            Some(session) => TxIntent::Ready(Arc::clone(session)),
+            None => TxIntent::RequiresHandshake,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn commit_tx(&mut self, commit: TxCommit) {
+        let TxCommit { wire_len, was_data } = *ManuallyDrop::new(commit);
+
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        if was_data {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+        self.tx_bytes += wire_len as u64;
+    }
+
+    /// The no-session path
+    pub(crate) fn queue_and_init<'a>(
+        &mut self,
+        src_len: usize,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        if src_len.ne(&0) {
+            if let Some(packet) = dst.get(DATA_OFFSET..src_len + DATA_OFFSET) {
+                self.queue_packet(packet);
+            } else {
+                return TunnResult::Err(WireGuardError::InvalidLength);
+            }
+        }
+
+        self.format_handshake_initiation(dst, false)
+    }
+
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn begin_rx_data(
+        &self,
+        packet: &PacketData<'_>,
+    ) -> Option<(Arc<session::Session>, RxCommit)> {
+        let session_idx = packet.receiver_idx as usize;
+        let session = self.sessions[session_idx % N_SESSIONS].as_ref()?;
+        Some((Arc::clone(session), RxCommit { session_idx }))
+    }
+
+    #[inline]
+    pub(crate) fn commit_rx(&mut self, commit: RxCommit, decapsulated: &Decapsulated<'_>) {
+        let RxCommit { session_idx } = *ManuallyDrop::new(commit);
+
+        self.set_current_session(session_idx);
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        match decapsulated {
+            Decapsulated::Keepalive => {
+                self.rx_bytes += message_data_len(0) as u64;
+            }
+            Decapsulated::Ip(packet) => {
+                self.timer_tick(TimerName::TimeLastDataPacketReceived);
+                self.rx_bytes += message_data_len(packet.len()) as u64;
+            }
+        }
+    }
+
     /// Update the private key and clear existing sessions
     pub fn set_static_private(
         &mut self,
@@ -277,36 +380,18 @@ impl Tunn {
         src_len: usize,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        let current = self.current;
-        #[allow(clippy::indexing_slicing)]
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
-            // Send the packet using an established session
-            let packet = match session.format_packet_data(src_len, dst) {
-                Ok(packet) => packet,
-                Err(e) => return TunnResult::Err(e),
-            };
-            self.timer_tick(TimerName::TimeLastPacketSent);
-            // Exclude Keepalive packets from timer update.
-            if src_len.ne(&0) {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
-            }
-            self.tx_bytes += packet.len() as u64;
-            return TunnResult::WriteToNetwork(packet);
-        }
+        let session = match self.begin_tx() {
+            TxIntent::Ready(session) => session,
+            TxIntent::RequiresHandshake => return self.queue_and_init(src_len, dst),
+        };
 
-        if src_len.ne(&0) {
-            // If there is no session, queue the packet for future retry,
-            // except if it's keepalive packet, new keepalive packets will be sent when session is created.
-            // This prevents double keepalive packets on initiation
-            if let Some(d) = dst.get(DATA_OFFSET..src_len + DATA_OFFSET) {
-                self.queue_packet(d);
-            } else {
-                return TunnResult::Err(WireGuardError::InvalidLength);
-            }
-        }
+        let packet = match session.format_packet_data(src_len, dst) {
+            Ok(packet) => packet,
+            Err(e) => return TunnResult::Err(e),
+        };
 
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        self.commit_tx(TxCommit::for_packet(packet.len(), src_len));
+        TunnResult::WriteToNetwork(packet)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -421,7 +506,7 @@ impl Tunn {
         let index = session.local_index();
         #[allow(clippy::indexing_slicing)]
         {
-            self.sessions[index % N_SESSIONS] = Some(session);
+            self.sessions[index % N_SESSIONS] = Some(Arc::new(session));
         }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
@@ -458,7 +543,7 @@ impl Tunn {
         #[allow(clippy::indexing_slicing)]
         let index = {
             let idx = l_idx % N_SESSIONS;
-            self.sessions[idx] = Some(session);
+            self.sessions[idx] = Some(Arc::new(session));
             idx
         };
 
@@ -519,24 +604,29 @@ impl Tunn {
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
-        let idx = r_idx % N_SESSIONS;
 
-        // Get the (probably) right session
-        #[allow(clippy::indexing_slicing)]
-        let plain_text_packet = {
-            let session = self.sessions[idx].as_ref();
-            let session = session.ok_or_else(|| {
-                tracing::trace!(message = "No current session available", remote_idx = r_idx);
-                WireGuardError::NoCurrentSession
-            })?;
-            session.receive_packet_data(packet, dst)?
+        let (session, commit) = self.begin_rx_data(&packet).ok_or_else(|| {
+            tracing::trace!(message = "No current session available", remote_idx = r_idx);
+            WireGuardError::NoCurrentSession
+        })?;
+
+        let plain_text_packet = match session.receive_packet_data(packet, dst) {
+            Ok(packet) => packet,
+            Err(e) => {
+                commit.discard();
+                return Err(e);
+            }
         };
 
-        self.set_current_session(r_idx);
-        self.timer_tick(TimerName::TimeLastPacketReceived);
+        let decapsulated = match packet::parse_inbound_ip(plain_text_packet) {
+            Ok(decapsulated) => decapsulated,
+            Err(e) => {
+                commit.discard();
+                return Err(e);
+            }
+        };
 
-        let decapsulated = packet::parse_inbound_ip(plain_text_packet)?;
-        self.commit_rx(&decapsulated);
+        self.commit_rx(commit, &decapsulated);
 
         Ok(match decapsulated {
             Decapsulated::Keepalive => TunnResult::Done,
@@ -577,19 +667,6 @@ impl Tunn {
         }
     }
 
-    #[inline]
-    fn commit_rx(&mut self, decapsulated: &Decapsulated<'_>) {
-        match decapsulated {
-            Decapsulated::Keepalive => {
-                self.rx_bytes += message_data_len(0) as u64;
-            }
-            Decapsulated::Ip(packet) => {
-                self.timer_tick(TimerName::TimeLastDataPacketReceived);
-                self.rx_bytes += message_data_len(packet.len()) as u64;
-            }
-        }
-    }
-
     /// Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
         if let Some(packet) = self.dequeue_packet() {
@@ -613,14 +690,14 @@ impl Tunn {
     }
 
     /// Push packet to the front of the queue
-    fn requeue_packet(&mut self, packet: Vec<u8>) {
+    pub(crate) fn requeue_packet(&mut self, packet: Vec<u8>) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
             self.packet_queue.push_front(packet);
         }
     }
 
-    fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
+    pub(crate) fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
         self.packet_queue.pop_front()
     }
 
