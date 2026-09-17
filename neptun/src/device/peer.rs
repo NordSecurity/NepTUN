@@ -13,7 +13,6 @@ use std::sync::Arc;
 use crate::device::modify_skt_buffer_size;
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
-use crate::serialization::PubKey;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::AsFd;
@@ -28,9 +27,8 @@ pub struct Endpoint {
 pub struct Peer {
     /// The associated tunnel struct
     pub(crate) tunnel: Mutex<Tunn>,
-    /// Public key of this peer. Masked when logged; use `as_bytes()` for the
-    /// raw key material.
-    pub(crate) public_key: PubKey,
+    /// Public key of this peer in raw bytes and hex formats
+    pub(crate) public_key: ([u8; 32], String),
     /// The index the tunnel uses
     index: u32,
     endpoint: RwLock<Endpoint>,
@@ -74,10 +72,15 @@ impl Peer {
         protect: Arc<dyn MakeExternalNeptun>,
     ) -> Peer {
         let pub_key = tunnel.peer_static_public();
+        let mut public_key_hex = String::with_capacity(32);
+        for byte in pub_key.as_bytes() {
+            let pub_symbol = format!("{:02X}", byte);
+            public_key_hex.push_str(&pub_symbol);
+        }
 
         Peer {
             tunnel: Mutex::new(tunnel),
-            public_key: PubKey::from(pub_key),
+            public_key: (pub_key.to_bytes(), public_key_hex),
             index,
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
