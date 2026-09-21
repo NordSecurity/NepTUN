@@ -23,7 +23,6 @@ use crate::x25519;
 
 use std::collections::VecDeque;
 use std::convert::TryInto;
-use std::mem::ManuallyDrop;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,7 +111,7 @@ const DATA: MessageType = 4;
 
 pub const HANDSHAKE_INIT_SZ: u64 = 148;
 pub const HANDSHAKE_RESP_SZ: u64 = 92;
-pub const COOKIE_REPLY_SZ: u64 = 64;
+const COOKIE_REPLY_SZ: u64 = 64;
 const DATA_OVERHEAD_SZ: u64 = 32;
 
 #[derive(Debug)]
@@ -279,7 +278,7 @@ impl Tunn {
 
     #[inline]
     pub(crate) fn commit_tx(&mut self, commit: TxCommit) {
-        let TxCommit { wire_len, was_data } = *ManuallyDrop::new(commit);
+        let TxCommit { wire_len, was_data } = commit;
 
         self.timer_tick(TimerName::TimeLastPacketSent);
         if was_data {
@@ -318,7 +317,7 @@ impl Tunn {
 
     #[inline]
     pub(crate) fn commit_rx(&mut self, commit: RxCommit, decapsulated: &Decapsulated<'_>) {
-        let RxCommit { session_idx } = *ManuallyDrop::new(commit);
+        let RxCommit { session_idx } = commit;
 
         self.set_current_session(session_idx);
         self.timer_tick(TimerName::TimeLastPacketReceived);

@@ -85,14 +85,6 @@ impl<'a> InboundIp<'a> {
     pub fn is_empty(&self) -> bool {
         self.payload.is_empty()
     }
-
-    #[inline(always)]
-    pub fn detach(self) -> DetachedIp {
-        DetachedIp {
-            len: self.payload.len(),
-            src_addr: self.src_addr,
-        }
-    }
 }
 
 // Parsed inbound IP packet
@@ -100,42 +92,6 @@ impl<'a> InboundIp<'a> {
 pub enum Decapsulated<'a> {
     Keepalive,
     Ip(InboundIp<'a>),
-}
-
-/// An [`InboundIp`] with its buffer removed, so that it can be stored in an owning struct
-/// alongside the buffer and sent to another thread.
-#[must_use = "a detached packet is dropped without ever reaching the interface"]
-#[derive(Debug)]
-pub struct DetachedIp {
-    len: usize,
-    src_addr: IpAddr,
-}
-
-impl DetachedIp {
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline(always)]
-    pub fn src_addr(&self) -> IpAddr {
-        self.src_addr
-    }
-
-    pub fn reattach(self, buf: &mut [u8]) -> Result<InboundIp<'_>, WireGuardError> {
-        let payload = buf
-            .get_mut(..self.len)
-            .ok_or(WireGuardError::InvalidPacket)?;
-        Ok(InboundIp {
-            payload,
-            src_addr: self.src_addr,
-        })
-    }
 }
 
 // TODO: fn name doesn't suggest in any way it can return WireGuardError - consider fixing this

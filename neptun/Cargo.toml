@@ -49,6 +49,7 @@ dispatch2 = "0.3"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = [
     "ioctl",
+    "poll",
     "time",
     "user",
     "socket",
