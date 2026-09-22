@@ -118,10 +118,19 @@ impl Peer {
     ///
     /// Returns `true` if the peer had a connected socket and it was removed, `false` otherwise.
     pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
+        // this is called per packet on the anonymous inbound path but the endpoint changes are rare;
+        // avoid the unnecessary write lock, which contends with the outbound thread's endpoint reads
+        if self.endpoint.read().addr == Some(addr) {
+            return false;
+        }
+
         let mut endpoint = self.endpoint.write();
+
+        // re-check - read guard was released above
         if endpoint.addr == Some(addr) {
             return false;
         }
+
         let had_conn = match endpoint.conn.take() {
             Some(conn) => {
                 if let Err(e) = conn.shutdown(Shutdown::Both) {

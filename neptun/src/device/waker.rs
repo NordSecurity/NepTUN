@@ -18,6 +18,11 @@ pub struct Waker {
     pending: AtomicBool,
 }
 
+pub(crate) enum Resume {
+    Now,
+    OnWake,
+}
+
 impl Waker {
     pub fn new() -> Result<Self, Error> {
         let (reader, writer) = io::pipe()?;

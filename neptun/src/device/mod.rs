@@ -525,8 +525,6 @@ impl Device {
             self.peers_by_ip
                 .remove(&|p: &Arc<Peer>| Arc::ptr_eq(&peer, p));
 
-            self.notify_inbound();
-
             tracing::info!("Peer removed");
         }
     }
@@ -551,9 +549,7 @@ impl Device {
 
         if let Some(peer) = self.peers.get(&pub_key) {
             if let Some(endpoint) = endpoint {
-                if peer.set_endpoint(endpoint) {
-                    self.notify_inbound();
-                }
+                peer.set_endpoint(endpoint);
             }
 
             if replace_ips {
@@ -762,8 +758,6 @@ impl Device {
 
         self.listen_port = port;
 
-        self.notify_data_plane();
-
         Ok(())
     }
 
@@ -823,7 +817,6 @@ impl Device {
 
         self.key_pair = key_pair;
         self.rate_limiter = Some(rate_limiter);
-        self.notify_inbound();
     }
 
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -857,8 +850,6 @@ impl Device {
         self.peers.clear();
         self.peers_by_idx.clear();
         self.peers_by_ip.clear();
-
-        self.notify_inbound();
     }
 
     fn register_notifiers(&mut self) -> Result<(), Error> {
@@ -947,6 +938,10 @@ impl Device {
             Some(notice) => self.queue.trigger_notification(notice),
             None => tracing::error!("Notification requested while there is no notice"),
         }
+
+        // Data plane threads run under device read lock guard, so they must be woken
+        // to drop the guard before try_writeable can take the write lock
+        self.notify_data_plane();
     }
 
     pub(crate) fn trigger_exit(&self) {
@@ -1297,7 +1292,7 @@ mod tests {
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     fn changing_listen_port_releases_the_old_port() {
-        let (mut device, _far) = mock_device(1);
+        let (mut device, _far) = mock_device();
 
         device.open_listen_socket(0).unwrap();
         let old_port = device.listen_port;

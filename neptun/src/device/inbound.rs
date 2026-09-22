@@ -21,8 +21,7 @@ use crate::{
         outbound,
         peer::Peer,
         routing::RoutableIp,
-        tun::TunSocket,
-        waker::{poll_retry, Waker},
+        waker::{poll_retry, Resume, Waker},
         Device, DeviceHandle, Error, MAX_PKT_SIZE,
     },
     noise::{
@@ -139,145 +138,172 @@ impl Inbound {
     }
 
     pub fn run(&self) {
-        if let Err(e) = self.run_inner() {
+        if let Err(e) = self.run_thread_main_loop() {
             tracing::error!(message = "Critical inbound thread failure, closing device", error = ?e);
             let mut d = self.device.read();
             DeviceHandle::close_device(&mut d);
         }
     }
 
-    // TODO: add missing timers handling
-
-    fn run_inner(&self) -> Result<(), Error> {
+    fn run_thread_main_loop(&self) -> Result<(), Error> {
         let mut rcvbuf = [0u8; MAX_PKT_SIZE];
         let mut dstbuf = [0u8; MAX_PKT_SIZE];
 
         while !self.stop.load(Ordering::Relaxed) {
-            let Some(snap) = self.take_snapshot()? else {
-                continue;
-            };
-
-            let mut poll_set = PollSet::new(&snap, &self.waker);
-
-            // Sockets readiness loop
-            loop {
-                poll_retry(poll_set.as_mut_slice())?;
-
-                if poll_set.woken() {
-                    self.waker.ack();
-                    break;
-                }
-
-                let mut resnapshot = false;
-
-                for (slot, revents) in poll_set.ready() {
-                    if revents.contains(PollFlags::POLLNVAL) {
-                        return Err(Error::InternalError(format!(
-                            "Polled an invalid fd on {}",
-                            slot.kind()
-                        )));
-                    }
-
-                    if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-                        match slot {
-                            Slot::Conn(conn) => {
-                                tracing::debug!(message = "Connected socket failed", revents = ?revents);
-                                let _ = conn.peer.shutdown_endpoint();
-                                resnapshot = true;
-                            }
-                            Slot::Anon(_) => {
-                                tracing::warn!(message = "UDP socket invalidated", revents = ?revents);
-                                resnapshot = true;
-                            }
-                        }
-                        continue;
-                    }
-
-                    if revents.contains(PollFlags::POLLIN) {
-                        let result = match slot {
-                            Slot::Anon(sock) => {
-                                self.drain_anon(sock, &snap, &mut rcvbuf, &mut dstbuf)?
-                            }
-                            Slot::Conn(conn) => {
-                                self.drain_conn(conn, &snap, &mut rcvbuf, &mut dstbuf)?
-                            }
-                        };
-
-                        if result.is_break() {
-                            resnapshot = true;
-                            break;
-                        }
-                    }
-                }
-
-                if resnapshot {
-                    break;
-                }
+            if let Resume::OnWake = self.run_inner_loop(&mut rcvbuf, &mut dstbuf)? {
+                self.waker.wait()?;
             }
         }
 
         Ok(())
     }
 
-    // TODO: ensure every change to any of the snaphot data notifies inbound
-    // how to bake this invariant in a safe way as prior lifetime read lock guaranteed?
-    fn take_snapshot(&self) -> Result<Option<Snapshot>, Error> {
-        let (iface, fw_callback, key_pair, rate_limiter, udp4, udp6, conns) = {
-            let d = self.device.read();
+    fn run_inner_loop(
+        &self,
+        rcvbuf: &mut [u8; MAX_PKT_SIZE],
+        dstbuf: &mut [u8; MAX_PKT_SIZE],
+    ) -> Result<Resume, Error> {
+        let device = self.device.read();
 
-            let conns = d
-                .peers
-                .values()
-                .filter_map(|peer| {
-                    let endpoint = peer.endpoint();
-                    let sock = endpoint.conn.as_ref()?.try_clone().ok()?;
-                    Some(Conn {
-                        peer: Arc::clone(peer),
-                        sock,
-                        peer_ip: endpoint.addr.map(|a| a.ip()),
-                    })
+        let view = match InboundView::new(&device, &self.waker) {
+            Ok(v) => v,
+            Err(e) => {
+                match e {
+                    ViewFailed::NotConnected => {
+                        tracing::debug!(message = "Not connected, parked until sockets are opened.")
+                    }
+                    ViewFailed::EmptyKeyPair => tracing::trace!(message = "Empty key pair"),
+                }
+                return Ok(Resume::OnWake);
+            }
+        };
+
+        let mut poll_set = PollSet::new(&view);
+
+        // Sockets readiness loop
+        loop {
+            poll_retry(poll_set.as_mut_slice())?;
+
+            if poll_set.woken() {
+                self.waker.ack();
+                return Ok(Resume::Now);
+            }
+
+            let mut invalidated = false;
+
+            for (slot, revents) in poll_set.ready() {
+                if revents.contains(PollFlags::POLLNVAL) {
+                    return Err(Error::InternalError(format!(
+                        "Polled an invalid fd on {}",
+                        slot.kind()
+                    )));
+                }
+
+                if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                    match slot {
+                        Slot::Conn(conn) => {
+                            tracing::debug!(message = "Connected socket failed", revents = ?revents);
+                            let _ = conn.peer.shutdown_endpoint();
+                            invalidated = true;
+                        }
+                        Slot::Anon(_) => {
+                            tracing::warn!(message = "UDP socket invalidated", revents = ?revents);
+                            invalidated = true;
+                        }
+                    }
+                    continue;
+                }
+
+                if revents.contains(PollFlags::POLLIN) {
+                    let result = match slot {
+                        Slot::Anon(sock) => view.drain_anon(sock, rcvbuf, dstbuf)?,
+                        Slot::Conn(conn) => view.drain_conn(conn, rcvbuf, dstbuf)?,
+                    };
+
+                    if result.is_break() {
+                        invalidated = true;
+                        break;
+                    }
+                }
+            }
+
+            if invalidated {
+                return Ok(Resume::Now);
+            }
+        }
+    }
+}
+
+fn verify_incoming<'a, 'c>(
+    rate_limiter: Option<&RateLimiter>,
+    src_addr: Option<IpAddr>,
+    datagram: &'a [u8],
+    cookie_buf: &'c mut [u8],
+) -> Result<Packet<'a>, Option<&'c mut [u8]>> {
+    match rate_limiter {
+        Some(rate_limiter) => match rate_limiter.verify_packet(src_addr, datagram, cookie_buf) {
+            Ok(packet) => Ok(packet),
+            Err(TunnResult::WriteToNetwork(cookie)) => Err(Some(cookie)),
+            Err(_) => Err(None),
+        },
+        None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
+    }
+}
+
+struct InboundView<'a> {
+    device: &'a Device,
+    waker: &'a Waker,
+    key_pair: &'a (StaticSecret, PublicKey),
+    udp4: &'a Socket,
+    udp6: &'a Socket,
+    // this is owned, as the `try_clone`d fds must outlive the poll
+    conns: Vec<Conn>,
+}
+
+enum ViewFailed {
+    NotConnected,
+    EmptyKeyPair,
+}
+
+impl<'a> InboundView<'a> {
+    // TODO: move logging out of new
+    fn new(device: &'a Device, waker: &'a Waker) -> Result<Self, ViewFailed> {
+        let (Some(udp4), Some(udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
+            return Err(ViewFailed::NotConnected);
+        };
+
+        let Some(key_pair) = device.key_pair.as_ref() else {
+            return Err(ViewFailed::EmptyKeyPair);
+        };
+
+        let conns = device
+            .peers
+            .values()
+            .filter_map(|peer| {
+                let endpoint = peer.endpoint();
+                let sock = endpoint.conn.as_ref()?.try_clone().ok()?;
+                Some(Conn {
+                    peer: Arc::clone(peer),
+                    sock,
+                    peer_ip: endpoint.addr.map(|a| a.ip()),
                 })
-                .collect();
+            })
+            .collect();
 
-            (
-                d.iface.clone(),
-                d.config.firewall_process_inbound_callback.clone(),
-                d.key_pair.clone(),
-                d.rate_limiter.clone(),
-                d.udp4.clone(),
-                d.udp6.clone(),
-                conns,
-            )
-        };
-
-        let (Some(udp4), Some(udp6)) = (udp4, udp6) else {
-            tracing::debug!(message = "Not connected, parked until sockets are opened.");
-            self.waker.wait()?;
-            return Ok(None);
-        };
-
-        let Some(key_pair) = key_pair else {
-            tracing::trace!("Empty key pair");
-            self.waker.wait()?;
-            return Ok(None);
-        };
-
-        Ok(Some(Snapshot {
-            iface,
-            fw_callback,
+        Ok(Self {
+            device,
+            waker,
             key_pair,
-            rate_limiter,
             udp4,
             udp6,
             conns,
-        }))
+        })
     }
 
     // TODO: refactor into dedicated methods like for outbound
     fn drain_anon(
         &self,
         sock: &Socket,
-        snap: &Snapshot, // TODO: ony pass the relevant part of the snap
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
@@ -314,8 +340,8 @@ impl Inbound {
             };
 
             // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-            let parsed_packet = match snap.rate_limiter {
-                Some(ref rate_limiter) => {
+            let parsed_packet = match self.device.rate_limiter.as_ref() {
+                Some(rate_limiter) => {
                     match rate_limiter.verify_packet(Some(sock_addr.ip()), packet, dstbuf) {
                         Ok(packet) => packet,
                         Err(TunnResult::WriteToNetwork(cookie)) => {
@@ -335,29 +361,23 @@ impl Inbound {
 
             let peer = match &parsed_packet {
                 Packet::HandshakeInit(p) => {
-                    let (private_key, public_key) = &snap.key_pair;
+                    let (private_key, public_key) = self.key_pair;
                     parse_handshake_anon(private_key, public_key, p)
                         .ok()
                         .and_then(|hh| {
-                            let d = self.device.read();
-                            d.peers
+                            self.device
+                                .peers
                                 .get(&x25519::PublicKey::from(hh.peer_static_public))
-                                .cloned()
                         })
                 }
                 // TODO: three branches handled in the same way
                 Packet::HandshakeResponse(p) => {
-                    let d = self.device.read();
-                    d.peers_by_idx.get(&(p.receiver_idx >> 8)).cloned()
+                    self.device.peers_by_idx.get(&(p.receiver_idx >> 8))
                 }
                 Packet::PacketCookieReply(p) => {
-                    let d = self.device.read();
-                    d.peers_by_idx.get(&(p.receiver_idx >> 8)).cloned()
+                    self.device.peers_by_idx.get(&(p.receiver_idx >> 8))
                 }
-                Packet::PacketData(p) => {
-                    let d = self.device.read();
-                    d.peers_by_idx.get(&(p.receiver_idx >> 8)).cloned()
-                }
+                Packet::PacketData(p) => self.device.peers_by_idx.get(&(p.receiver_idx >> 8)),
             };
 
             let peer = match peer {
@@ -367,7 +387,7 @@ impl Inbound {
 
             let mut flush = false; // Are there packets to send from the queue?
 
-            let res = handle_verified_packet(&peer, parsed_packet, &mut dstbuf[..]);
+            let res = handle_verified_packet(peer, parsed_packet, &mut dstbuf[..]);
 
             match res {
                 TunnResult::Done => {}
@@ -382,18 +402,23 @@ impl Inbound {
                     }
                 }
                 TunnResult::WriteToTunnel(mut packet) => {
-                    if let Some(callback) = &snap.fw_callback {
+                    if let Some(callback) = self
+                        .device
+                        .config
+                        .firewall_process_inbound_callback
+                        .as_ref()
+                    {
                         if !callback(&peer.public_key.0, packet.payload_mut()) {
                             continue;
                         }
                     }
 
-                    match RoutableIp::check(packet, &peer) {
+                    match RoutableIp::check(packet, peer) {
                         Ok(packet) => {
-                            _ = packet.write_to(snap.iface.as_ref());
+                            _ = packet.write_to(self.device.iface.as_ref());
                             tracing::trace!(
                                 message = "Writing packet to tunnel",
-                                interface = ?snap.iface.name(),
+                                interface = ?self.device.iface.name(),
                                 packet_length = packet.len(),
                                 src_addr = ?packet.src_addr(),
                                 public_key = peer.public_key.1,
@@ -412,7 +437,7 @@ impl Inbound {
             if flush {
                 // Flush pending queue
                 loop {
-                    let res = outbound::flush_queued(&peer, &mut dstbuf[..]);
+                    let res = outbound::flush_queued(peer, &mut dstbuf[..]);
 
                     let TunnResult::WriteToNetwork(packet) = res else {
                         break;
@@ -431,10 +456,11 @@ impl Inbound {
             // This packet was OK, that means we want to create a connected socket for this peer
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
             {
-                let d = self.device.read();
-
-                if d.config.use_connected_socket {
-                    if let Err(e) = peer.connect_endpoint(d.listen_port, d.config.skt_buffer_size) {
+                if self.device.config.use_connected_socket {
+                    if let Err(e) = peer.connect_endpoint(
+                        self.device.listen_port,
+                        self.device.config.skt_buffer_size,
+                    ) {
                         tracing::error!(
                             message = "Failed to create connected socket for a peer",
                             public_key = peer.public_key.1,
@@ -457,7 +483,6 @@ impl Inbound {
     fn drain_conn(
         &self,
         conn: &Conn,
-        snap: &Snapshot, // TODO: ony pass the relevant part of the snap
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
@@ -489,7 +514,7 @@ impl Inbound {
 
                 #[allow(clippy::indexing_slicing)]
                 let parsed_packet = match verify_incoming(
-                    snap.rate_limiter.as_deref(),
+                    self.device.rate_limiter.as_deref(),
                     conn.peer_ip,
                     rcvbuf[..read_bytes].as_ref(),
                     dstbuf,
@@ -526,7 +551,9 @@ impl Inbound {
                         }
                     }
                     TunnResult::WriteToTunnel(mut packet) => {
-                        if let Some(callback) = &snap.fw_callback {
+                        if let Some(callback) =
+                            &self.device.config.firewall_process_inbound_callback
+                        {
                             if !callback(&conn.peer.public_key.0, packet.payload_mut()) {
                                 continue;
                             }
@@ -534,7 +561,7 @@ impl Inbound {
 
                         match RoutableIp::check(packet, &conn.peer) {
                             Ok(packet) => {
-                                _ = packet.write_to(snap.iface.as_ref());
+                                _ = packet.write_to(self.device.iface.as_ref());
                                 tracing::trace!(
                                     message = "Writing packet to tunnel",
                                     packet_length = packet.len(),
@@ -573,34 +600,6 @@ impl Inbound {
     }
 }
 
-fn verify_incoming<'a, 'c>(
-    rate_limiter: Option<&RateLimiter>,
-    src_addr: Option<IpAddr>,
-    datagram: &'a [u8],
-    cookie_buf: &'c mut [u8],
-) -> Result<Packet<'a>, Option<&'c mut [u8]>> {
-    match rate_limiter {
-        Some(rate_limiter) => match rate_limiter.verify_packet(src_addr, datagram, cookie_buf) {
-            Ok(packet) => Ok(packet),
-            Err(TunnResult::WriteToNetwork(cookie)) => Err(Some(cookie)),
-            Err(_) => Err(None),
-        },
-        None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
-    }
-}
-
-// TODO: refactor - snapshot consists of two parts with different usage, split them
-struct Snapshot {
-    iface: Arc<TunSocket>,
-    fw_callback: Option<Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>>,
-    key_pair: (StaticSecret, PublicKey),
-    rate_limiter: Option<Arc<RateLimiter>>,
-    // ----
-    udp4: Arc<Socket>,
-    udp6: Arc<Socket>,
-    conns: Vec<Conn>,
-}
-
 struct Conn {
     peer: Arc<Peer>,
     sock: Socket,
@@ -629,24 +628,24 @@ struct PollSet<'a> {
 }
 
 impl<'a> PollSet<'a> {
-    fn new(snap: &'a Snapshot, waker: &'a Waker) -> Self {
+    fn new(view: &'a InboundView) -> Self {
         // TODO: ony pass the relevant part of the snap
         // 3 pfds are always present: a waker and two anonymous UDP sockets
-        let capacity = 3 + snap.conns.len();
+        let capacity = 3 + view.conns.len();
         let mut pfds = Vec::with_capacity(capacity);
         let mut slots = Vec::with_capacity(capacity);
 
         // Push Waker's PollFd first, it has no corresponding slot
-        pfds.push(PollFd::new(waker.wait_fd(), PollFlags::POLLIN));
+        pfds.push(PollFd::new(view.waker.wait_fd(), PollFlags::POLLIN));
 
         // Push anonymous UDP sockets' PollFds and their corresponding anon slots
-        for sock in [&snap.udp4, &snap.udp6] {
+        for sock in [&view.udp4, &view.udp6] {
             pfds.push(PollFd::new(sock.as_fd(), PollFlags::POLLIN));
             slots.push(Slot::Anon(sock));
         }
 
         // Push connected UDP sockets' PollFds and their corresponding conn slots
-        for conn in &snap.conns {
+        for conn in &view.conns {
             pfds.push(PollFd::new(conn.sock.as_fd(), PollFlags::POLLIN));
             slots.push(Slot::Conn(conn));
         }
