@@ -21,7 +21,6 @@ use super::{
 };
 use crate::device::allowed_ips::AllowedIps;
 use crate::device::peer::Peer;
-use crate::device::peer_span;
 use crate::device::tun::TunSocket;
 
 const CHANNEL_SIZE: usize = 500;
@@ -220,7 +219,6 @@ fn write_to_socket_worker(
                 if let Ok(mut batched_pkts) = element {
                     for element in batched_pkts.iter_mut() {
                         let len = element.buf_len;
-                        let _span = peer_span(element.peer.public_key);
 
                         if let Some(callback) = &firewall_process_outbound_callback {
                             let buffer = match element.data.get_mut(WG_HEADER_OFFSET..len + WG_HEADER_OFFSET) {
@@ -256,12 +254,11 @@ fn write_to_tun_worker(
                 if let Ok(batched_pkts) = batched_pkts {
                     for mut t in batched_pkts {
                         let peer = t.peer;
-                        let _span = peer_span(peer.public_key);
 
                         let buffer = match t.buffer.get_mut(..t.buf_len) {
                             Some(b) => b,
                             None => {
-                                tracing::warn!("Length is greater than buffer space");
+                                tracing::warn!(peer = %peer.public_key, "Length is greater than buffer space");
                                 continue
                             },
                         };
@@ -276,6 +273,7 @@ fn write_to_tun_worker(
                                 message = "Writing packet to tunnel",
                                 packet_length = t.buf_len,
                                 src_addr = ?t.addr,
+                                peer = %peer.public_key,
                             );
                         }
                     }

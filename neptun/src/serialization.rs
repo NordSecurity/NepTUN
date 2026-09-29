@@ -11,46 +11,59 @@ const KEY_BASE64_LEN: usize = 44;
 /// `Display` and `Debug` both render only the first and last four base64
 /// characters (`AQEB...AQE=`) — enough to tell which peer a log line belongs
 /// to, without putting a whole key in a log sink.
+/// Length of the masked rendering: `MASK_KEEP + "...".len() + MASK_KEEP`.
+const MASKED_LEN: usize = 2 * MASK_KEEP + 3;
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct PubKey([u8; 32]);
+pub(crate) struct PubKey {
+    /// Raw key material, never logged.
+    bytes: [u8; 32],
+    /// Masked base64 rendering, computed once so that `Display` never
+    /// encodes or allocates - it may run on the packet path when trace
+    /// logging is enabled.
+    masked: [u8; MASKED_LEN],
+}
 
 impl PubKey {
-    /// Raw key material.
     // Only used by the firewall callbacks; gated to match `device` in lib.rs,
     // which is unix-only - otherwise this is dead code on Windows.
     #[cfg(all(unix, feature = "device"))]
     pub(crate) const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
+        &self.bytes
     }
 }
 
 impl From<[u8; 32]> for PubKey {
     fn from(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+        let encoded = general_purpose::STANDARD.encode(bytes);
+        let encoded = encoded.as_bytes();
+        let mut masked = [b'.'; MASKED_LEN];
+        if encoded.len() == KEY_BASE64_LEN {
+            masked[..MASK_KEEP].copy_from_slice(&encoded[..MASK_KEEP]);
+            masked[MASK_KEEP + 3..].copy_from_slice(&encoded[KEY_BASE64_LEN - MASK_KEEP..]);
+        }
+        Self { bytes, masked }
     }
 }
 
 impl From<crate::x25519::PublicKey> for PubKey {
     fn from(key: crate::x25519::PublicKey) -> Self {
-        Self(key.to_bytes())
+        Self::from(key.to_bytes())
     }
 }
 
 impl From<&crate::x25519::PublicKey> for PubKey {
     fn from(key: &crate::x25519::PublicKey) -> Self {
-        Self(key.to_bytes())
+        Self::from(key.to_bytes())
     }
 }
 
 impl std::fmt::Display for PubKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let encoded = general_purpose::STANDARD.encode(self.0);
-        match (
-            encoded.get(..MASK_KEEP),
-            encoded.get(KEY_BASE64_LEN - MASK_KEEP..),
-        ) {
-            (Some(head), Some(tail)) => write!(f, "{}...{}", head, tail),
-            _ => f.write_str("<unencodable key>"),
+        // base64 output is ASCII, so this only fails if `masked` was never filled.
+        match std::str::from_utf8(&self.masked) {
+            Ok(masked) => f.write_str(masked),
+            Err(_) => f.write_str("<unencodable key>"),
         }
     }
 }
