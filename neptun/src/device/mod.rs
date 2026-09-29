@@ -30,7 +30,7 @@ mod packet_workers;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::{self, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use dev_lock::{Lock, LockReadGuard};
@@ -40,8 +40,6 @@ use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Write};
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::mem::swap;
 use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
@@ -62,6 +60,7 @@ use dispatch2::{
 use {
     nix::sys::socket as NixSocket,
     packet_workers::{PacketWorkers, TunnelWorkerData},
+    std::mem::swap,
     std::net::IpAddr,
     std::os::fd::{AsFd, BorrowedFd},
     std::thread::{self, JoinHandle},
@@ -1088,10 +1087,9 @@ impl Device {
                     };
 
                     let mut flush = false; // Are there packets to send from the queue?
-                    let res = {
-                        let mut tun = peer.tunnel.lock();
-                        tun.handle_verified_packet(parsed_packet, &mut t.dst_buf[..])
-                    };
+
+                    let res = noise::handle_verified_packet_off_lock(&peer.tunnel, parsed_packet, &mut t.dst_buf[..]);
+
                     match res {
                         TunnResult::Done => {}
                         TunnResult::Err(err) => {
@@ -1118,7 +1116,12 @@ impl Device {
                                     interface = ?t.iface.name(),
                                     packet_length = packet.len(),
                                     src_addr = ?addr,
-                                    public_key = peer.public_key.1
+                                    public_key = peer.public_key.1,
+                                );
+                            } else {
+                                tracing::debug!(
+                                    message = "Dropping packet from outside of allowed IPs",
+                                    src_addr = ?addr,
                                 );
                             }
                         }
@@ -1199,15 +1202,25 @@ impl Device {
                         if let Ok(read_bytes) = udp.recv(src_buf) {
                             let mut flush = false;
                             let mut buffer = [0u8; MAX_PKT_SIZE];
-                            let res = {
-                                let mut tun = peer.tunnel.lock();
-                                #[allow(clippy::indexing_slicing)]
-                                tun.decapsulate(
-                                    Some(peer_addr),
-                                    t.src_buf[..read_bytes].as_ref(),
-                                    &mut buffer[..],
-                                )
+
+                            #[allow(clippy::indexing_slicing)]
+                            let parsed_packet = match verify_incoming(
+                                d.rate_limiter.as_deref(),
+                                Some(peer_addr),
+                                t.src_buf[..read_bytes].as_ref(),
+                                &mut buffer,
+                            ) {
+                                Ok(packet) => packet,
+                                Err(Some(cookie)) => {
+                                    if let Err(err) = udp.send(cookie) {
+                                        tracing::warn!(message = "Failed to send cookie", error = ?err);
+                                    }
+                                    continue;
+                                }
+                                Err(None) => continue,
                             };
+
+                            let res = noise::handle_verified_packet_off_lock(&peer.tunnel, parsed_packet, &mut buffer[..]);
 
                             match res {
                                 TunnResult::Done => {}
@@ -1247,10 +1260,7 @@ impl Device {
                                 // Flush pending queue
                                 loop {
                                     let mut dst_buf = [0u8; MAX_PKT_SIZE];
-                                    let res = {
-                                        let mut tun = peer.tunnel.lock();
-                                        tun.decapsulate(None, &[], &mut dst_buf[..])
-                                    };
+                                    let res = noise::flush_queued_off_lock(&peer.tunnel, &mut dst_buf[..]);
                                     let TunnResult::WriteToNetwork(packet) = res else {
                                         break;
                                     };
@@ -1393,10 +1403,7 @@ fn encapsulate_and_send(
     udp4: &socket2::Socket,
     udp6: &socket2::Socket,
 ) {
-    let res = {
-        let mut tun = peer.tunnel.lock();
-        tun.encapsulate_in_place(payload_len, buf)
-    };
+    let res = noise::encapsulate_in_place_off_lock(&peer.tunnel, payload_len, buf);
 
     match res {
         TunnResult::Done => {}
@@ -1444,6 +1451,23 @@ fn encapsulate_and_send(
         _ => {
             tracing::error!("Unexpected result from encapsulate");
         }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+fn verify_incoming<'a, 'c>(
+    rate_limiter: Option<&RateLimiter>,
+    src_addr: Option<IpAddr>,
+    datagram: &'a [u8],
+    cookie_buf: &'c mut [u8],
+) -> Result<Packet<'a>, Option<&'c mut [u8]>> {
+    match rate_limiter {
+        Some(rate_limiter) => match rate_limiter.verify_packet(src_addr, datagram, cookie_buf) {
+            Ok(packet) => Ok(packet),
+            Err(TunnResult::WriteToNetwork(cookie)) => Err(Some(cookie)),
+            Err(_) => Err(None),
+        },
+        None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
     }
 }
 
