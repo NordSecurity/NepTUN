@@ -10,6 +10,7 @@ use libc::{
 };
 use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io::{self, Write};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicBool;
 use tracing::error;
@@ -34,6 +35,12 @@ pub struct TunSocket {
 impl Drop for TunSocket {
     fn drop(&mut self) {
         self.force_close();
+    }
+}
+
+impl AsFd for TunSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
     }
 }
 
