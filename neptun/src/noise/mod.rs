@@ -10,6 +10,7 @@ pub mod safe_duration;
 mod session;
 mod timers;
 
+use parking_lot::Mutex;
 use session::DATA_OFFSET;
 
 use crate::noise::errors::WireGuardError;
@@ -129,6 +130,15 @@ pub enum Packet<'a> {
     PacketData(PacketData<'a>),
 }
 
+/// Packet encapsulation result
+#[allow(dead_code)]
+pub(crate) enum Encapsulated<'a> {
+    Packet(&'a mut [u8]),
+    Queued,
+    NeedsHandshake,
+    Err(WireGuardError),
+}
+
 // Parsed inbound packet
 #[derive(Debug)]
 pub enum Decapsulated<'a> {
@@ -170,6 +180,22 @@ impl<'a> TryFrom<&'a mut [u8]> for Decapsulated<'a> {
             .ok_or(WireGuardError::InvalidPacket)?;
 
         Ok(Decapsulated::IpPacket(payload, src_addr))
+    }
+}
+
+/// Data packet receive result
+#[allow(dead_code)]
+pub(crate) struct Received<'a> {
+    pub(crate) result: TunnResult<'a>,
+    pub(crate) queue_ready: bool,
+}
+
+impl From<WireGuardError> for Received<'_> {
+    fn from(e: WireGuardError) -> Self {
+        Self {
+            result: TunnResult::Err(e),
+            queue_ready: false,
+        }
     }
 }
 
@@ -330,18 +356,41 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
-    pub(crate) fn commit_tx<'a>(
+    /// Data plane no-session path: packet is queued and the handshake is left
+    /// to the control plane.
+    ///
+    /// Returns `true` if a handshake has to be initiated.
+    #[allow(dead_code)]
+    pub(crate) fn queue_for_handshake(
         &mut self,
-        packet: &'a mut [u8],
-        payload_len: usize,
-    ) -> TunnResult<'a> {
+        src_len: usize,
+        dst: &[u8],
+    ) -> Result<bool, WireGuardError> {
+        if src_len.ne(&0) {
+            let packet = dst
+                .get(DATA_OFFSET..src_len + DATA_OFFSET)
+                .ok_or(WireGuardError::InvalidLength)?;
+            self.queue_packet(packet);
+        }
+        Ok(!self.handshake.is_in_progress())
+    }
+
+    /// Initiates a handshake requested by the data plane
+    #[allow(dead_code)]
+    pub(crate) fn initiate_requested_handshake<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        if self.current_session().is_some() {
+            return TunnResult::Done;
+        }
+        self.format_handshake_initiation(dst, false)
+    }
+
+    #[inline]
+    pub(crate) fn commit_tx(&mut self, packet_len: usize, payload_len: usize) {
         self.timer_tick(TimerName::TimeLastPacketSent);
         if payload_len != 0 {
             self.timer_tick(TimerName::TimeLastDataPacketSent);
         }
-        self.tx_bytes += packet.len() as u64;
-
-        TunnResult::WriteToNetwork(packet)
+        self.tx_bytes += packet_len as u64;
     }
 
     pub(crate) fn commit_rx<'a>(
@@ -425,7 +474,8 @@ impl Tunn {
             Err(e) => return TunnResult::Err(e),
         };
 
-        self.commit_tx(packet, src_len)
+        self.commit_tx(packet.len(), src_len);
+        TunnResult::WriteToNetwork(packet)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -777,6 +827,113 @@ fn read_addr<const N: usize>(buf: &[u8], off: usize) -> Result<[u8; N], WireGuar
     buf.get(off..off + N)
         .and_then(|s| s.try_into().ok())
         .ok_or(WireGuardError::InvalidPacket)
+}
+
+#[allow(dead_code)]
+pub(crate) fn encapsulate_in_place_off_lock<'a>(
+    tunnel: &Mutex<Tunn>,
+    src_len: usize,
+    dst: &'a mut [u8],
+) -> Encapsulated<'a> {
+    let session = {
+        let mut guard = tunnel.lock();
+        match guard.current_session() {
+            Some(session) => session,
+            None => {
+                return match guard.queue_for_handshake(src_len, dst) {
+                    Ok(true) => Encapsulated::NeedsHandshake,
+                    Ok(false) => Encapsulated::Queued,
+                    Err(e) => Encapsulated::Err(e),
+                };
+            }
+        }
+    };
+
+    // Tunnel lock is released at this point
+    let packet = match session.format_packet_data(src_len, dst) {
+        Ok(packet) => packet,
+        Err(e) => return Encapsulated::Err(e),
+    };
+
+    // Reacquiring tunnel lock
+    tunnel.lock().commit_tx(packet.len(), src_len);
+    Encapsulated::Packet(packet)
+}
+
+#[allow(dead_code)]
+pub(crate) fn flush_queued_off_lock<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8]) -> TunnResult<'a> {
+    let (session, payload) = {
+        let mut guard = tunnel.lock();
+        // Packets without a session stay in the queue
+        let Some(session) = guard.current_session() else {
+            return TunnResult::Done;
+        };
+        let Some(payload) = guard.dequeue_packet() else {
+            return TunnResult::Done;
+        };
+        (session, payload)
+    };
+    let payload_len = payload.len();
+
+    match dst.get_mut(DATA_OFFSET..DATA_OFFSET + payload_len) {
+        Some(d) => d.copy_from_slice(&payload),
+        None => {
+            tunnel.lock().requeue_packet(payload);
+            return TunnResult::Err(WireGuardError::InvalidLength);
+        }
+    }
+
+    // Tunnel lock is released at this point
+    let packet = match session.format_packet_data(payload_len, dst) {
+        Ok(packet) => packet,
+        Err(e) => {
+            tunnel.lock().requeue_packet(payload);
+            return TunnResult::Err(e);
+        }
+    };
+
+    // Reacquiring tunnel lock
+    tunnel.lock().commit_tx(packet.len(), payload_len);
+    TunnResult::WriteToNetwork(packet)
+}
+
+#[allow(dead_code)]
+pub(crate) fn decapsulate_data_off_lock<'a>(
+    tunnel: &Mutex<Tunn>,
+    packet: PacketData<'_>,
+    dst: &'a mut [u8],
+) -> Received<'a> {
+    let session = {
+        let guard = tunnel.lock();
+        match guard.session_for(&packet) {
+            Some(session) => session,
+            None => {
+                tracing::trace!("No current session available");
+                return WireGuardError::NoCurrentSession.into();
+            }
+        }
+    };
+
+    // Tunnel lock is released at this point
+    let authenticated = match session.receive_packet_data(packet, dst) {
+        Ok(p) => p,
+        Err(e) => return e.into(),
+    };
+
+    let decapsulated = Decapsulated::try_from(authenticated);
+
+    // Reacquiring tunnel lock
+    let mut guard = tunnel.lock();
+    let current = guard.current;
+    let result = guard
+        .commit_rx(&session, decapsulated)
+        .unwrap_or_else(TunnResult::from);
+    let queue_ready = guard.current != current && !guard.packet_queue.is_empty();
+
+    Received {
+        result,
+        queue_ready,
+    }
 }
 
 #[cfg(test)]
@@ -1389,5 +1546,388 @@ mod tests {
             rx_bytes,
             "Rx bytes should not be appended if session was cleared mid flight."
         )
+    }
+
+    fn stage(buf: &mut [u8], payload: &[u8]) -> usize {
+        buf[DATA_OFFSET..DATA_OFFSET + payload.len()].copy_from_slice(payload);
+        payload.len()
+    }
+
+    fn tx_bytes(tunnel: &Mutex<Tunn>) -> u64 {
+        tunnel.lock().stats().1
+    }
+
+    #[test]
+    fn encapsulate_without_session_queues_packet_and_starts_handshake() {
+        let (tun_a, _tun_b) = create_two_tuns();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut buf = vec![0; 2048];
+        let len = stage(&mut buf, &ip_packet);
+
+        let result = encapsulate_in_place_off_lock(&tunnel, len, &mut buf);
+        assert!(
+            matches!(result, Encapsulated::NeedsHandshake),
+            "Sending without a session should request a handshake."
+        );
+
+        // control plane starts the handshake
+        let TunnResult::WriteToNetwork(_) = tunnel.lock().initiate_requested_handshake(&mut buf)
+        else {
+            panic!("Expected handshake initiation.");
+        };
+
+        // a keepalive is not queued, handshake is already in progress
+        let result = encapsulate_in_place_off_lock(&tunnel, 0, &mut buf);
+        assert!(matches!(result, Encapsulated::Queued));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(ip_packet),
+            "The packet should wait in the queue for the session."
+        );
+        assert_eq!(
+            tun.dequeue_packet(),
+            None,
+            "A keepalive should not be queued."
+        );
+    }
+
+    #[test]
+    fn requested_handshake_is_initiated_once() {
+        let (mut tun, _) = create_two_tuns();
+        let mut buf = vec![0; 2048];
+
+        let TunnResult::WriteToNetwork(sent) = tun.initiate_requested_handshake(&mut buf) else {
+            panic!("Expected handshake initiation.");
+        };
+
+        assert!(matches!(
+            Tunn::parse_incoming_packet(sent),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        assert!(
+            matches!(tun.initiate_requested_handshake(&mut buf), TunnResult::Done),
+            "A handshake in progress should not be initiated again."
+        )
+    }
+
+    #[test]
+    fn requested_handshake_is_dropped_with_session() {
+        let (mut tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let mut buf = vec![0; 2048];
+
+        assert!(
+            matches!(
+                tun_a.initiate_requested_handshake(&mut buf),
+                TunnResult::Done
+            ),
+            "A handshake request should be dropped once a session is established."
+        )
+    }
+
+    #[test]
+    fn encapsulate_with_session_encrypts_and_commits() {
+        let (tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut buf = vec![0; 2048];
+        let len = stage(&mut buf, &ip_packet);
+        let tx_before = tx_bytes(&tunnel);
+
+        let Encapsulated::Packet(sent) = encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
+        else {
+            panic!("Expected an encrypted packet.");
+        };
+        let sent_len = sent.len() as u64;
+
+        let mut out = vec![0; 2048];
+        let TunnResult::WriteToTunnel(received, _) = tun_b.decapsulate(None, sent, &mut out) else {
+            panic!("Expected to get a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            tx_bytes(&tunnel),
+            tx_before + sent_len,
+            "Tx bytes should grow by the size of the encrypted packet."
+        );
+    }
+
+    #[test]
+    fn encapsulate_failure_does_not_commit() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        // insufficient space for the AEAD tag
+        let mut buf = vec![0; DATA_OFFSET + ip_packet.len()];
+        let len = stage(&mut buf, &ip_packet);
+        let tx_before = tx_bytes(&tunnel);
+
+        let result = encapsulate_in_place_off_lock(&tunnel, len, &mut buf);
+        assert!(matches!(
+            result,
+            Encapsulated::Err(WireGuardError::IncorrectPacketLength)
+        ));
+        assert_eq!(
+            tx_bytes(&tunnel),
+            tx_before,
+            "Tx bytes should not grow on failed encryption."
+        );
+    }
+
+    #[test]
+    fn flush_empty_queue_results_in_done() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let mut buf = vec![0; 2048];
+
+        assert!(matches!(
+            flush_queued_off_lock(&tunnel, &mut buf),
+            TunnResult::Done
+        ));
+    }
+
+    #[test]
+    fn flush_sends_queued_packet() {
+        let (tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        let mut buf = vec![0; 2048];
+
+        let TunnResult::WriteToNetwork(sent) = flush_queued_off_lock(&tunnel, &mut buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+
+        let mut out = vec![0; 2048];
+        let TunnResult::WriteToTunnel(received, _) = tun_b.decapsulate(None, sent, &mut out) else {
+            panic!("Expected to get a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            tunnel.lock().dequeue_packet(),
+            None,
+            "Queue should be drained."
+        );
+    }
+
+    #[test]
+    fn flush_requeues_at_front_when_buffer_is_too_small() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let first = create_ipv4_udp_packet();
+        let second = create_large_ipv4_udp_packet();
+        {
+            // requeue pushes to the front
+            let mut tun = tunnel.lock();
+            tun.requeue_packet(second.clone());
+            tun.requeue_packet(first.clone());
+        }
+        let mut buf = vec![0; DATA_OFFSET];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidLength)
+        ));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(first),
+            "The packet should be requeued at the front."
+        );
+        assert_eq!(tun.dequeue_packet(), Some(second));
+    }
+
+    #[test]
+    fn flush_requeues_on_failed_encryption() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        // insufficient space for the AEAD tag
+        let mut buf = vec![0; DATA_OFFSET + ip_packet.len()];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::IncorrectPacketLength)
+        ));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(ip_packet),
+            "The packet should be requeued."
+        );
+    }
+
+    #[test]
+    fn flush_without_session_leaves_queue_untouched() {
+        let (tun_a, _tun_b) = create_two_tuns();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        let mut buf = vec![0; 2048];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(
+            matches!(result, TunnResult::Done),
+            "Flushing without a session should neither send nor start a handshake."
+        );
+
+        let mut tun = tunnel.lock();
+        assert_eq!(tun.dequeue_packet(), Some(ip_packet));
+        assert_eq!(
+            tun.dequeue_packet(),
+            None,
+            "The packet should not be duplicated."
+        );
+    }
+
+    fn encrypt(tun: &mut Tunn, payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0; 2048];
+        let TunnResult::WriteToNetwork(packet) = tun.encapsulate(payload, &mut buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+        packet.to_vec()
+    }
+
+    fn rx_bytes(tunnel: &Mutex<Tunn>) -> u64 {
+        tunnel.lock().stats().2
+    }
+
+    fn data_packet(encrypted: &[u8]) -> PacketData<'_> {
+        let Ok(Packet::PacketData(packet)) = Tunn::parse_incoming_packet(encrypted) else {
+            panic!("Expected data packet.");
+        };
+        packet
+    }
+
+    #[test]
+    fn decapsulate_data_with_session_decrypts_and_commits() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let ip_packet = create_ipv4_udp_packet();
+        let encrypted = encrypt(&mut tun_a, &ip_packet);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = data_packet(&encrypted);
+        let TunnResult::WriteToTunnel(received, _) =
+            decapsulate_data_off_lock(&tunnel, packet, &mut dst).result
+        else {
+            panic!("Expected a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before + message_data_len(ip_packet.len()) as u64,
+            "Rx bytes should grow by the size of the data message."
+        );
+    }
+
+    #[test]
+    fn decapsulate_keepalive_with_session_commits() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let encrypted = encrypt(&mut tun_a, &[]);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
+
+        assert!(matches!(result, TunnResult::Done));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before + message_data_len(0) as u64,
+            "Rx bytes should grow by the size of the keepalive message."
+        );
+    }
+
+    #[test]
+    fn decapsulate_data_without_session_is_rejected() {
+        let (mut tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let ip_packet = create_ipv4_udp_packet();
+        let encrypted = encrypt(&mut tun_a, &ip_packet);
+
+        // this call clears all sessions
+        tun_b.set_preshared_key(None);
+
+        let tunnel = Mutex::new(tun_b);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
+
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::NoCurrentSession)
+        ));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before,
+            "Rx bytes should not grow on missing session."
+        );
+    }
+
+    #[test]
+    fn decapsulate_data_decryption_failure_does_not_commit() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut encrypted = encrypt(&mut tun_a, &ip_packet);
+
+        // corrupt AEAD tag
+        *encrypted.last_mut().unwrap() ^= 1;
+
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
+
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidAeadTag)
+        ));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before,
+            "Rx bytes should not grow on failed decryption."
+        );
+    }
+
+    #[test]
+    fn confirming_responder_session_reports_queue_ready() {
+        let (mut tun_a, mut tun_b) = create_two_tuns();
+        let init = create_handshake_init(&mut tun_a);
+        let resp = create_handshake_response(&mut tun_b, &init);
+        let keepalive = parse_handshake_resp(&mut tun_a, &resp);
+
+        let tunnel = Mutex::new(tun_b);
+        tunnel.lock().requeue_packet(create_ipv4_udp_packet());
+        let mut dst = vec![0; 2048];
+
+        let received = decapsulate_data_off_lock(&tunnel, data_packet(&keepalive), &mut dst);
+        assert!(matches!(received.result, TunnResult::Done));
+        assert!(
+            received.queue_ready,
+            "Confirming the responder session should report the queued packets."
+        );
+
+        let encrypted = encrypt(&mut tun_a, &[]);
+        let received = decapsulate_data_off_lock(&tunnel, data_packet(&encrypted), &mut dst);
+        assert!(
+            !received.queue_ready,
+            "A packet on the current session should not report the queue again."
+        );
     }
 }

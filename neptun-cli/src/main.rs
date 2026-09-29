@@ -43,14 +43,6 @@ fn main() {
                 .short('f')
                 .action(clap::ArgAction::SetTrue)
                 .help("Run and log in the foreground"),
-            Arg::new("threads")
-                .num_args(1)
-                .long("threads")
-                .short('t')
-                .env("WG_THREADS")
-                .value_parser(value_parser!(usize))
-                .help("Number of OS threads to use")
-                .default_value("4"),
             Arg::new("verbosity")
                 .num_args(1)
                 .long("verbosity")
@@ -80,17 +72,11 @@ fn main() {
                 .long("socket-buffer-size")
                 .value_parser(value_parser!(u32))
                 .help("Sets socket buffers to custom size"),
-            #[cfg(target_os = "linux")]
-            Arg::new("disable-multi-queue")
-                .long("disable-multi-queue")
-                .action(clap::ArgAction::SetTrue)
-                .help("Disable using multiple queues for the tunnel interface"),
         ])
         .get_matches();
 
     let background = !matches.get_flag("foreground");
     let tun_name: String = matches.get_one::<String>("INTERFACE_NAME").unwrap().clone();
-    let n_threads: usize = *matches.get_one("threads").unwrap();
     let log_level: Level = *matches.get_one("verbosity").unwrap();
     let skt_buffer_size = matches.get_one::<usize>("skt-buff-size").copied();
 
@@ -149,10 +135,7 @@ fn main() {
     }
 
     let config = DeviceConfig {
-        n_threads,
         use_connected_socket: !matches.get_flag("disable-connected-udp"),
-        #[cfg(target_os = "linux")]
-        use_multi_queue: !matches.get_flag("disable-multi-queue"),
         open_uapi_socket: true,
         protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
         firewall_process_inbound_callback: None,
