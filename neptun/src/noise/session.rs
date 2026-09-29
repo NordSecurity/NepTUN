@@ -261,7 +261,7 @@ impl Session {
     /// packet - a data packet we received from the network
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
-    /// return the size of the encapsulated packet on success
+    /// returns the decrypted buffer
     pub(super) fn receive_packet_data<'a>(
         &self,
         packet: PacketData,
