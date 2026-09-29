@@ -7,16 +7,19 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crate::device::modify_skt_buffer_size;
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 use crate::serialization::PubKey;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::AsFd;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::device::modify_skt_buffer_size;
+
 use std::os::fd::AsRawFd;
 
 #[derive(Default, Debug)]
@@ -37,6 +40,7 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    handshake_requested: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -86,33 +90,67 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            handshake_requested: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn request_handshake(&self) -> bool {
+        !self.handshake_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_handshake_request(&self) -> bool {
+        self.handshake_requested.swap(false, Ordering::AcqRel)
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
         self.endpoint.read()
     }
 
-    pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
-            tracing::info!("Disconnecting from endpoint");
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+    /// Removes the peer's connected socket.
+    ///
+    /// Returns `false` if the peer didn't have a connected socket.
+    pub fn shutdown_endpoint(&self) -> bool {
+        match self.endpoint.write().conn.take() {
+            Some(conn) => {
+                tracing::info!("Disconnecting from endpoint");
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
+            None => false,
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    /// Sets an endpoint on the peer.
+    ///
+    /// Returns `true` if the peer had a connected socket and it was removed, `false` otherwise.
+    pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
+        // this is called per packet on the anonymous inbound path but the endpoint changes are rare;
+        // avoid the unnecessary write lock, which contends with the outbound thread's endpoint reads
+        if self.endpoint.read().addr == Some(addr) {
+            return false;
+        }
+
         let mut endpoint = self.endpoint.write();
+
+        // re-check - read guard was released above
         if endpoint.addr == Some(addr) {
-            return;
+            return false;
         }
-        if let Some(conn) = endpoint.conn.take() {
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+
+        let had_conn = match endpoint.conn.take() {
+            Some(conn) => {
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
-        }
+            None => false,
+        };
+
         endpoint.addr = Some(addr);
+        had_conn
     }
 
     /// On Apple platforms, it is optimal to rely on the kernel autotuning of the socket size.
