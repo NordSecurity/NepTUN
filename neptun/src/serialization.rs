@@ -38,9 +38,14 @@ impl From<[u8; 32]> for PubKey {
         let encoded = general_purpose::STANDARD.encode(bytes);
         let encoded = encoded.as_bytes();
         let mut masked = [b'.'; MASKED_LEN];
-        if encoded.len() == KEY_BASE64_LEN {
-            masked[..MASK_KEEP].copy_from_slice(&encoded[..MASK_KEEP]);
-            masked[MASK_KEEP + 3..].copy_from_slice(&encoded[KEY_BASE64_LEN - MASK_KEEP..]);
+        if let (Some(head), Some(tail)) = (
+            encoded.get(..MASK_KEEP),
+            encoded.get(KEY_BASE64_LEN - MASK_KEEP..),
+        ) {
+            let rendered = head.iter().chain(b"...").chain(tail);
+            for (dst, src) in masked.iter_mut().zip(rendered) {
+                *dst = *src;
+            }
         }
         Self { bytes, masked }
     }
