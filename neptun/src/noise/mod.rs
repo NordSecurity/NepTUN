@@ -182,6 +182,22 @@ impl<'a> Decapsulated<'a> {
     }
 }
 
+/// Data packet receive result
+#[allow(dead_code)]
+pub(crate) struct Received<'a> {
+    pub(crate) result: TunnResult<'a>,
+    pub(crate) queue_ready: bool,
+}
+
+impl From<WireGuardError> for Received<'_> {
+    fn from(e: WireGuardError) -> Self {
+        Self {
+            result: TunnResult::Err(e),
+            queue_ready: false,
+        }
+    }
+}
+
 impl Tunn {
     pub fn peer_static_public(&self) -> x25519_dalek::PublicKey {
         self.peer_static_public
@@ -887,23 +903,18 @@ pub(crate) fn flush_queued_off_lock<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8])
 }
 
 #[allow(dead_code)]
-pub(crate) fn handle_verified_packet_off_lock<'a, 'd>(
+pub(crate) fn decapsulate_data_off_lock<'a>(
     tunnel: &Mutex<Tunn>,
-    packet: Packet<'d>,
+    packet: PacketData<'_>,
     dst: &'a mut [u8],
-) -> TunnResult<'a> {
-    let (session, packet) = {
-        let mut guard = tunnel.lock();
-        let packet = match packet {
-            Packet::PacketData(p) => p,
-            control => return guard.handle_verified_packet(control, dst),
-        };
-
+) -> Received<'a> {
+    let session = {
+        let guard = tunnel.lock();
         match guard.session_for(&packet) {
-            Some(session) => (session, packet),
+            Some(session) => session,
             None => {
                 tracing::trace!("No current session available");
-                return TunnResult::Err(WireGuardError::NoCurrentSession);
+                return WireGuardError::NoCurrentSession.into();
             }
         }
     };
@@ -911,16 +922,23 @@ pub(crate) fn handle_verified_packet_off_lock<'a, 'd>(
     // Tunnel lock is released at this point
     let authenticated = match session.receive_packet_data(packet, dst) {
         Ok(p) => p,
-        Err(e) => return TunnResult::Err(e),
+        Err(e) => return e.into(),
     };
 
     let decapsulated = Decapsulated::parse(authenticated);
 
     // Reacquiring tunnel lock
-    tunnel
-        .lock()
+    let mut guard = tunnel.lock();
+    let current = guard.current;
+    let result = guard
         .commit_rx(&session, decapsulated)
-        .unwrap_or_else(TunnResult::from)
+        .unwrap_or_else(TunnResult::from);
+    let queue_ready = guard.current != current && !guard.packet_queue.is_empty();
+
+    Received {
+        result,
+        queue_ready,
+    }
 }
 
 #[cfg(test)]
@@ -1787,8 +1805,15 @@ mod tests {
         tunnel.lock().stats().2
     }
 
+    fn data_packet(encrypted: &[u8]) -> PacketData<'_> {
+        let Ok(Packet::PacketData(packet)) = Tunn::parse_incoming_packet(encrypted) else {
+            panic!("Expected data packet.");
+        };
+        packet
+    }
+
     #[test]
-    fn handle_data_with_session_decrypts_and_commits() {
+    fn decapsulate_data_with_session_decrypts_and_commits() {
         let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
         let tunnel = Mutex::new(tun_b);
         let ip_packet = create_ipv4_udp_packet();
@@ -1796,9 +1821,9 @@ mod tests {
         let rx_before = rx_bytes(&tunnel);
         let mut dst = vec![0; 2048];
 
-        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
+        let packet = data_packet(&encrypted);
         let TunnResult::WriteToTunnel(received, _) =
-            handle_verified_packet_off_lock(&tunnel, packet, &mut dst)
+            decapsulate_data_off_lock(&tunnel, packet, &mut dst).result
         else {
             panic!("Expected a decrypted packet.");
         };
@@ -1812,15 +1837,15 @@ mod tests {
     }
 
     #[test]
-    fn handle_keepalive_with_session_commits() {
+    fn decapsulate_keepalive_with_session_commits() {
         let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
         let tunnel = Mutex::new(tun_b);
         let encrypted = encrypt(&mut tun_a, &[]);
         let rx_before = rx_bytes(&tunnel);
         let mut dst = vec![0; 2048];
 
-        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
-        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
 
         assert!(matches!(result, TunnResult::Done));
         assert_eq!(
@@ -1831,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_data_without_session_is_rejected() {
+    fn decapsulate_data_without_session_is_rejected() {
         let (mut tun_a, mut tun_b) = create_two_tuns_and_handshake();
         let ip_packet = create_ipv4_udp_packet();
         let encrypted = encrypt(&mut tun_a, &ip_packet);
@@ -1843,8 +1868,8 @@ mod tests {
         let rx_before = rx_bytes(&tunnel);
         let mut dst = vec![0; 2048];
 
-        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
-        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
 
         assert!(matches!(
             result,
@@ -1858,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_data_decryption_failure_does_not_commit() {
+    fn decapsulate_data_decryption_failure_does_not_commit() {
         let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
         let tunnel = Mutex::new(tun_b);
         let ip_packet = create_ipv4_udp_packet();
@@ -1870,8 +1895,8 @@ mod tests {
         let rx_before = rx_bytes(&tunnel);
         let mut dst = vec![0; 2048];
 
-        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
-        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+        let packet = data_packet(&encrypted);
+        let result = decapsulate_data_off_lock(&tunnel, packet, &mut dst).result;
 
         assert!(matches!(
             result,
@@ -1885,25 +1910,28 @@ mod tests {
     }
 
     #[test]
-    fn handle_control_packet_is_passed_to_tunnel() {
-        let (mut tun_a, tun_b) = create_two_tuns();
+    fn confirming_responder_session_reports_queue_ready() {
+        let (mut tun_a, mut tun_b) = create_two_tuns();
         let init = create_handshake_init(&mut tun_a);
+        let resp = create_handshake_response(&mut tun_b, &init);
+        let keepalive = parse_handshake_resp(&mut tun_a, &resp);
+
         let tunnel = Mutex::new(tun_b);
+        tunnel.lock().requeue_packet(create_ipv4_udp_packet());
         let mut dst = vec![0; 2048];
 
-        let packet = Tunn::parse_incoming_packet(&init).unwrap();
-        let TunnResult::WriteToNetwork(response) =
-            handle_verified_packet_off_lock(&tunnel, packet, &mut dst)
-        else {
-            panic!("Expected a handshake response.");
-        };
-
+        let received = decapsulate_data_off_lock(&tunnel, data_packet(&keepalive), &mut dst);
+        assert!(matches!(received.result, TunnResult::Done));
         assert!(
-            matches!(
-                Tunn::parse_incoming_packet(response),
-                Ok(Packet::HandshakeResponse(_))
-            ),
-            "Handshake initiation should be answered by the tunnel."
+            received.queue_ready,
+            "Confirming the responder session should report the queued packets."
+        );
+
+        let encrypted = encrypt(&mut tun_a, &[]);
+        let received = decapsulate_data_off_lock(&tunnel, data_packet(&encrypted), &mut dst);
+        assert!(
+            !received.queue_ready,
+            "A packet on the current session should not report the queue again."
         );
     }
 }

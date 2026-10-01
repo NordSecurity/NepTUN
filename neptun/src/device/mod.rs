@@ -32,16 +32,18 @@ use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
 use crate::device::waker::Waker;
 use crate::noise::errors::WireGuardError;
+use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{flush_queued_off_lock, Packet, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use dev_lock::{Lock, LockReadGuard};
+use parking_lot::Mutex;
 use peer::{AllowedIP, Peer};
 use poll::{EventPoll, EventRef, WaitResult};
 use rand_core::{OsRng, RngCore};
 use socket2::{Domain, Protocol, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufReader, BufWriter};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::RawFd;
@@ -63,6 +65,8 @@ use {
 };
 
 const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we can tolerate before using cookies
+const HANDSHAKE_QUEUE_SIZE: usize = 1024; // Number of handshake messages awaiting the control plane
+const HANDSHAKE_BATCH_SIZE: usize = 64; // Number of handshake messages handled per single control plane wake
 
 // Max packet size of 1550 because packets are limited by the MTU sizes
 // used in wild networks.
@@ -185,11 +189,17 @@ pub struct Device {
     out_waker: Arc<Waker>,
     in_waker: Arc<Waker>,
     control_waker: Waker,
+    handshake_queue: Mutex<VecDeque<HandshakeMessage>>,
 }
 
 struct ControlThreadData {
     dst_buf: [u8; MAX_PKT_SIZE],
     update_seq: u32,
+}
+
+struct HandshakeMessage {
+    datagram: Vec<u8>,
+    src: SocketAddr,
 }
 
 enum IfaceReadResult<'a> {
@@ -684,6 +694,7 @@ impl Device {
             out_waker: Arc::new(Waker::new()?),
             in_waker: Arc::new(Waker::new()?),
             control_waker: Waker::new()?,
+            handshake_queue: Mutex::new(VecDeque::new()),
         };
 
         if device.config.open_uapi_socket {
@@ -875,11 +886,111 @@ impl Device {
             Box::new(|d, t| {
                 // ACK must come before serving, so a request raised in the meantime wakes the control plane again
                 d.control_waker.ack();
+                d.handle_queued_handshakes(&mut t.dst_buf[..]);
                 d.initiate_requested_handshakes(&mut t.dst_buf[..]);
                 Action::Continue
             }),
         )?;
         Ok(())
+    }
+
+    pub(crate) fn queue_handshake(&self, datagram: &[u8], src: SocketAddr) {
+        let message = HandshakeMessage {
+            datagram: datagram.to_vec(),
+            src,
+        };
+
+        {
+            let mut queue = self.handshake_queue.lock();
+            if queue.len() >= HANDSHAKE_QUEUE_SIZE {
+                tracing::debug!(message = "Handshake queue is full, dropping a message", src = ?src);
+                return;
+            }
+            queue.push_back(message);
+        }
+
+        self.notify_control();
+    }
+
+    fn handle_queued_handshakes(&self, dst: &mut [u8]) {
+        for _ in 0..HANDSHAKE_BATCH_SIZE {
+            let Some(message) = self.handshake_queue.lock().pop_front() else {
+                return;
+            };
+            self.handle_handshake(&message, dst);
+        }
+
+        // The rest is handled on the next wake, so that other events are not starved
+        if !self.handshake_queue.lock().is_empty() {
+            self.notify_control();
+        }
+    }
+
+    fn handle_handshake(&self, message: &HandshakeMessage, dst: &mut [u8]) {
+        let Ok(packet) = Tunn::parse_incoming_packet(&message.datagram) else {
+            return;
+        };
+
+        let peer = match &packet {
+            Packet::HandshakeInit(p) => {
+                let Some((private_key, public_key)) = self.key_pair.as_ref() else {
+                    return;
+                };
+                parse_handshake_anon(private_key, public_key, p)
+                    .ok()
+                    .and_then(|hh| {
+                        self.peers
+                            .get(&x25519::PublicKey::from(hh.peer_static_public))
+                    })
+            }
+            Packet::HandshakeResponse(p) => self.peers_by_idx.get(&(p.receiver_idx >> 8)),
+            Packet::PacketCookieReply(p) => self.peers_by_idx.get(&(p.receiver_idx >> 8)),
+            Packet::PacketData(_) => None,
+        };
+
+        let Some(peer) = peer else {
+            return;
+        };
+
+        let res = {
+            let mut tun = peer.tunnel.lock();
+            tun.handle_verified_packet(packet, dst)
+        };
+
+        match res {
+            TunnResult::Done => {}
+            TunnResult::WriteToNetwork(packet) => self.send_to_addr(packet, message.src),
+            TunnResult::Err(e) => {
+                tracing::warn!(message = "Failed to handle handshake", error = ?e);
+                return;
+            }
+            _ => {
+                tracing::error!("Unexpected result from handshake");
+                return;
+            }
+        }
+
+        self.flush_queued(peer, message.src, dst);
+
+        if peer.set_endpoint(message.src) {
+            self.notify_inbound();
+        }
+
+        // This message was OK, that means we want to create a connected socket for this peer
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        {
+            if self.config.use_connected_socket {
+                match peer.connect_endpoint(self.listen_port, self.config.skt_buffer_size) {
+                    Ok(_) => self.notify_inbound(),
+                    Err(Error::Connect(_)) => {}
+                    Err(e) => tracing::error!(
+                        message = "Failed to create connected socket for a peer",
+                        public_key = peer.public_key.1,
+                        error = ?e
+                    ),
+                }
+            }
+        }
     }
 
     fn initiate_requested_handshakes(&self, dst: &mut [u8]) {
@@ -892,10 +1003,14 @@ impl Device {
                 let mut tun = peer.tunnel.lock();
                 tun.initiate_requested_handshake(dst)
             };
+            let addr = peer.endpoint().addr;
 
-            let packet = match res {
-                TunnResult::Done => continue,
-                TunnResult::WriteToNetwork(packet) => packet,
+            match res {
+                TunnResult::Done => {}
+                TunnResult::WriteToNetwork(packet) => match addr {
+                    Some(addr) => self.send_to_addr(packet, addr),
+                    None => tracing::error!("No endpoint"),
+                },
                 TunnResult::Err(e) => {
                     tracing::error!(message = "Handshake initiation error", error = ?e, public_key = peer.public_key.1);
                     continue;
@@ -906,24 +1021,31 @@ impl Device {
                 }
             };
 
-            let Some(addr) = peer.endpoint().addr else {
-                tracing::error!("No endpoint");
-                continue;
-            };
-
-            let sock = match addr {
-                SocketAddr::V4(_) => self.udp4.as_ref(),
-                SocketAddr::V6(_) => self.udp6.as_ref(),
-            };
-
-            let Some(sock) = sock else {
-                tracing::warn!(message = "Not connected, dropping handshake initiation", dst = ?addr);
-                continue;
-            };
-
-            if let Err(e) = sock.send_to(packet, &addr.into()) {
-                tracing::warn!(message = "Failed to send handshake initiation", error = ?e, dst = ?addr);
+            if let Some(addr) = addr {
+                self.flush_queued(peer, addr, dst);
             }
+        }
+    }
+
+    fn flush_queued(&self, peer: &Peer, addr: SocketAddr, dst: &mut [u8]) {
+        while let TunnResult::WriteToNetwork(packet) = flush_queued_off_lock(&peer.tunnel, dst) {
+            self.send_to_addr(packet, addr);
+        }
+    }
+
+    fn send_to_addr(&self, packet: &[u8], addr: SocketAddr) {
+        let sock = match addr {
+            SocketAddr::V4(_) => self.udp4.as_ref(),
+            SocketAddr::V6(_) => self.udp6.as_ref(),
+        };
+
+        let Some(sock) = sock else {
+            tracing::warn!(message = "Not connected, dropping packet", dst = ?addr);
+            return;
+        };
+
+        if let Err(e) = sock.send_to(packet, &addr.into()) {
+            tracing::warn!(message = "Failed to send packet", error = ?e, dst = ?addr);
         }
     }
 

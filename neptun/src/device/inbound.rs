@@ -1,7 +1,7 @@
 use std::{
     io::{self, Write},
     mem::MaybeUninit,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     ops::ControlFlow,
     os::fd::AsFd,
     sync::{
@@ -12,7 +12,6 @@ use std::{
 
 use nix::poll::{PollFd, PollFlags};
 use socket2::Socket;
-use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     device::{
@@ -21,11 +20,7 @@ use crate::{
         waker::{poll_retry, Resume, Waker},
         Device, DeviceHandle, Error, MAX_PKT_SIZE,
     },
-    noise::{
-        self, errors::WireGuardError, handshake::parse_handshake_anon, rate_limiter::RateLimiter,
-        Packet, Tunn, TunnResult,
-    },
-    x25519,
+    noise::{self, rate_limiter::RateLimiter, Packet, PacketData, Received, Tunn, TunnResult},
 };
 
 pub(super) struct Inbound {
@@ -159,7 +154,6 @@ fn verify_incoming<'a, 'c>(
 struct InboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
-    key_pair: &'a (StaticSecret, PublicKey),
     udp4: &'a Socket,
     udp6: &'a Socket,
     // this is owned, as the `try_clone`d fds must outlive the poll
@@ -172,15 +166,14 @@ enum ViewFailed {
 }
 
 impl<'a> InboundView<'a> {
-    // TODO: move logging out of new
     fn new(device: &'a Device, waker: &'a Waker) -> Result<Self, ViewFailed> {
         let (Some(udp4), Some(udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
             return Err(ViewFailed::NotConnected);
         };
 
-        let Some(key_pair) = device.key_pair.as_ref() else {
+        if device.key_pair.is_none() {
             return Err(ViewFailed::EmptyKeyPair);
-        };
+        }
 
         let conns = device
             .peers
@@ -191,7 +184,7 @@ impl<'a> InboundView<'a> {
                 Some(Conn {
                     peer: Arc::clone(peer),
                     sock,
-                    peer_ip: endpoint.addr.map(|a| a.ip()),
+                    peer_addr: endpoint.addr?,
                 })
             })
             .collect();
@@ -199,14 +192,12 @@ impl<'a> InboundView<'a> {
         Ok(Self {
             device,
             waker,
-            key_pair,
             udp4,
             udp6,
             conns,
         })
     }
 
-    // TODO: refactor into dedicated methods like for outbound
     fn drain_anon(
         &self,
         sock: &Socket,
@@ -245,115 +236,37 @@ impl<'a> InboundView<'a> {
                 }
             };
 
-            // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-            let parsed_packet = match self.device.rate_limiter.as_ref() {
-                Some(rate_limiter) => {
-                    match rate_limiter.verify_packet(Some(sock_addr.ip()), packet, dstbuf) {
-                        Ok(packet) => packet,
-                        Err(TunnResult::WriteToNetwork(cookie)) => {
-                            if let Err(err) = sock.send_to(cookie, &addr) {
-                                tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
-                            }
-                            continue;
-                        }
-                        Err(_) => continue,
+            let parsed_packet = match verify_incoming(
+                self.device.rate_limiter.as_deref(),
+                Some(sock_addr.ip()),
+                packet,
+                dstbuf,
+            ) {
+                Ok(packet) => packet,
+                Err(Some(cookie)) => {
+                    if let Err(err) = sock.send_to(cookie, &addr) {
+                        tracing::warn!(message = "Failed to send cookie", error = ?err, dst = ?addr);
                     }
-                }
-                None => match Tunn::parse_incoming_packet(packet) {
-                    Ok(packet) => packet,
-                    Err(_) => continue,
-                },
-            };
-
-            let peer = match &parsed_packet {
-                Packet::HandshakeInit(p) => {
-                    let (private_key, public_key) = self.key_pair;
-                    parse_handshake_anon(private_key, public_key, p)
-                        .ok()
-                        .and_then(|hh| {
-                            self.device
-                                .peers
-                                .get(&x25519::PublicKey::from(hh.peer_static_public))
-                        })
-                }
-                // TODO: three branches handled in the same way
-                Packet::HandshakeResponse(p) => {
-                    self.device.peers_by_idx.get(&(p.receiver_idx >> 8))
-                }
-                Packet::PacketCookieReply(p) => {
-                    self.device.peers_by_idx.get(&(p.receiver_idx >> 8))
-                }
-                Packet::PacketData(p) => self.device.peers_by_idx.get(&(p.receiver_idx >> 8)),
-            };
-
-            let peer = match peer {
-                None => continue,
-                Some(peer) => peer,
-            };
-
-            let mut flush = false; // Are there packets to send from the queue?
-
-            let res = noise::handle_verified_packet_off_lock(
-                &peer.tunnel,
-                parsed_packet,
-                &mut dstbuf[..],
-            );
-
-            match res {
-                TunnResult::Done => {}
-                TunnResult::Err(err) => {
-                    tracing::warn!(message = "Failed to handle packet", error = ?err);
                     continue;
                 }
-                TunnResult::WriteToNetwork(packet) => {
-                    flush = true;
-                    if let Err(err) = sock.send_to(packet, &addr) {
-                        tracing::warn!(message = "Failed to send packet", error = ?err, dst = ?addr);
-                    }
-                }
-                TunnResult::WriteToTunnel(packet, src_addr) => {
-                    if let Some(callback) = self
-                        .device
-                        .config
-                        .firewall_process_inbound_callback
-                        .as_ref()
-                    {
-                        if !callback(&peer.public_key.0, packet) {
-                            continue;
-                        }
-                    }
+                Err(None) => continue,
+            };
 
-                    if peer.is_allowed_ip(src_addr) {
-                        _ = self.device.iface.as_ref().write(packet);
-                        tracing::trace!(
-                            message = "Writing packet to tunnel",
-                            interface = ?self.device.iface.name(),
-                            packet_length = packet.len(),
-                            src_addr = ?src_addr,
-                            public_key = peer.public_key.1,
-                        );
-                    } else {
-                        tracing::debug!(
-                            message = "Dropping packet from outside of allowed IPs",
-                            src_addr = ?src_addr,
-                        );
-                    }
+            let data = match parsed_packet {
+                Packet::PacketData(data) => data,
+                // handshake messages are handled by the control plane
+                _ => {
+                    self.device.queue_handshake(packet, sock_addr);
+                    continue;
                 }
             };
 
-            if flush {
-                // Flush pending queue
-                loop {
-                    let res = noise::flush_queued_off_lock(&peer.tunnel, &mut dstbuf[..]);
+            let Some(peer) = self.device.peers_by_idx.get(&(data.receiver_idx >> 8)) else {
+                continue;
+            };
 
-                    let TunnResult::WriteToNetwork(packet) = res else {
-                        break;
-                    };
-
-                    if let Err(err) = sock.send_to(packet, &addr) {
-                        tracing::warn!(message = "Failed to flush queue", error = ?err, dst = ?addr);
-                    }
-                }
+            if !self.deliver_data(peer, data, &mut dstbuf[..]) {
+                continue;
             }
 
             if peer.set_endpoint(sock_addr) {
@@ -417,13 +330,13 @@ impl<'a> InboundView<'a> {
             };
 
             if read_bytes > 0 {
-                let mut flush = false;
-
                 #[allow(clippy::indexing_slicing)]
+                let datagram = &rcvbuf[..read_bytes];
+
                 let parsed_packet = match verify_incoming(
                     self.device.rate_limiter.as_deref(),
-                    conn.peer_ip,
-                    rcvbuf[..read_bytes].as_ref(),
+                    Some(conn.peer_addr.ip()),
+                    datagram,
                     dstbuf,
                 ) {
                     Ok(packet) => packet,
@@ -436,68 +349,16 @@ impl<'a> InboundView<'a> {
                     Err(None) => continue,
                 };
 
-                let res = noise::handle_verified_packet_off_lock(
-                    &conn.peer.tunnel,
-                    parsed_packet,
-                    &mut dstbuf[..],
-                );
-
-                match res {
-                    TunnResult::Done => {}
-                    TunnResult::Err(e) => match e {
-                        WireGuardError::DuplicateCounter => {
-                            tracing::error!(message="Decapsulate error",
-                                error=?e)
-                        }
-                        _ => {
-                            tracing::error!(message="Decapsulate error",
-                            error=?e)
-                        }
-                    },
-                    TunnResult::WriteToNetwork(packet) => {
-                        // Respond to handshake packets
-                        flush = true;
-                        if let Err(err) = conn.sock.send(packet) {
-                            tracing::warn!(message="Failed to write packet", error = ?err);
-                        }
+                let data = match parsed_packet {
+                    Packet::PacketData(data) => data,
+                    // handshake messages are handled by the control plane
+                    _ => {
+                        self.device.queue_handshake(datagram, conn.peer_addr);
+                        continue;
                     }
-                    TunnResult::WriteToTunnel(packet, src_addr) => {
-                        if let Some(callback) =
-                            &self.device.config.firewall_process_inbound_callback
-                        {
-                            if !callback(&conn.peer.public_key.0, packet) {
-                                continue;
-                            }
-                        }
+                };
 
-                        if conn.peer.is_allowed_ip(src_addr) {
-                            _ = self.device.iface.as_ref().write(packet);
-                            tracing::trace!(
-                                message = "Writing packet to tunnel",
-                                packet_length = packet.len(),
-                                src_addr = ?src_addr,
-                            );
-                        } else {
-                            tracing::debug!(
-                                message = "Dropping packet from outside of allowed IPs",
-                                src_addr = ?src_addr,
-                            );
-                        }
-                    }
-                }
-
-                if flush {
-                    // Flush pending queue
-                    loop {
-                        let res = noise::flush_queued_off_lock(&conn.peer.tunnel, &mut dstbuf[..]);
-                        let TunnResult::WriteToNetwork(packet) = res else {
-                            break;
-                        };
-                        if let Err(err) = conn.sock.send(packet) {
-                            tracing::warn!(message="Failed to flush queue", error = ?err);
-                        }
-                    }
-                }
+                self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
             } else {
                 // Avoid spin in case of the EOF on a shutdown socket
                 return Ok(ControlFlow::Break(()));
@@ -506,12 +367,62 @@ impl<'a> InboundView<'a> {
 
         Ok(ControlFlow::Continue(()))
     }
+
+    /// Decrypts a data packet and writes it to the tunnel
+    ///
+    /// Returns `true` if the packet should update peer's endpoint
+    fn deliver_data(&self, peer: &Peer, data: PacketData<'_>, dstbuf: &mut [u8]) -> bool {
+        let Received {
+            result,
+            queue_ready,
+        } = noise::decapsulate_data_off_lock(&peer.tunnel, data, dstbuf);
+
+        if queue_ready && peer.request_handshake() {
+            self.device.notify_control();
+        }
+
+        match result {
+            TunnResult::Done => true,
+            TunnResult::WriteToTunnel(packet, src_addr) => {
+                if let Some(callback) = &self.device.config.firewall_process_inbound_callback {
+                    if !callback(&peer.public_key.0, packet) {
+                        return false;
+                    }
+                }
+
+                if peer.is_allowed_ip(src_addr) {
+                    _ = self.device.iface.as_ref().write(packet);
+                    tracing::trace!(
+                        message = "Writing packet to tunnel",
+                        interface = ?self.device.iface.name(),
+                        packet_length = packet.len(),
+                        src_addr = ?src_addr,
+                        public_key = peer.public_key.1,
+                    );
+                } else {
+                    tracing::debug!(
+                        message = "Dropping packet from outside of allowed IPs",
+                        src_addr = ?src_addr,
+                    );
+                }
+                true
+            }
+            TunnResult::Err(e) => {
+                tracing::warn!(message = "Failed to handle packet", error = ?e);
+                false
+            }
+            TunnResult::WriteToNetwork(_) => {
+                tracing::error!("Unexpected result from decapsulate");
+                false
+            }
+        }
+    }
 }
 
 struct Conn {
     peer: Arc<Peer>,
     sock: Socket,
-    peer_ip: Option<IpAddr>,
+    peer_addr: SocketAddr,
 }
 
 enum Slot<'a> {
