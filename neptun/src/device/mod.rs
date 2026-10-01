@@ -184,6 +184,7 @@ pub struct Device {
     data_stop: Arc<AtomicBool>,
     out_waker: Arc<Waker>,
     in_waker: Arc<Waker>,
+    control_waker: Waker,
 }
 
 struct ControlThreadData {
@@ -682,6 +683,7 @@ impl Device {
             data_stop: Arc::new(AtomicBool::new(false)),
             out_waker: Arc::new(Waker::new()?),
             in_waker: Arc::new(Waker::new()?),
+            control_waker: Waker::new()?,
         };
 
         if device.config.open_uapi_socket {
@@ -689,6 +691,7 @@ impl Device {
         }
         device.register_notifiers()?;
         device.register_timers()?;
+        device.register_control_waker()?;
 
         #[cfg(target_os = "macos")]
         {
@@ -866,6 +869,64 @@ impl Device {
         Ok(())
     }
 
+    fn register_control_waker(&self) -> Result<(), Error> {
+        self.queue.new_event(
+            self.control_waker.wait_fd().as_raw_fd(),
+            Box::new(|d, t| {
+                // ACK must come before serving, so a request raised in the meantime wakes the control plane again
+                d.control_waker.ack();
+                d.initiate_requested_handshakes(&mut t.dst_buf[..]);
+                Action::Continue
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn initiate_requested_handshakes(&self, dst: &mut [u8]) {
+        for peer in self.peers.values() {
+            if !peer.take_handshake_request() {
+                continue;
+            }
+
+            let res = {
+                let mut tun = peer.tunnel.lock();
+                tun.initiate_requested_handshake(dst)
+            };
+
+            let packet = match res {
+                TunnResult::Done => continue,
+                TunnResult::WriteToNetwork(packet) => packet,
+                TunnResult::Err(e) => {
+                    tracing::error!(message = "Handshake initiation error", error = ?e, public_key = peer.public_key.1);
+                    continue;
+                }
+                _ => {
+                    tracing::error!("Unexpected result from handshake initiation");
+                    continue;
+                }
+            };
+
+            let Some(addr) = peer.endpoint().addr else {
+                tracing::error!("No endpoint");
+                continue;
+            };
+
+            let sock = match addr {
+                SocketAddr::V4(_) => self.udp4.as_ref(),
+                SocketAddr::V6(_) => self.udp6.as_ref(),
+            };
+
+            let Some(sock) = sock else {
+                tracing::warn!(message = "Not connected, dropping handshake initiation", dst = ?addr);
+                continue;
+            };
+
+            if let Err(e) = sock.send_to(packet, &addr.into()) {
+                tracing::warn!(message = "Failed to send handshake initiation", error = ?e, dst = ?addr);
+            }
+        }
+    }
+
     fn register_timers(&self) -> Result<(), Error> {
         self.queue.new_periodic_event(
             // Reset the rate limiter every second give or take
@@ -978,6 +1039,10 @@ impl Device {
 
     pub fn iface(&self) -> &TunSocket {
         &self.iface
+    }
+
+    pub(crate) fn notify_control(&self) {
+        self.control_waker.wake();
     }
 
     pub(crate) fn notify_inbound(&self) {

@@ -20,7 +20,7 @@ use crate::{
         waker::{poll_retry, Resume, Waker},
         Device, DeviceHandle, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
-    noise::{self, Tunn, TunnResult},
+    noise::{self, Encapsulated, Tunn},
 };
 
 struct CheckedMtu(usize);
@@ -158,17 +158,17 @@ impl<'a> OutboundView<'a> {
             let res = noise::encapsulate_in_place_off_lock(&peer.tunnel, payload.len(), buf);
 
             match res {
-                TunnResult::Done => {}
-                TunnResult::Err(e) => {
+                Encapsulated::Packet(packet) => self.send_packet(&peer, packet),
+                Encapsulated::Queued => {}
+                Encapsulated::NeedsHandshake => {
+                    if peer.request_handshake() {
+                        self.device.notify_control();
+                    }
+                }
+                Encapsulated::Err(e) => {
                     tracing::error!(message = "Encapsulate error",
                         error = ?e,
                         public_key = peer.public_key.1);
-                }
-                TunnResult::WriteToNetwork(packet) => {
-                    self.send_packet(&peer, packet);
-                }
-                _ => {
-                    tracing::error!("Unexpected result from encapsulate");
                 }
             }
         }

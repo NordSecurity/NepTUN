@@ -7,6 +7,7 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
@@ -37,6 +38,7 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    handshake_requested: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -91,7 +93,16 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            handshake_requested: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn request_handshake(&self) -> bool {
+        !self.handshake_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_handshake_request(&self) -> bool {
+        self.handshake_requested.swap(false, Ordering::AcqRel)
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {

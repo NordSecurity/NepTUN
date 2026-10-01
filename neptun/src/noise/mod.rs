@@ -130,6 +130,15 @@ pub enum Packet<'a> {
     PacketData(PacketData<'a>),
 }
 
+/// Packet encapsulation result
+#[allow(dead_code)]
+pub(crate) enum Encapsulated<'a> {
+    Packet(&'a mut [u8]),
+    Queued,
+    NeedsHandshake,
+    Err(WireGuardError),
+}
+
 // Parsed inbound IP packet
 #[derive(Debug)]
 pub enum Decapsulated<'a> {
@@ -335,19 +344,41 @@ impl Tunn {
         self.format_handshake_initiation(dst, false)
     }
 
-    #[inline]
-    pub(crate) fn commit_tx<'a>(
+    /// Data plane no-session path: packet is queued and the handshake is left
+    /// to the control plane.
+    ///
+    /// Returns `true` if a handshake has to be initiated.
+    #[allow(dead_code)]
+    pub(crate) fn queue_for_handshake(
         &mut self,
-        packet: &'a mut [u8],
-        payload_len: usize,
-    ) -> TunnResult<'a> {
+        src_len: usize,
+        dst: &[u8],
+    ) -> Result<bool, WireGuardError> {
+        if src_len.ne(&0) {
+            let packet = dst
+                .get(DATA_OFFSET..src_len + DATA_OFFSET)
+                .ok_or(WireGuardError::InvalidLength)?;
+            self.queue_packet(packet);
+        }
+        Ok(!self.handshake.is_in_progress())
+    }
+
+    /// Initiates a handshake requested by the data plane
+    #[allow(dead_code)]
+    pub(crate) fn initiate_requested_handshake<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        if self.current_session().is_some() {
+            return TunnResult::Done;
+        }
+        self.format_handshake_initiation(dst, false)
+    }
+
+    #[inline]
+    pub(crate) fn commit_tx(&mut self, packet_len: usize, payload_len: usize) {
         self.timer_tick(TimerName::TimeLastPacketSent);
         if payload_len != 0 {
             self.timer_tick(TimerName::TimeLastDataPacketSent);
         }
-        self.tx_bytes += packet.len() as u64;
-
-        TunnResult::WriteToNetwork(packet)
+        self.tx_bytes += packet_len as u64;
     }
 
     #[inline]
@@ -432,7 +463,8 @@ impl Tunn {
             Err(e) => return TunnResult::Err(e),
         };
 
-        self.commit_tx(packet, src_len)
+        self.commit_tx(packet.len(), src_len);
+        TunnResult::WriteToNetwork(packet)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -791,29 +823,44 @@ pub(crate) fn encapsulate_in_place_off_lock<'a>(
     tunnel: &Mutex<Tunn>,
     src_len: usize,
     dst: &'a mut [u8],
-) -> TunnResult<'a> {
-    let mut guard = tunnel.lock();
-    let Some(session) = guard.current_session() else {
-        return guard.queue_and_init(src_len, dst);
+) -> Encapsulated<'a> {
+    let session = {
+        let mut guard = tunnel.lock();
+        match guard.current_session() {
+            Some(session) => session,
+            None => {
+                return match guard.queue_for_handshake(src_len, dst) {
+                    Ok(true) => Encapsulated::NeedsHandshake,
+                    Ok(false) => Encapsulated::Queued,
+                    Err(e) => Encapsulated::Err(e),
+                };
+            }
+        }
     };
-    // Dropping the guard so that the crypto work is done off tunnel lock
-    drop(guard);
 
     // Tunnel lock is released at this point
     let packet = match session.format_packet_data(src_len, dst) {
         Ok(packet) => packet,
-        Err(e) => return TunnResult::Err(e),
+        Err(e) => return Encapsulated::Err(e),
     };
 
     // Reacquiring tunnel lock
-    tunnel.lock().commit_tx(packet, src_len)
+    tunnel.lock().commit_tx(packet.len(), src_len);
+    Encapsulated::Packet(packet)
 }
 
 #[allow(dead_code)]
 pub(crate) fn flush_queued_off_lock<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8]) -> TunnResult<'a> {
-    let payload = match tunnel.lock().dequeue_packet() {
-        Some(p) => p,
-        None => return TunnResult::Done,
+    // Packets stay queued without a session
+    let (session, payload) = {
+        let mut guard = tunnel.lock();
+        let Some(session) = guard.current_session() else {
+            return TunnResult::Done;
+        };
+        let Some(payload) = guard.dequeue_packet() else {
+            return TunnResult::Done;
+        };
+        (session, payload)
     };
     let payload_len = payload.len();
 
@@ -825,13 +872,18 @@ pub(crate) fn flush_queued_off_lock<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8])
         }
     }
 
-    match encapsulate_in_place_off_lock(tunnel, payload_len, dst) {
-        TunnResult::Err(e) => {
+    // Tunnel lock is released at this point
+    let packet = match session.format_packet_data(payload_len, dst) {
+        Ok(packet) => packet,
+        Err(e) => {
             tunnel.lock().requeue_packet(payload);
-            TunnResult::Err(e)
+            return TunnResult::Err(e);
         }
-        other => other,
-    }
+    };
+
+    // Reacquiring tunnel lock
+    tunnel.lock().commit_tx(packet.len(), payload_len);
+    TunnResult::WriteToNetwork(packet)
 }
 
 #[allow(dead_code)]
@@ -840,18 +892,21 @@ pub(crate) fn handle_verified_packet_off_lock<'a, 'd>(
     packet: Packet<'d>,
     dst: &'a mut [u8],
 ) -> TunnResult<'a> {
-    let mut guard = tunnel.lock();
-    let packet = match packet {
-        Packet::PacketData(p) => p,
-        control => return guard.handle_verified_packet(control, dst),
-    };
+    let (session, packet) = {
+        let mut guard = tunnel.lock();
+        let packet = match packet {
+            Packet::PacketData(p) => p,
+            control => return guard.handle_verified_packet(control, dst),
+        };
 
-    let Some(session) = guard.session_for(&packet) else {
-        tracing::trace!("No current session available");
-        return TunnResult::Err(WireGuardError::NoCurrentSession);
+        match guard.session_for(&packet) {
+            Some(session) => (session, packet),
+            None => {
+                tracing::trace!("No current session available");
+                return TunnResult::Err(WireGuardError::NoCurrentSession);
+            }
+        }
     };
-    // Dropping the guard so that the crypto work is done off tunnel lock
-    drop(guard);
 
     // Tunnel lock is released at this point
     let authenticated = match session.receive_packet_data(packet, dst) {
@@ -1496,22 +1551,21 @@ mod tests {
         let mut buf = vec![0; 2048];
         let len = stage(&mut buf, &ip_packet);
 
-        let TunnResult::WriteToNetwork(sent) =
-            encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
+        let result = encapsulate_in_place_off_lock(&tunnel, len, &mut buf);
+        assert!(
+            matches!(result, Encapsulated::NeedsHandshake),
+            "Sending without a session should request a handshake."
+        );
+
+        // control plane starts the handshake
+        let TunnResult::WriteToNetwork(_) = tunnel.lock().initiate_requested_handshake(&mut buf)
         else {
             panic!("Expected handshake initiation.");
         };
-        assert!(
-            matches!(
-                Tunn::parse_incoming_packet(sent),
-                Ok(Packet::HandshakeInit(_))
-            ),
-            "Sending without a session should start a handshake."
-        );
 
         // a keepalive is not queued, handshake is already in progress
         let result = encapsulate_in_place_off_lock(&tunnel, 0, &mut buf);
-        assert!(matches!(result, TunnResult::Done));
+        assert!(matches!(result, Encapsulated::Queued));
 
         let mut tun = tunnel.lock();
         assert_eq!(
@@ -1527,6 +1581,39 @@ mod tests {
     }
 
     #[test]
+    fn requested_handshake_is_initiated_once() {
+        let (mut tun, _) = create_two_tuns();
+        let mut buf = vec![0; 2048];
+
+        let TunnResult::WriteToNetwork(sent) = tun.initiate_requested_handshake(&mut buf) else {
+            panic!("Expected handshake initiation.");
+        };
+
+        assert!(matches!(
+            Tunn::parse_incoming_packet(sent),
+            Ok(Packet::HandshakeInit(_))
+        ));
+        assert!(
+            matches!(tun.initiate_requested_handshake(&mut buf), TunnResult::Done),
+            "A handshake in progress should not be initiated again."
+        )
+    }
+
+    #[test]
+    fn requested_handshake_is_dropped_with_session() {
+        let (mut tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let mut buf = vec![0; 2048];
+
+        assert!(
+            matches!(
+                tun_a.initiate_requested_handshake(&mut buf),
+                TunnResult::Done
+            ),
+            "A handshake request should be dropped once a session is established."
+        )
+    }
+
+    #[test]
     fn encapsulate_with_session_encrypts_and_commits() {
         let (tun_a, mut tun_b) = create_two_tuns_and_handshake();
         let tunnel = Mutex::new(tun_a);
@@ -1535,8 +1622,7 @@ mod tests {
         let len = stage(&mut buf, &ip_packet);
         let tx_before = tx_bytes(&tunnel);
 
-        let TunnResult::WriteToNetwork(sent) =
-            encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
+        let Encapsulated::Packet(sent) = encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
         else {
             panic!("Expected an encrypted packet.");
         };
@@ -1568,7 +1654,7 @@ mod tests {
         let result = encapsulate_in_place_off_lock(&tunnel, len, &mut buf);
         assert!(matches!(
             result,
-            TunnResult::Err(WireGuardError::IncorrectPacketLength)
+            Encapsulated::Err(WireGuardError::IncorrectPacketLength)
         ));
         assert_eq!(
             tx_bytes(&tunnel),
@@ -1667,7 +1753,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_without_session_keeps_single_copy() {
+    fn flush_without_session_leaves_queue_untouched() {
         let (tun_a, _tun_b) = create_two_tuns();
         let tunnel = Mutex::new(tun_a);
         let ip_packet = create_ipv4_udp_packet();
@@ -1676,8 +1762,8 @@ mod tests {
 
         let result = flush_queued_off_lock(&tunnel, &mut buf);
         assert!(
-            matches!(result, TunnResult::WriteToNetwork(_)),
-            "Flushing without a session should start a handshake."
+            matches!(result, TunnResult::Done),
+            "Flushing without a session should neither send nor start a handshake."
         );
 
         let mut tun = tunnel.lock();

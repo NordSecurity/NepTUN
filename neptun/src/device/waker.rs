@@ -50,7 +50,7 @@ impl Waker {
     // TODO: fix error handling
     // Acknowledges reception of a sent signal
     pub fn ack(&self) {
-        self.pending.store(false, Ordering::Release);
+        self.pending.swap(false, Ordering::AcqRel);
 
         let mut buf = [0u8; 1];
         let _ = (&self.reader).read(&mut buf);
