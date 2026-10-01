@@ -5,6 +5,7 @@
 use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
+use crate::serialization::PubKey;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
@@ -288,12 +289,13 @@ struct NoiseParams {
 impl std::fmt::Debug for NoiseParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoiseParams")
-            .field("static_public", &self.static_public)
+            .field("static_public", &PubKey::from(self.static_public))
             .field("static_private", &"<redacted>")
-            .field("peer_static_public", &self.peer_static_public)
+            .field("peer_static_public", &PubKey::from(self.peer_static_public))
             .field("static_shared", &"<redacted>")
             .field("sending_mac1_key", &self.sending_mac1_key)
-            .field("preshared_key", &self.preshared_key)
+            // Secret key material: only whether one is set, never its bytes.
+            .field("preshared_key", &self.preshared_key.map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -358,10 +360,19 @@ struct Cookies {
     write_cookie: Option<[u8; 16]>,
 }
 
-#[derive(Debug)]
 pub struct HalfHandshake {
     pub peer_index: u32,
     pub peer_static_public: [u8; 32],
+}
+
+// Deliberately not derived: a derived Debug would print the whole peer key.
+impl std::fmt::Debug for HalfHandshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HalfHandshake")
+            .field("peer_index", &self.peer_index)
+            .field("peer_static_public", &PubKey::from(self.peer_static_public))
+            .finish()
+    }
 }
 
 pub fn parse_handshake_anon(
@@ -867,7 +878,10 @@ impl Handshake {
                 peer_index,
             } => (chaining_key, hash, peer_ephemeral_public, peer_index),
             _ => {
-                tracing::error!("Unexpected attempt to call send_handshake_response");
+                tracing::error!(
+                    peer = %PubKey::from(self.params.peer_static_public),
+                    "Unexpected attempt to call send_handshake_response"
+                );
                 return Err(WireGuardError::UnexpectedPacket);
             }
         };

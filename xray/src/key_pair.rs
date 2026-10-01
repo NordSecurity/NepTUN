@@ -19,6 +19,12 @@ impl KeyPair {
     }
 }
 
+impl Default for KeyPair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub trait NepTUNKey {
     fn bytes(&self) -> &[u8];
 
