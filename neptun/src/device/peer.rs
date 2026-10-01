@@ -39,6 +39,8 @@ pub struct Peer {
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
     handshake_requested: AtomicBool,
+    endpoint_requested: AtomicBool,
+    requested_endpoint: Mutex<Option<SocketAddr>>,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -94,6 +96,8 @@ impl Peer {
             preshared_key: RwLock::new(preshared_key),
             protect,
             handshake_requested: AtomicBool::new(false),
+            endpoint_requested: AtomicBool::new(false),
+            requested_endpoint: Mutex::new(None),
         }
     }
 
@@ -103,6 +107,26 @@ impl Peer {
 
     pub(crate) fn take_handshake_request(&self) -> bool {
         self.handshake_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn needs_endpoint_update(&self, addr: SocketAddr, connect: bool) -> bool {
+        let endpoint = self.endpoint.read();
+        endpoint.addr != Some(addr) || (connect && endpoint.conn.is_none())
+    }
+
+    /// Requests the control plane to update the endpoint (latest request wins)
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
+    pub(crate) fn request_endpoint(&self, addr: SocketAddr) -> bool {
+        *self.requested_endpoint.lock() = Some(addr);
+        !self.endpoint_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_endpoint_request(&self) -> Option<SocketAddr> {
+        if !self.endpoint_requested.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.requested_endpoint.lock().take()
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
@@ -129,7 +153,6 @@ impl Peer {
     ///
     /// Returns `true` if the peer had a connected socket and it was removed, `false` otherwise.
     pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
-        // this is called per packet on the anonymous inbound path but the endpoint changes are rare;
         // avoid the unnecessary write lock, which contends with the outbound thread's endpoint reads
         if self.endpoint.read().addr == Some(addr) {
             return false;

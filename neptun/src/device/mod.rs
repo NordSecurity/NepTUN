@@ -887,6 +887,7 @@ impl Device {
                 // ACK must come before serving, so a request raised in the meantime wakes the control plane again
                 d.control_waker.ack();
                 d.handle_queued_handshakes(&mut t.dst_buf[..]);
+                d.update_requested_endpoints();
                 d.initiate_requested_handshakes(&mut t.dst_buf[..]);
                 Action::Continue
             }),
@@ -971,24 +972,39 @@ impl Device {
         }
 
         self.flush_queued(peer, message.src, dst);
+        self.update_endpoint(peer, message.src);
+    }
 
-        if peer.set_endpoint(message.src) {
+    fn uses_connected_sockets(&self) -> bool {
+        cfg!(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos"
+        ))) && self.config.use_connected_socket
+    }
+
+    fn update_endpoint(&self, peer: &Peer, addr: SocketAddr) {
+        if peer.set_endpoint(addr) {
             self.notify_inbound();
         }
 
-        // This message was OK, that means we want to create a connected socket for this peer
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        {
-            if self.config.use_connected_socket {
-                match peer.connect_endpoint(self.listen_port, self.config.skt_buffer_size) {
-                    Ok(_) => self.notify_inbound(),
-                    Err(Error::Connect(_)) => {}
-                    Err(e) => tracing::error!(
-                        message = "Failed to create connected socket for a peer",
-                        public_key = peer.public_key.1,
-                        error = ?e
-                    ),
-                }
+        if self.uses_connected_sockets() {
+            match peer.connect_endpoint(self.listen_port, self.config.skt_buffer_size) {
+                Ok(_) => self.notify_inbound(),
+                Err(Error::Connect(_)) => {}
+                Err(e) => tracing::error!(
+                    message = "Failed to create connected socket for a peer",
+                    public_key = peer.public_key.1,
+                    error = ?e,
+                ),
+            }
+        }
+    }
+
+    fn update_requested_endpoints(&self) {
+        for peer in self.peers.values() {
+            if let Some(addr) = peer.take_endpoint_request() {
+                self.update_endpoint(peer, addr);
             }
         }
     }

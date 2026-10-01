@@ -204,8 +204,6 @@ impl<'a> InboundView<'a> {
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
-        let mut resnapshot = false;
-
         loop {
             if self.waker.is_pending() {
                 self.waker.ack();
@@ -269,31 +267,10 @@ impl<'a> InboundView<'a> {
                 continue;
             }
 
-            if peer.set_endpoint(sock_addr) {
-                resnapshot = true;
-            }
-
-            // This packet was OK, that means we want to create a connected socket for this peer
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+            if peer.needs_endpoint_update(sock_addr, self.device.uses_connected_sockets())
+                && peer.request_endpoint(sock_addr)
             {
-                if self.device.config.use_connected_socket {
-                    if let Err(e) = peer.connect_endpoint(
-                        self.device.listen_port,
-                        self.device.config.skt_buffer_size,
-                    ) {
-                        tracing::error!(
-                            message = "Failed to create connected socket for a peer",
-                            public_key = peer.public_key.1,
-                            error = ?e
-                        );
-                    } else {
-                        resnapshot = true;
-                    }
-                }
-            }
-
-            if resnapshot {
-                return Ok(ControlFlow::Break(()));
+                self.device.notify_control();
             }
         }
 
