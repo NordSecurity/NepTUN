@@ -57,7 +57,9 @@ use thiserror::Error;
 use tun::TunSocket;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{DispatchGroup, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime};
+use dispatch2::{
+    DispatchGroup, DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use {
@@ -257,6 +259,7 @@ pub struct Device {
     in_waker: Arc<Waker>,
     control_waker: Waker,
     handshake_queue: Mutex<VecDeque<HandshakeMessage>>,
+    conns_drop_requested: AtomicBool,
 }
 
 struct ControlThreadData {
@@ -302,9 +305,13 @@ impl DeviceThread {
     {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         let thread = {
+            let attr = DispatchQueueAttr::with_qos_class(
+                DispatchQueueAttr::SERIAL,
+                DispatchQoS::UserInitiated,
+                0,
+            );
+            let queue = DispatchQueue::new(name, Some(&attr));
             let group = DispatchGroup::new();
-            let queue = DispatchQueue::new(name, DispatchQueueAttr::SERIAL);
-            // TODO: ensure P-core preference for execution
             group.exec_async(&queue, runner);
             group
         };
@@ -445,8 +452,12 @@ impl DeviceHandle {
         self.device.read().trigger_exit();
     }
 
+    /// Requests dropping all connected sockets.
+    ///
+    /// Control thread drops them asynchronously, so they can still be in use
+    /// shortly after this function returns.
     pub fn drop_connected_sockets(&self) {
-        self.device.read().drop_connected_sockets();
+        self.device.read().request_drop_connected_sockets();
 
         // No connected sockets on Apple; rebuild the shared socket instead,
         // or it wedges with EAGAIN after a network change (LLT-7562).
@@ -772,6 +783,7 @@ impl Device {
             in_waker: Arc::new(Waker::new()?),
             control_waker: Waker::new()?,
             handshake_queue: Mutex::new(VecDeque::new()),
+            conns_drop_requested: AtomicBool::new(false),
         };
 
         if device.config.open_uapi_socket {
@@ -944,8 +956,8 @@ impl Device {
         self.queue.new_event(
             self.control_waker.wait_fd().as_raw_fd(),
             Box::new(|d, t| {
-                // ACK must come before serving, so a request raised in the meantime wakes the control plane again
-                d.control_waker.ack();
+                d.control_waker.ack(); // ACK must come before serving, so a request raised in the meantime wakes the control plane again
+                d.disconnect_requested(); // drop stale connected sockets before the handshakes open new ones
                 d.handle_queued_handshakes(&mut t.dst_buf[..]);
                 d.update_requested_endpoints();
                 d.initiate_requested_handshakes(&mut t.dst_buf[..]);
@@ -1064,6 +1076,7 @@ impl Device {
     fn update_requested_endpoints(&self) {
         for peer in self.peers.values() {
             if let Some(addr) = peer.take_endpoint_request() {
+                let _span = peer_span(peer.public_key);
                 self.update_endpoint(peer, addr);
             }
         }
@@ -1214,13 +1227,20 @@ impl Device {
         }
     }
 
-    pub(crate) fn drop_connected_sockets(&self) {
+    pub(crate) fn request_drop_connected_sockets(&self) {
+        if !self.conns_drop_requested.swap(true, Ordering::AcqRel) {
+            self.notify_control();
+        }
+    }
+
+    fn disconnect_requested(&self) {
+        let drop_all = self.conns_drop_requested.swap(false, Ordering::AcqRel);
         let mut conn_skts_changed = false;
 
         for peer in self.peers.values() {
-            let endpoint = peer.endpoint();
-            if endpoint.conn.is_some() {
-                drop(endpoint);
+            let requested = peer.take_disconnect_request();
+            if requested || drop_all {
+                let _span = peer_span(peer.public_key);
                 conn_skts_changed |= peer.shutdown_endpoint();
             }
         }

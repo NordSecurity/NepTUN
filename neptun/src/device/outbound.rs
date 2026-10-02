@@ -56,8 +56,7 @@ impl Outbound {
     pub fn run(&self) {
         if let Err(e) = self.main_loop() {
             tracing::error!(message = "Critical outbound thread failure, closing device", error = ?e);
-            let mut d = self.device.read();
-            DeviceHandle::close_device(&mut d);
+            self.device.read().trigger_exit();
         }
     }
 
@@ -194,6 +193,7 @@ impl<'a> OutboundView<'a> {
             .iface
             .read(&mut buf[WG_HEADER_OFFSET..WG_HEADER_OFFSET + mtu.get()])
         {
+            Ok([]) => IfaceReadResult::Exhausted,
             Ok(payload) => match Tunn::dst_address(payload) {
                 None => IfaceReadResult::Skip,
                 Some(dst_addr) => match self.device.peers_by_ip.find(dst_addr) {
@@ -236,9 +236,8 @@ impl<'a> OutboundView<'a> {
                 }
                 Err(err) => {
                     tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                    drop(endpoint);
-                    if peer.shutdown_endpoint() {
-                        self.device.notify_inbound();
+                    if peer.request_disconnect() {
+                        self.device.notify_control();
                     }
                 }
             }
