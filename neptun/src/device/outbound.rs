@@ -18,7 +18,7 @@ use crate::{
         peer::Peer,
         tun::TunSocket,
         waker::{poll_retry, Resume, Waker},
-        Device, DeviceHandle, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
+        Device, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
     noise::{self, Encapsulated, Tunn},
 };
@@ -56,8 +56,7 @@ impl Outbound {
     pub fn run(&self) {
         if let Err(e) = self.run_thread_main_loop() {
             tracing::error!(message = "Critical outbound thread failure, closing device", error = ?e);
-            let mut d = self.device.read();
-            DeviceHandle::close_device(&mut d);
+            self.device.read().trigger_exit();
         }
     }
 
@@ -192,10 +191,10 @@ impl<'a> OutboundView<'a> {
             ));
         }
 
-        // On TUN iface change break out of TUN waiting loop to re-read the Device config
         if tun_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            tracing::warn!(message = "TUN iface invalidated", revents = ?tun_revents);
-            return Ok(ControlFlow::Break(Resume::OnWake));
+            return Err(Error::InternalError(format!(
+                "TUN iface invalidated: {tun_revents:?}"
+            )));
         }
 
         Ok(ControlFlow::Continue(()))
@@ -255,9 +254,8 @@ impl<'a> OutboundView<'a> {
                 }
                 Err(err) => {
                     tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                    drop(endpoint);
-                    if peer.shutdown_endpoint() {
-                        self.device.notify_inbound();
+                    if peer.request_disconnect() {
+                        self.device.notify_control();
                     }
                 }
             }

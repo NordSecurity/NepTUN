@@ -18,10 +18,13 @@ use crate::{
         dev_lock::Lock,
         peer::Peer,
         waker::{poll_retry, Resume, Waker},
-        Device, DeviceHandle, Error, MAX_PKT_SIZE,
+        Device, Error, MAX_PKT_SIZE,
     },
     noise::{self, rate_limiter::RateLimiter, Packet, PacketData, Received, Tunn, TunnResult},
 };
+
+/// drain batch size limit to prevent a busy socket from starving the others
+const MAX_DRAIN_BATCH: usize = 128;
 
 pub(super) struct Inbound {
     device: Arc<Lock<Device>>,
@@ -41,8 +44,7 @@ impl Inbound {
     pub fn run(&self) {
         if let Err(e) = self.run_thread_main_loop() {
             tracing::error!(message = "Critical inbound thread failure, closing device", error = ?e);
-            let mut d = self.device.read();
-            DeviceHandle::close_device(&mut d);
+            self.device.read().trigger_exit();
         }
     }
 
@@ -100,16 +102,22 @@ impl Inbound {
                     )));
                 }
 
-                if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                if revents.contains(PollFlags::POLLHUP) {
+                    // only a local shutdown hangs up a UDP socket
+                    invalidated = true;
+                    continue;
+                }
+
+                if revents.contains(PollFlags::POLLERR) {
                     match slot {
                         Slot::Conn(conn) => {
-                            tracing::debug!(message = "Connected socket failed", revents = ?revents);
-                            let _ = conn.peer.shutdown_endpoint();
-                            invalidated = true;
+                            let error = conn.sock.take_error();
+                            tracing::debug!(message = "Connected socket failed", error = ?error);
+                            view.request_disconnect(&conn.peer);
                         }
-                        Slot::Anon(_) => {
-                            tracing::warn!(message = "UDP socket invalidated", revents = ?revents);
-                            invalidated = true;
+                        Slot::Anon(sock) => {
+                            let error = sock.take_error();
+                            tracing::warn!(message = "UDP socket error", error = ?error);
                         }
                     }
                     continue;
@@ -204,7 +212,7 @@ impl<'a> InboundView<'a> {
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
-        loop {
+        for _ in 0..MAX_DRAIN_BATCH {
             if self.waker.is_pending() {
                 self.waker.ack();
                 return Ok(ControlFlow::Break(()));
@@ -283,7 +291,7 @@ impl<'a> InboundView<'a> {
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<ControlFlow<()>, Error> {
-        loop {
+        for _ in 0..MAX_DRAIN_BATCH {
             if self.waker.is_pending() {
                 self.waker.ack();
                 return Ok(ControlFlow::Break(()));
@@ -300,8 +308,8 @@ impl<'a> InboundView<'a> {
                     io::ErrorKind::Interrupted => continue,
                     _ => {
                         tracing::warn!(message = "Connected socket recv failed", error = ?e);
-                        let _ = conn.peer.shutdown_endpoint();
-                        return Ok(ControlFlow::Break(()));
+                        self.request_disconnect(&conn.peer);
+                        break;
                     }
                 },
             };
@@ -392,6 +400,12 @@ impl<'a> InboundView<'a> {
                 tracing::error!("Unexpected result from decapsulate");
                 false
             }
+        }
+    }
+
+    fn request_disconnect(&self, peer: &Peer) {
+        if peer.request_disconnect() {
+            self.device.notify_control();
         }
     }
 }

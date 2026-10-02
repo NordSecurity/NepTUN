@@ -38,9 +38,11 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    // control plane fields
     handshake_requested: AtomicBool,
     endpoint_requested: AtomicBool,
     requested_endpoint: Mutex<Option<SocketAddr>>,
+    disconnect_requested: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -98,6 +100,7 @@ impl Peer {
             handshake_requested: AtomicBool::new(false),
             endpoint_requested: AtomicBool::new(false),
             requested_endpoint: Mutex::new(None),
+            disconnect_requested: AtomicBool::new(false),
         }
     }
 
@@ -190,21 +193,18 @@ impl Peer {
         )]
         skt_buffer_size: Option<usize>,
     ) -> Result<socket2::Socket, Error> {
-        let mut endpoint = self.endpoint.write();
-
-        if endpoint.conn.is_some() {
-            return Err(Error::Connect("Connected".to_owned()));
-        }
-
-        let addr = endpoint.addr.ok_or_else(||
-            {
-                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
-                Error::InternalError(
-                    "Peer endpoint was not specified".to_owned(),
-                )
+        let addr = {
+            let endpoint = self.endpoint.read();
+            if endpoint.conn.is_some() {
+                return Err(Error::Connect("Connected".to_owned()));
             }
-        )?;
+            endpoint.addr.ok_or_else(|| {
+                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
+                Error::InternalError("Peer endpoint was not specified".to_owned())
+            })?
+        };
 
+        // Socket is set up without the endpoint lock, so it does not block data plane's endpoint reads
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         udp_conn.set_reuse_address(true)?;
@@ -220,20 +220,43 @@ impl Peer {
         // Also mind that all socket setup functions should be called before .connect().
         udp_conn.connect(&addr.into())?;
 
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        if let Some(buffer_size) = skt_buffer_size {
+            modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
+        }
+
+        let conn = udp_conn.try_clone()?;
+        {
+            let mut endpoint = self.endpoint.write();
+            if endpoint.conn.is_some() {
+                return Err(Error::Connect("Connected".to_owned()));
+            }
+            if endpoint.addr != Some(addr) {
+                return Err(Error::Connect(
+                    "Endpoint changed while connecting".to_owned(),
+                ));
+            }
+            endpoint.conn = Some(conn);
+        }
+
         tracing::info!(
             message="Connected endpoint",
             port=port,
             endpoint=?addr
         );
 
-        endpoint.conn = Some(udp_conn.try_clone()?);
-
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        if let Some(buffer_size) = skt_buffer_size {
-            modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
-        }
-
         Ok(udp_conn)
+    }
+
+    /// Requests the control plane to remove the connected socket
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
+    pub(crate) fn request_disconnect(&self) -> bool {
+        !self.disconnect_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_disconnect_request(&self) -> bool {
+        self.disconnect_requested.swap(false, Ordering::AcqRel)
     }
 
     pub fn is_allowed_ip<I: Into<IpAddr>>(&self, addr: I) -> bool {
