@@ -273,8 +273,6 @@ impl WGHandle {
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
                 skt_buffer_size: None,
-                inter_thread_channel_size: None,
-                max_inter_thread_batched_pkts: None,
             },
         )
     }
@@ -505,8 +503,6 @@ fn test_wg_start_ipv4_non_connected() {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
-            inter_thread_channel_size: None,
-            max_inter_thread_batched_pkts: None,
         },
     );
 
@@ -801,8 +797,6 @@ fn test_wg_start_ipv6_endpoint_not_connected() {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
-            inter_thread_channel_size: None,
-            max_inter_thread_batched_pkts: None,
         },
     );
 
