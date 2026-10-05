@@ -8,10 +8,8 @@ use std::mem;
 use std::ops::{Index, IndexMut};
 use std::time::SystemTime;
 
-use base64::{engine::general_purpose, Engine};
 #[cfg(feature = "mock-instant")]
 use mock_instant::thread_local::Instant;
-use x25519_dalek::PublicKey;
 
 #[cfg(not(any(
     feature = "mock-instant",
@@ -43,18 +41,6 @@ pub(crate) const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub(crate) const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
-
-// Privacy-aware public key formatter. Aligns with libtelio approach of logging
-// the first and last 4 chars of the key for better diagnostics while
-// not revealing the full key.
-fn format_pubkey_short(&key: &PublicKey) -> String {
-    let encoded = general_purpose::STANDARD.encode(key);
-    if encoded.len() <= 8 {
-        encoded
-    } else {
-        format!("{}...{}", &encoded[..4], &encoded[encoded.len() - 4..])
-    }
-}
 
 #[derive(Debug)]
 pub enum TimerName {
@@ -205,7 +191,6 @@ impl Tunn {
                 if let Some(session) = self.sessions[i].take() {
                     tracing::info!(
                         message = "SESSION_EXPIRED(REJECT_AFTER_TIME)",
-                        peer = format_pubkey_short(&self.peer_static_public),
                         session = session.receiving_index
                     );
                 }
@@ -255,10 +240,7 @@ impl Tunn {
             // All ephemeral private keys and symmetric session keys are zeroed out after
             // (REJECT_AFTER_TIME * 3) ms if no new keys have been exchanged.
             if now - session_established >= REJECT_AFTER_TIME * 3 {
-                tracing::info!(
-                    message = "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)",
-                    peer = format_pubkey_short(&self.peer_static_public)
-                );
+                tracing::info!(message = "CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)",);
                 self.clear_all();
 
                 if persistent_keepalive > 0 {
@@ -279,7 +261,6 @@ impl Tunn {
                     tracing::info!(
                         message = "CONNECTION_EXPIRED
                         (REKEY_ATTEMPT_TIME)",
-                        peer = format_pubkey_short(&self.peer_static_public)
                     );
                     self.clear_all();
 
@@ -297,10 +278,7 @@ impl Tunn {
                     // A handshake initiation is retried after REKEY_TIMEOUT + jitter ms,
                     // if a response has not been received, where jitter is some random
                     // value between 0 and 333 ms.
-                    tracing::debug!(
-                        message = "HANDSHAKE(REKEY_TIMEOUT)",
-                        peer = format_pubkey_short(&self.peer_static_public)
-                    );
+                    tracing::debug!(message = "HANDSHAKE(REKEY_TIMEOUT)",);
                     handshake_initiation_required = true;
                 }
             } else {
@@ -313,10 +291,7 @@ impl Tunn {
                     if session_established < data_packet_sent
                         && now - session_established >= REKEY_AFTER_TIME
                     {
-                        tracing::debug!(
-                            message = "HANDSHAKE(REKEY_AFTER_TIME (on send))",
-                            peer = format_pubkey_short(&self.peer_static_public)
-                        );
+                        tracing::debug!(message = "HANDSHAKE(REKEY_AFTER_TIME (on send))",);
                         handshake_initiation_required = true;
                     }
 
@@ -332,7 +307,6 @@ impl Tunn {
                             message = "HANDSHAKE(REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - \
                         REKEY_TIMEOUT \
                         (on receive))",
-                            peer = format_pubkey_short(&self.peer_static_public)
                         );
                         handshake_initiation_required = true;
                     }
@@ -349,10 +323,7 @@ impl Tunn {
                     })
                     .unwrap_or_default()
                 {
-                    tracing::debug!(
-                        message = "HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)",
-                        peer = format_pubkey_short(&self.peer_static_public)
-                    );
+                    tracing::debug!(message = "HANDSHAKE(KEEPALIVE + REKEY_TIMEOUT)",);
                     handshake_initiation_required = true;
                     self.timers.want_handshake_since = None;
                 }
@@ -364,10 +335,7 @@ impl Tunn {
                         && now - aut_packet_sent >= KEEPALIVE_TIMEOUT
                         && mem::replace(&mut self.timers.want_keepalive, false)
                     {
-                        tracing::debug!(
-                            message = "KEEPALIVE(KEEPALIVE_TIMEOUT)",
-                            peer = format_pubkey_short(&self.peer_static_public)
-                        );
+                        tracing::debug!(message = "KEEPALIVE(KEEPALIVE_TIMEOUT)",);
                         keepalive_required = true;
                     }
 
@@ -377,10 +345,7 @@ impl Tunn {
                             >= Duration::from_secs(persistent_keepalive as _))
                             || self.time_since_last_handshake().is_none())
                     {
-                        tracing::debug!(
-                            message = "KEEPALIVE(PERSISTENT_KEEPALIVE)",
-                            peer = format_pubkey_short(&self.peer_static_public)
-                        );
+                        tracing::debug!(message = "KEEPALIVE(PERSISTENT_KEEPALIVE)",);
                         self.timer_tick(TimePersistentKeepalive);
                         keepalive_required = true;
                     }
@@ -435,17 +400,5 @@ impl Tunn {
 
     pub fn set_persistent_keepalive(&mut self, keepalive: u16) {
         self.timers.persistent_keepalive = keepalive as usize;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_pubkey_short;
-    use x25519_dalek::PublicKey;
-
-    #[test]
-    fn test_pubkey_format() {
-        let key = PublicKey::from([1u8; 32]);
-        assert_eq!(format_pubkey_short(&key), "AQEB...AQE=");
     }
 }

@@ -225,7 +225,7 @@ fn write_to_socket_worker(
                                 Some(b) => b,
                                 None => continue,
                             };
-                            if !callback(&element.peer.public_key.0, buffer, &mut element.iface.as_ref()) {
+                            if !callback(element.peer.public_key.as_bytes(), buffer, &mut element.iface.as_ref()) {
                                 continue;
                             }
                         }
@@ -258,12 +258,12 @@ fn write_to_tun_worker(
                         let buffer = match t.buffer.get_mut(..t.buf_len) {
                             Some(b) => b,
                             None => {
-                                tracing::warn!("Length is greater than buffer space");
+                                tracing::warn!(peer = %peer.public_key, "Length is greater than buffer space");
                                 continue
                             },
                         };
                         if let Some(callback) = &firewall_process_inbound_callback {
-                            if !callback(&peer.public_key.0, buffer) {
+                            if !callback(peer.public_key.as_bytes(), buffer) {
                                 continue;
                             }
                         }
@@ -273,7 +273,7 @@ fn write_to_tun_worker(
                                 message = "Writing packet to tunnel",
                                 packet_length = t.buf_len,
                                 src_addr = ?t.addr,
-                                public_key = peer.public_key.1
+                                peer = %peer.public_key,
                             );
                         }
                     }
