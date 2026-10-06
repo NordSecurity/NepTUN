@@ -10,12 +10,13 @@ pub mod safe_duration;
 mod session;
 mod timers;
 
+use parking_lot::Mutex;
 use session::DATA_OFFSET;
 
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::session::message_data_len;
+use crate::noise::session::{message_data_len, Session};
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
@@ -65,7 +66,7 @@ pub struct Tunn {
     /// The handshake currently in progress
     handshake: handshake::Handshake,
     /// The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
-    sessions: [Option<session::Session>; N_SESSIONS],
+    sessions: [Option<Arc<session::Session>>; N_SESSIONS],
     /// Index of most recently used session
     current: usize,
     /// Queue to store blocked packets
@@ -127,6 +128,49 @@ pub enum Packet<'a> {
     HandshakeResponse(HandshakeResponse<'a>),
     PacketCookieReply(PacketCookieReply<'a>),
     PacketData(PacketData<'a>),
+}
+
+// Parsed inbound IP packet
+#[derive(Debug)]
+pub enum Decapsulated<'a> {
+    Keepalive,
+    Ip(&'a mut [u8], IpAddr),
+}
+
+impl<'a> Decapsulated<'a> {
+    // Verifies authenticated IP packet and truncates it to the length declared in its header.
+    #[inline]
+    pub(crate) fn parse(buf: &mut [u8]) -> Result<Decapsulated<'_>, WireGuardError> {
+        let version = match buf.first() {
+            // A zero-length payload is a keepalive packet
+            None => return Ok(Decapsulated::Keepalive),
+            Some(first) => first >> 4,
+        };
+
+        let (min_header, declared_len, src_addr) = match version {
+            4 if buf.len() >= IPV4_MIN_HEADER_SIZE => (
+                IPV4_MIN_HEADER_SIZE,
+                read_u16_be(buf, IPV4_LEN_OFF)? as usize,
+                IpAddr::from(read_addr::<IPV4_IP_SZ>(buf, IPV4_SRC_IP_OFF)?),
+            ),
+            6 if buf.len() >= IPV6_MIN_HEADER_SIZE => (
+                IPV6_MIN_HEADER_SIZE,
+                read_u16_be(buf, IPV6_LEN_OFF)? as usize + IPV6_MIN_HEADER_SIZE,
+                IpAddr::from(read_addr::<IPV6_IP_SZ>(buf, IPV6_SRC_IP_OFF)?),
+            ),
+            _ => return Err(WireGuardError::InvalidPacket),
+        };
+
+        if declared_len < min_header {
+            return Err(WireGuardError::InvalidPacket);
+        }
+
+        let payload = buf
+            .get_mut(..declared_len)
+            .ok_or(WireGuardError::InvalidPacket)?;
+
+        Ok(Decapsulated::Ip(payload, src_addr))
+    }
 }
 
 impl Tunn {
@@ -204,20 +248,12 @@ impl Tunn {
 
     pub fn dst_address(packet: &[u8]) -> Option<IpAddr> {
         match packet.first()? >> 4 {
-            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV4_IP_SZ] = packet
-                    .get(IPV4_DST_IP_OFF..IPV4_DST_IP_OFF + IPV4_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
-            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let addr_bytes: [u8; IPV6_IP_SZ] = packet
-                    .get(IPV6_DST_IP_OFF..IPV6_DST_IP_OFF + IPV6_IP_SZ)?
-                    .try_into()
-                    .ok()?;
-                Some(IpAddr::from(addr_bytes))
-            }
+            4 if packet.len() >= IPV4_MIN_HEADER_SIZE => Some(IpAddr::from(
+                read_addr::<IPV4_IP_SZ>(packet, IPV4_DST_IP_OFF).ok()?,
+            )),
+            6 if packet.len() >= IPV6_MIN_HEADER_SIZE => Some(IpAddr::from(
+                read_addr::<IPV6_IP_SZ>(packet, IPV6_DST_IP_OFF).ok()?,
+            )),
             _ => None,
         }
     }
@@ -257,6 +293,88 @@ impl Tunn {
         };
 
         Ok(tunn)
+    }
+
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn current_session(&self) -> Option<Arc<Session>> {
+        self.sessions[self.current % N_SESSIONS].clone()
+    }
+
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    pub(crate) fn session_for(&self, packet: &PacketData<'_>) -> Option<Arc<Session>> {
+        let session_idx = packet.receiver_idx as usize;
+        let session = self.sessions[session_idx % N_SESSIONS].as_ref()?;
+        Some(Arc::clone(session))
+    }
+
+    /// Checks if the `session` is still in the session ring, _i.e._ it wasn't
+    /// replaced or cleared while the lock was released.
+    #[inline]
+    #[allow(clippy::indexing_slicing)]
+    fn is_live(&self, session: &Arc<Session>) -> bool {
+        self.sessions[session.local_index() % N_SESSIONS]
+            .as_ref()
+            .is_some_and(|s| Arc::ptr_eq(s, session))
+    }
+
+    /// The no-session path
+    pub(crate) fn queue_and_init<'a>(
+        &mut self,
+        src_len: usize,
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        if src_len.ne(&0) {
+            match dst.get(DATA_OFFSET..src_len + DATA_OFFSET) {
+                Some(p) => self.queue_packet(p),
+                None => return TunnResult::Err(WireGuardError::InvalidLength),
+            }
+        }
+
+        self.format_handshake_initiation(dst, false)
+    }
+
+    #[inline]
+    pub(crate) fn commit_tx<'a>(
+        &mut self,
+        packet: &'a mut [u8],
+        payload_len: usize,
+    ) -> TunnResult<'a> {
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        if payload_len != 0 {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+        self.tx_bytes += packet.len() as u64;
+
+        TunnResult::WriteToNetwork(packet)
+    }
+
+    #[inline]
+    pub(crate) fn commit_rx<'a>(
+        &mut self,
+        session: &Arc<Session>,
+        decapsulated: Result<Decapsulated<'a>, WireGuardError>,
+    ) -> Result<TunnResult<'a>, WireGuardError> {
+        // for a crypto work done off-lock, the session might be gone at the time of committing
+        if !self.is_live(session) {
+            return Err(WireGuardError::NoCurrentSession);
+        }
+        self.set_current_session(session.local_index());
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+
+        match decapsulated {
+            Ok(Decapsulated::Keepalive) => {
+                self.rx_bytes += message_data_len(0) as u64;
+                Ok(TunnResult::Done)
+            }
+            Ok(Decapsulated::Ip(packet, src_addr)) => {
+                self.timer_tick(TimerName::TimeLastDataPacketReceived);
+                self.rx_bytes += message_data_len(packet.len()) as u64;
+                Ok(TunnResult::WriteToTunnel(packet, src_addr))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Update the private key and clear existing sessions
@@ -305,36 +423,16 @@ impl Tunn {
         src_len: usize,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
-        let current = self.current;
-        #[allow(clippy::indexing_slicing)]
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
-            // Send the packet using an established session
-            let packet = match session.format_packet_data(src_len, dst) {
-                Ok(packet) => packet,
-                Err(e) => return TunnResult::Err(e),
-            };
-            self.timer_tick(TimerName::TimeLastPacketSent);
-            // Exclude Keepalive packets from timer update.
-            if src_len.ne(&0) {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
-            }
-            self.tx_bytes += packet.len() as u64;
-            return TunnResult::WriteToNetwork(packet);
-        }
+        let Some(session) = self.current_session() else {
+            return self.queue_and_init(src_len, dst);
+        };
 
-        if src_len.ne(&0) {
-            // If there is no session, queue the packet for future retry,
-            // except if it's keepalive packet, new keepalive packets will be sent when session is created.
-            // This prevents double keepalive packets on initiation
-            if let Some(d) = dst.get(DATA_OFFSET..src_len + DATA_OFFSET) {
-                self.queue_packet(d);
-            } else {
-                return TunnResult::Err(WireGuardError::InvalidLength);
-            }
-        }
+        let packet = match session.format_packet_data(src_len, dst) {
+            Ok(packet) => packet,
+            Err(e) => return TunnResult::Err(e),
+        };
 
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        self.commit_tx(packet, src_len)
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -381,7 +479,7 @@ impl Tunn {
 
     #[cfg(feature = "xray")]
     pub fn decrypt<'a>(
-        &mut self,
+        &self,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> Result<&'a [u8], WireGuardError> {
@@ -406,10 +504,9 @@ impl Tunn {
                     session.decrypt_data_packet(p, dst)?
                 };
 
-                match self.validate_decapsulated_packet(decapsulated_packet) {
-                    TunnResult::WriteToTunnel(p, _) => Ok(p),
-                    TunnResult::Err(err) => Err(err),
-                    _ => Err(WireGuardError::UnexpectedPacket),
+                match Decapsulated::parse(decapsulated_packet)? {
+                    Decapsulated::Ip(packet, _) => Ok(packet),
+                    Decapsulated::Keepalive => Err(WireGuardError::UnexpectedPacket),
                 }
             }
             _ => Err(WireGuardError::WrongPacketType),
@@ -450,7 +547,7 @@ impl Tunn {
         let index = session.local_index();
         #[allow(clippy::indexing_slicing)]
         {
-            self.sessions[index % N_SESSIONS] = Some(session);
+            self.sessions[index % N_SESSIONS] = Some(Arc::new(session));
         }
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
@@ -487,7 +584,7 @@ impl Tunn {
         #[allow(clippy::indexing_slicing)]
         let index = {
             let idx = l_idx % N_SESSIONS;
-            self.sessions[idx] = Some(session);
+            self.sessions[idx] = Some(Arc::new(session));
             idx
         };
 
@@ -548,24 +645,16 @@ impl Tunn {
         dst: &'a mut [u8],
     ) -> Result<TunnResult<'a>, WireGuardError> {
         let r_idx = packet.receiver_idx as usize;
-        let idx = r_idx % N_SESSIONS;
 
-        // Get the (probably) right session
-        #[allow(clippy::indexing_slicing)]
-        let decapsulated_packet = {
-            let session = self.sessions[idx].as_ref();
-            let session = session.ok_or_else(|| {
-                tracing::trace!(message = "No current session available", remote_idx = r_idx);
-                WireGuardError::NoCurrentSession
-            })?;
-            session.receive_packet_data(packet, dst)?
-        };
+        let session = self.session_for(&packet).ok_or_else(|| {
+            tracing::trace!(message = "No current session available", remote_idx = r_idx);
+            WireGuardError::NoCurrentSession
+        })?;
 
-        self.set_current_session(r_idx);
+        let authenticated = session.receive_packet_data(packet, dst)?;
+        let decapsulated = Decapsulated::parse(authenticated);
 
-        self.timer_tick(TimerName::TimeLastPacketReceived);
-
-        Ok(self.validate_decapsulated_packet(decapsulated_packet))
+        self.commit_rx(&session, decapsulated)
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
@@ -599,74 +688,6 @@ impl Tunn {
             }
             Err(e) => TunnResult::Err(e),
         }
-    }
-
-    /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
-    /// Returns the truncated packet and the source IP as TunnResult
-    fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
-        let (computed_len, src_ip_address) = match packet.len() {
-            0 => {
-                self.rx_bytes += message_data_len(0) as u64;
-                return TunnResult::Done; // This is keepalive, and not an error
-            }
-            #[allow(clippy::indexing_slicing)]
-            _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] =
-                    match packet[IPV4_LEN_OFF..IPV4_LEN_OFF + IP_LEN_SZ].try_into() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Error getting IPV4 len_bytes {}", e);
-                            return TunnResult::Err(WireGuardError::InvalidPacket);
-                        }
-                    };
-                let addr_bytes: [u8; IPV4_IP_SZ] =
-                    match packet[IPV4_SRC_IP_OFF..IPV4_SRC_IP_OFF + IPV4_IP_SZ].try_into() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Error getting IPV4 addr_bytes {}", e);
-                            return TunnResult::Err(WireGuardError::InvalidPacket);
-                        }
-                    };
-                (
-                    u16::from_be_bytes(len_bytes) as usize,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            #[allow(clippy::indexing_slicing)]
-            _ if packet[0] >> 4 == 6 && packet.len() >= IPV6_MIN_HEADER_SIZE => {
-                let len_bytes: [u8; IP_LEN_SZ] =
-                    match packet[IPV6_LEN_OFF..IPV6_LEN_OFF + IP_LEN_SZ].try_into() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Error getting IPV6 len_bytes {}", e);
-                            return TunnResult::Err(WireGuardError::InvalidPacket);
-                        }
-                    };
-                let addr_bytes: [u8; IPV6_IP_SZ] =
-                    match packet[IPV6_SRC_IP_OFF..IPV6_SRC_IP_OFF + IPV6_IP_SZ].try_into() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::error!("Error getting IPV6 addr_bytes {}", e);
-                            return TunnResult::Err(WireGuardError::InvalidPacket);
-                        }
-                    };
-                (
-                    u16::from_be_bytes(len_bytes) as usize + IPV6_MIN_HEADER_SIZE,
-                    IpAddr::from(addr_bytes),
-                )
-            }
-            _ => return TunnResult::Err(WireGuardError::InvalidPacket),
-        };
-
-        let data = match packet.get_mut(..computed_len) {
-            Some(p) => p,
-            None => return TunnResult::Err(WireGuardError::InvalidPacket),
-        };
-
-        self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += message_data_len(computed_len) as u64;
-
-        TunnResult::WriteToTunnel(data, src_ip_address)
     }
 
     /// Get a packet from the queue, and try to encapsulate it
@@ -749,8 +770,108 @@ impl Tunn {
     }
 }
 
+#[inline(always)]
+fn read_u16_be(buf: &[u8], off: usize) -> Result<u16, WireGuardError> {
+    let bytes: [u8; IP_LEN_SZ] = buf
+        .get(off..off + IP_LEN_SZ)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(WireGuardError::InvalidPacket)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+#[inline(always)]
+fn read_addr<const N: usize>(buf: &[u8], off: usize) -> Result<[u8; N], WireGuardError> {
+    buf.get(off..off + N)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(WireGuardError::InvalidPacket)
+}
+
+#[allow(dead_code)]
+pub(crate) fn encapsulate_in_place_off_lock<'a>(
+    tunnel: &Mutex<Tunn>,
+    src_len: usize,
+    dst: &'a mut [u8],
+) -> TunnResult<'a> {
+    let mut guard = tunnel.lock();
+    let Some(session) = guard.current_session() else {
+        return guard.queue_and_init(src_len, dst);
+    };
+    // Dropping the guard so that the crypto work is done off tunnel lock
+    drop(guard);
+
+    // Tunnel lock is released at this point
+    let packet = match session.format_packet_data(src_len, dst) {
+        Ok(packet) => packet,
+        Err(e) => return TunnResult::Err(e),
+    };
+
+    // Reacquiring tunnel lock
+    tunnel.lock().commit_tx(packet, src_len)
+}
+
+#[allow(dead_code)]
+pub(crate) fn flush_queued_off_lock<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8]) -> TunnResult<'a> {
+    let payload = match tunnel.lock().dequeue_packet() {
+        Some(p) => p,
+        None => return TunnResult::Done,
+    };
+    let payload_len = payload.len();
+
+    match dst.get_mut(DATA_OFFSET..DATA_OFFSET + payload_len) {
+        Some(d) => d.copy_from_slice(&payload),
+        None => {
+            tunnel.lock().requeue_packet(payload);
+            return TunnResult::Err(WireGuardError::InvalidLength);
+        }
+    }
+
+    match encapsulate_in_place_off_lock(tunnel, payload_len, dst) {
+        TunnResult::Err(e) => {
+            tunnel.lock().requeue_packet(payload);
+            TunnResult::Err(e)
+        }
+        other => other,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn handle_verified_packet_off_lock<'a, 'd>(
+    tunnel: &Mutex<Tunn>,
+    packet: Packet<'d>,
+    dst: &'a mut [u8],
+) -> TunnResult<'a> {
+    let mut guard = tunnel.lock();
+    let packet = match packet {
+        Packet::PacketData(p) => p,
+        control => return guard.handle_verified_packet(control, dst),
+    };
+
+    let Some(session) = guard.session_for(&packet) else {
+        tracing::trace!("No current session available");
+        return TunnResult::Err(WireGuardError::NoCurrentSession);
+    };
+    // Dropping the guard so that the crypto work is done off tunnel lock
+    drop(guard);
+
+    // Tunnel lock is released at this point
+    let authenticated = match session.receive_packet_data(packet, dst) {
+        Ok(p) => p,
+        Err(e) => return TunnResult::Err(e),
+    };
+
+    let decapsulated = Decapsulated::parse(authenticated);
+
+    // Reacquiring tunnel lock
+    tunnel
+        .lock()
+        .commit_rx(&session, decapsulated)
+        .unwrap_or_else(TunnResult::from)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use crate::noise::timers::{
         REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, REKEY_TIMEOUT,
     };
@@ -1137,5 +1258,566 @@ mod tests {
         let (_, tx, _, _, _) = my_tun.stats();
         assert!(rx >= 1424 * 4_000_000, "Rx bytes overflowed");
         assert!(tx >= 1424 * 4_000_000, "Tx bytes overflowed");
+    }
+
+    const IP_PAYLOAD_LEN: usize = 100;
+    const IPV4_PKT_LEN: usize = IPV4_MIN_HEADER_SIZE + IP_PAYLOAD_LEN;
+    const IPV6_PKT_LEN: usize = IPV6_MIN_HEADER_SIZE + IP_PAYLOAD_LEN;
+    const IPV4_SRC_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 1);
+    const IPV6_SRC_ADDR: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    const IPV4_DST_ADDR: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 2);
+    const IPV6_DST_ADDR: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+
+    fn ipv4_packet<'a>(buf: &'a mut [u8], total_len: u16) -> &'a mut [u8] {
+        const IP_VERSION: u8 = 4;
+        let ip_len_bytes = total_len.to_be_bytes();
+        let src_addr_bytes = IPV4_SRC_ADDR.octets();
+        let dst_addr_bytes = IPV4_DST_ADDR.octets();
+
+        buf[0] = IP_VERSION << 4;
+        buf[2..4].copy_from_slice(&ip_len_bytes);
+        buf[12..16].copy_from_slice(&src_addr_bytes);
+        buf[16..20].copy_from_slice(&dst_addr_bytes);
+
+        buf
+    }
+
+    fn ipv6_packet<'a>(buf: &'a mut [u8], payload_len: u16) -> &'a mut [u8] {
+        const IP_VERSION: u8 = 6;
+        let ip_len_bytes = payload_len.to_be_bytes();
+        let src_addr_bytes = IPV6_SRC_ADDR.octets();
+        let dst_addr_bytes = IPV6_DST_ADDR.octets();
+
+        buf[0] = IP_VERSION << 4;
+        buf[4..6].copy_from_slice(&ip_len_bytes);
+        buf[8..24].copy_from_slice(&src_addr_bytes);
+        buf[24..40].copy_from_slice(&dst_addr_bytes);
+
+        buf
+    }
+
+    #[test]
+    fn test_parse_inbound_ip() {
+        // keepalive packet
+        let keepalive_packet = &mut [];
+        let parsed = Decapsulated::parse(keepalive_packet).unwrap();
+        assert!(
+            matches!(parsed, Decapsulated::Keepalive),
+            "Empty packet should be treated as a keepalive packet."
+        );
+
+        // IPv4 packet
+        let mut buf = [0; IPV4_PKT_LEN];
+        let packet = ipv4_packet(&mut buf, IPV4_PKT_LEN as u16);
+        let expected_payload = packet.to_vec();
+        let parsed = Decapsulated::parse(packet).unwrap();
+        let Decapsulated::Ip(payload, src_addr) = parsed else {
+            panic!("Expected a valid IPv4 packet, but got: {:?}", parsed);
+        };
+        assert_eq!(payload, expected_payload, "Payload bytes mismatch.");
+        assert_eq!(
+            src_addr,
+            IpAddr::V4(IPV4_SRC_ADDR),
+            "Source IP address mismatch."
+        );
+
+        // IPv4 packet of minimal length (header only)
+        let mut buf = [0; IPV4_MIN_HEADER_SIZE];
+        let packet = ipv4_packet(&mut buf, IPV4_MIN_HEADER_SIZE as u16);
+        let expected_payload = packet.to_vec();
+        let parsed = Decapsulated::parse(packet).unwrap();
+        let Decapsulated::Ip(payload, src_addr) = parsed else {
+            panic!("Expected a valid IPv4 packet, but got: {:?}", parsed);
+        };
+        assert_eq!(payload, expected_payload, "Payload bytes mismatch.");
+        assert_eq!(
+            src_addr,
+            IpAddr::V4(IPV4_SRC_ADDR),
+            "Source IP address mismatch."
+        );
+
+        // IPv4 packet with declared length < min header length
+        let mut buf = [0; IPV4_MIN_HEADER_SIZE];
+        let packet = ipv4_packet(&mut buf, (IPV4_MIN_HEADER_SIZE - 1) as u16);
+        assert!(matches!(
+            Decapsulated::parse(packet).unwrap_err(),
+            WireGuardError::InvalidPacket
+        ));
+
+        // IPv4 packet shorter than declared
+        let mut buf = [0; IPV4_PKT_LEN - 1];
+        let packet = ipv4_packet(&mut buf, IPV4_PKT_LEN as u16);
+        assert!(matches!(
+            Decapsulated::parse(packet).unwrap_err(),
+            WireGuardError::InvalidPacket
+        ));
+
+        // IPv6 packet
+        let mut buf = [0; IPV6_PKT_LEN];
+        let packet = ipv6_packet(&mut buf, IP_PAYLOAD_LEN as u16);
+        let expected_payload = packet.to_vec();
+        let parsed = Decapsulated::parse(packet).unwrap();
+        let Decapsulated::Ip(payload, src_addr) = parsed else {
+            panic!("Expected a valid IPv6 packet, but got: {:?}", parsed);
+        };
+        assert_eq!(payload, expected_payload, "Payload bytes mismatch.");
+        assert_eq!(
+            src_addr,
+            IpAddr::V6(IPV6_SRC_ADDR),
+            "Source IP address mismatch."
+        );
+
+        // IPv6 packet of minimal length (header only)
+        let mut buf = [0; IPV6_MIN_HEADER_SIZE];
+        let packet = ipv6_packet(&mut buf, 0);
+        let expected_payload = packet.to_vec();
+        let parsed = Decapsulated::parse(packet).unwrap();
+        let Decapsulated::Ip(payload, src_addr) = parsed else {
+            panic!("Expected a valid IPv6 packet, but got: {:?}", parsed);
+        };
+        assert_eq!(payload, expected_payload, "Payload bytes mismatch.");
+        assert_eq!(
+            src_addr,
+            IpAddr::V6(IPV6_SRC_ADDR),
+            "Source IP address mismatch."
+        );
+
+        // IPv6 packet shorter than declared
+        let mut buf = [0; IPV6_PKT_LEN - 1];
+        let packet = ipv6_packet(&mut buf, IP_PAYLOAD_LEN as u16);
+        assert!(matches!(
+            Decapsulated::parse(packet).unwrap_err(),
+            WireGuardError::InvalidPacket
+        ));
+
+        // invalid IP version
+        let packet = &mut [127; 1];
+        assert!(matches!(
+            Decapsulated::parse(packet).unwrap_err(),
+            WireGuardError::InvalidPacket
+        ));
+    }
+
+    #[test]
+    fn test_dst_address() {
+        // IPv4 packet
+        let mut buf = [0; IPV4_PKT_LEN];
+        let packet = ipv4_packet(&mut buf, IPV4_PKT_LEN as u16);
+        assert_eq!(
+            Tunn::dst_address(packet).unwrap(),
+            IpAddr::V4(IPV4_DST_ADDR)
+        );
+
+        // IPv6 packet
+        let mut buf = [0; IPV6_PKT_LEN];
+        let packet = ipv6_packet(&mut buf, IP_PAYLOAD_LEN as u16);
+        assert_eq!(
+            Tunn::dst_address(packet).unwrap(),
+            IpAddr::V6(IPV6_DST_ADDR)
+        );
+
+        // invalid IP version
+        let packet = &mut [0; 1];
+        assert!(Tunn::dst_address(packet).is_none());
+    }
+
+    #[test]
+    fn commit_rx_rejects_session_cleared_mid_flight() {
+        let (mut tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let ip_packet = create_ipv4_udp_packet();
+        let mut src_buf = vec![0; 2048];
+        let mut dst_buf = vec![0; 2048];
+
+        // receive packet
+        let TunnResult::WriteToNetwork(src) = tun_a.encapsulate(&ip_packet, &mut src_buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+        let Packet::PacketData(data) = Tunn::parse_incoming_packet(src).unwrap() else {
+            panic!("Expected a data packet.");
+        };
+
+        let session = tun_b.session_for(&data).unwrap();
+        let plaintext = session.receive_packet_data(data, &mut dst_buf).unwrap();
+        let decapsulated = Decapsulated::parse(plaintext);
+
+        let rx_bytes = tun_b.stats().2;
+        let result = tun_b.commit_rx(&session, decapsulated);
+        assert!(
+            result.is_ok(),
+            "Result should be OK after committing a packet on a valid session."
+        );
+        assert!(
+            tun_b.stats().2 > rx_bytes,
+            "Rx bytes should grow after committing a packet on a valid session."
+        );
+
+        // receive another packet, but clear session before committing receive
+        let TunnResult::WriteToNetwork(src) = tun_a.encapsulate(&ip_packet, &mut src_buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+        let Packet::PacketData(data) = Tunn::parse_incoming_packet(src).unwrap() else {
+            panic!("Expected a data packet.");
+        };
+
+        let session = tun_b.session_for(&data).unwrap();
+        let plaintext = session.receive_packet_data(data, &mut dst_buf).unwrap();
+        let decapsulated = Decapsulated::parse(plaintext);
+
+        // setting preshared key clears all sessions
+        tun_b.set_preshared_key(None);
+
+        let rx_bytes = tun_b.stats().2;
+        let result = tun_b.commit_rx(&session, decapsulated);
+        assert!(
+            result.is_err(),
+            "Result should err if session was cleared mid flight."
+        );
+        assert_eq!(
+            tun_b.stats().2,
+            rx_bytes,
+            "Rx bytes should not be appended if session was cleared mid flight."
+        )
+    }
+
+    fn stage(buf: &mut [u8], payload: &[u8]) -> usize {
+        buf[DATA_OFFSET..DATA_OFFSET + payload.len()].copy_from_slice(payload);
+        payload.len()
+    }
+
+    fn tx_bytes(tunnel: &Mutex<Tunn>) -> u64 {
+        tunnel.lock().stats().1
+    }
+
+    #[test]
+    fn encapsulate_without_session_queues_packet_and_starts_handshake() {
+        let (tun_a, _tun_b) = create_two_tuns();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut buf = vec![0; 2048];
+        let len = stage(&mut buf, &ip_packet);
+
+        let TunnResult::WriteToNetwork(sent) =
+            encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
+        else {
+            panic!("Expected handshake initiation.");
+        };
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(sent),
+                Ok(Packet::HandshakeInit(_))
+            ),
+            "Sending without a session should start a handshake."
+        );
+
+        // a keepalive is not queued, handshake is already in progress
+        let result = encapsulate_in_place_off_lock(&tunnel, 0, &mut buf);
+        assert!(matches!(result, TunnResult::Done));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(ip_packet),
+            "The packet should wait in the queue for the session."
+        );
+        assert_eq!(
+            tun.dequeue_packet(),
+            None,
+            "A keepalive should not be queued."
+        );
+    }
+
+    #[test]
+    fn encapsulate_with_session_encrypts_and_commits() {
+        let (tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut buf = vec![0; 2048];
+        let len = stage(&mut buf, &ip_packet);
+        let tx_before = tx_bytes(&tunnel);
+
+        let TunnResult::WriteToNetwork(sent) =
+            encapsulate_in_place_off_lock(&tunnel, len, &mut buf)
+        else {
+            panic!("Expected an encrypted packet.");
+        };
+        let sent_len = sent.len() as u64;
+
+        let mut out = vec![0; 2048];
+        let TunnResult::WriteToTunnel(received, _) = tun_b.decapsulate(None, sent, &mut out) else {
+            panic!("Expected to get a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            tx_bytes(&tunnel),
+            tx_before + sent_len,
+            "Tx bytes should grow by the size of the encrypted packet."
+        );
+    }
+
+    #[test]
+    fn encapsulate_failure_does_not_commit() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        // insufficient space for the AEAD tag
+        let mut buf = vec![0; DATA_OFFSET + ip_packet.len()];
+        let len = stage(&mut buf, &ip_packet);
+        let tx_before = tx_bytes(&tunnel);
+
+        let result = encapsulate_in_place_off_lock(&tunnel, len, &mut buf);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::IncorrectPacketLength)
+        ));
+        assert_eq!(
+            tx_bytes(&tunnel),
+            tx_before,
+            "Tx bytes should not grow on failed encryption."
+        );
+    }
+
+    #[test]
+    fn flush_empty_queue_results_in_done() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let mut buf = vec![0; 2048];
+
+        assert!(matches!(
+            flush_queued_off_lock(&tunnel, &mut buf),
+            TunnResult::Done
+        ));
+    }
+
+    #[test]
+    fn flush_sends_queued_packet() {
+        let (tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        let mut buf = vec![0; 2048];
+
+        let TunnResult::WriteToNetwork(sent) = flush_queued_off_lock(&tunnel, &mut buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+
+        let mut out = vec![0; 2048];
+        let TunnResult::WriteToTunnel(received, _) = tun_b.decapsulate(None, sent, &mut out) else {
+            panic!("Expected to get a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            tunnel.lock().dequeue_packet(),
+            None,
+            "Queue should be drained."
+        );
+    }
+
+    #[test]
+    fn flush_requeues_at_front_when_buffer_is_too_small() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let first = create_ipv4_udp_packet();
+        let second = create_large_ipv4_udp_packet();
+        {
+            // requeue pushes to the front
+            let mut tun = tunnel.lock();
+            tun.requeue_packet(second.clone());
+            tun.requeue_packet(first.clone());
+        }
+        let mut buf = vec![0; DATA_OFFSET];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidLength)
+        ));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(first),
+            "The packet should be requeued at the front."
+        );
+        assert_eq!(tun.dequeue_packet(), Some(second));
+    }
+
+    #[test]
+    fn flush_requeues_on_failed_encryption() {
+        let (tun_a, _tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        // insufficient space for the AEAD tag
+        let mut buf = vec![0; DATA_OFFSET + ip_packet.len()];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::IncorrectPacketLength)
+        ));
+
+        let mut tun = tunnel.lock();
+        assert_eq!(
+            tun.dequeue_packet(),
+            Some(ip_packet),
+            "The packet should be requeued."
+        );
+    }
+
+    #[test]
+    fn flush_without_session_keeps_single_copy() {
+        let (tun_a, _tun_b) = create_two_tuns();
+        let tunnel = Mutex::new(tun_a);
+        let ip_packet = create_ipv4_udp_packet();
+        tunnel.lock().requeue_packet(ip_packet.clone());
+        let mut buf = vec![0; 2048];
+
+        let result = flush_queued_off_lock(&tunnel, &mut buf);
+        assert!(
+            matches!(result, TunnResult::WriteToNetwork(_)),
+            "Flushing without a session should start a handshake."
+        );
+
+        let mut tun = tunnel.lock();
+        assert_eq!(tun.dequeue_packet(), Some(ip_packet));
+        assert_eq!(
+            tun.dequeue_packet(),
+            None,
+            "The packet should not be duplicated."
+        );
+    }
+
+    fn encrypt(tun: &mut Tunn, payload: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0; 2048];
+        let TunnResult::WriteToNetwork(packet) = tun.encapsulate(payload, &mut buf) else {
+            panic!("Expected an encrypted packet.");
+        };
+        packet.to_vec()
+    }
+
+    fn rx_bytes(tunnel: &Mutex<Tunn>) -> u64 {
+        tunnel.lock().stats().2
+    }
+
+    #[test]
+    fn handle_data_with_session_decrypts_and_commits() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let ip_packet = create_ipv4_udp_packet();
+        let encrypted = encrypt(&mut tun_a, &ip_packet);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
+        let TunnResult::WriteToTunnel(received, _) =
+            handle_verified_packet_off_lock(&tunnel, packet, &mut dst)
+        else {
+            panic!("Expected a decrypted packet.");
+        };
+
+        assert_eq!(received, ip_packet.as_slice());
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before + message_data_len(ip_packet.len()) as u64,
+            "Rx bytes should grow by the size of the data message."
+        );
+    }
+
+    #[test]
+    fn handle_keepalive_with_session_commits() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let encrypted = encrypt(&mut tun_a, &[]);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
+        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+
+        assert!(matches!(result, TunnResult::Done));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before + message_data_len(0) as u64,
+            "Rx bytes should grow by the size of the keepalive message."
+        );
+    }
+
+    #[test]
+    fn handle_data_without_session_is_rejected() {
+        let (mut tun_a, mut tun_b) = create_two_tuns_and_handshake();
+        let ip_packet = create_ipv4_udp_packet();
+        let encrypted = encrypt(&mut tun_a, &ip_packet);
+
+        // this call clears all sessions
+        tun_b.set_preshared_key(None);
+
+        let tunnel = Mutex::new(tun_b);
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
+        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::NoCurrentSession)
+        ));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before,
+            "Rx bytes should not grow on missing session."
+        );
+    }
+
+    #[test]
+    fn handle_data_decryption_failure_does_not_commit() {
+        let (mut tun_a, tun_b) = create_two_tuns_and_handshake();
+        let tunnel = Mutex::new(tun_b);
+        let ip_packet = create_ipv4_udp_packet();
+        let mut encrypted = encrypt(&mut tun_a, &ip_packet);
+
+        // corrupt AEAD tag
+        *encrypted.last_mut().unwrap() ^= 1;
+
+        let rx_before = rx_bytes(&tunnel);
+        let mut dst = vec![0; 2048];
+
+        let packet = Tunn::parse_incoming_packet(&encrypted).unwrap();
+        let result = handle_verified_packet_off_lock(&tunnel, packet, &mut dst);
+
+        assert!(matches!(
+            result,
+            TunnResult::Err(WireGuardError::InvalidAeadTag)
+        ));
+        assert_eq!(
+            rx_bytes(&tunnel),
+            rx_before,
+            "Rx bytes should not grow on failed decryption."
+        );
+    }
+
+    #[test]
+    fn handle_control_packet_is_passed_to_tunnel() {
+        let (mut tun_a, tun_b) = create_two_tuns();
+        let init = create_handshake_init(&mut tun_a);
+        let tunnel = Mutex::new(tun_b);
+        let mut dst = vec![0; 2048];
+
+        let packet = Tunn::parse_incoming_packet(&init).unwrap();
+        let TunnResult::WriteToNetwork(response) =
+            handle_verified_packet_off_lock(&tunnel, packet, &mut dst)
+        else {
+            panic!("Expected a handshake response.");
+        };
+
+        assert!(
+            matches!(
+                Tunn::parse_incoming_packet(response),
+                Ok(Packet::HandshakeResponse(_))
+            ),
+            "Handshake initiation should be answered by the tunnel."
+        );
     }
 }
