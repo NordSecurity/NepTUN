@@ -92,6 +92,56 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_PKT_SIZE: usize = 1550;
 const MAX_ITR: usize = 100;
 const WG_HEADER_OFFSET: usize = 16;
+const MAX_LISTEN_SOCKET_BIND_ATTEMPTS: usize = 100;
+
+fn bind_listen_sockets(port: u16) -> io::Result<(socket2::Socket, socket2::Socket, u16)> {
+    bind_listen_sockets_with(port, |socket, address| socket.bind(&address.into()))
+}
+
+fn bind_listen_sockets_with<F>(
+    port: u16,
+    mut bind_ipv6: F,
+) -> io::Result<(socket2::Socket, socket2::Socket, u16)>
+where
+    F: FnMut(&socket2::Socket, SocketAddrV6) -> io::Result<()>,
+{
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+        let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        udp_sock4.set_reuse_address(true)?;
+        udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+
+        let bound_port = if port == 0 {
+            udp_sock4
+                .local_addr()?
+                .as_socket()
+                .map(|address| address.port())
+                .ok_or_else(|| io::Error::other("bound socket reported a non-IP address family"))?
+        } else {
+            port
+        };
+
+        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        udp_sock6.set_reuse_address(true)?;
+
+        match bind_ipv6(
+            &udp_sock6,
+            SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bound_port, 0, 0),
+        ) {
+            Ok(()) => return Ok((udp_sock4, udp_sock6, bound_port)),
+            Err(error)
+                if port == 0
+                    && error.kind() == io::ErrorKind::AddrInUse
+                    && attempts < MAX_LISTEN_SOCKET_BIND_ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -766,7 +816,7 @@ impl Device {
         Ok(device)
     }
 
-    fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
+    fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -793,27 +843,10 @@ impl Device {
         }
 
         // Then open new sockets and bind to the port
-        let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock4.set_reuse_address(true)?;
-        udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+        let (udp_sock4, udp_sock6, port) = bind_listen_sockets(port)?;
         udp_sock4.set_nonblocking(true)?;
-        self.config.protect.make_external(udp_sock4.as_raw_fd());
-
-        if port == 0 {
-            // Random port was assigned
-            port = udp_sock4
-                .local_addr()?
-                .as_socket()
-                .map(|s| s.port())
-                .ok_or_else(|| {
-                    Error::GetSockName("bound socket reported a non-IP address family".to_owned())
-                })?;
-        }
-
-        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock6.set_reuse_address(true)?;
-        udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
         udp_sock6.set_nonblocking(true)?;
+        self.config.protect.make_external(udp_sock4.as_raw_fd());
         self.config.protect.make_external(udp_sock6.as_raw_fd());
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -1522,6 +1555,62 @@ impl Default for IndexLfsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_listen_port_retries_ipv6_address_in_use() {
+        let mut ipv6_bind_attempts = 0;
+
+        let (udp_sock4, udp_sock6, port) = bind_listen_sockets_with(0, |socket, address| {
+            ipv6_bind_attempts += 1;
+            if ipv6_bind_attempts == 1 {
+                return Err(io::Error::from(io::ErrorKind::AddrInUse));
+            }
+            socket.bind(&address.into())
+        })
+        .unwrap();
+
+        assert_eq!(ipv6_bind_attempts, 2);
+        assert_ne!(port, 0);
+        assert_eq!(
+            udp_sock4.local_addr().unwrap().as_socket().unwrap().port(),
+            port
+        );
+        assert_eq!(
+            udp_sock6.local_addr().unwrap().as_socket().unwrap().port(),
+            port
+        );
+    }
+
+    #[test]
+    fn random_listen_port_stops_after_maximum_bind_attempts() {
+        let mut ipv6_bind_attempts = 0;
+
+        let error = bind_listen_sockets_with(0, |_, _| {
+            ipv6_bind_attempts += 1;
+            Err(io::Error::from(io::ErrorKind::AddrInUse))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(ipv6_bind_attempts, MAX_LISTEN_SOCKET_BIND_ATTEMPTS);
+    }
+
+    #[test]
+    fn fixed_listen_port_does_not_retry_ipv6_address_in_use() {
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut ipv6_bind_attempts = 0;
+        let error = bind_listen_sockets_with(port, |_, _| {
+            ipv6_bind_attempts += 1;
+            Err(io::Error::from(io::ErrorKind::AddrInUse))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(ipv6_bind_attempts, 1);
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
