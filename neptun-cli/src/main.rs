@@ -5,7 +5,7 @@
 use clap::{value_parser, Arg, Command};
 use daemonize::{Daemonize, Outcome, Parent};
 use neptun::device::drop_privileges::drop_privileges;
-use neptun::device::{DeviceConfig, DeviceHandle};
+use neptun::device::{DataPlaneLayout, DeviceConfig, DeviceHandle};
 use std::fs::File;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
@@ -72,6 +72,10 @@ fn main() {
                 .long("socket-buffer-size")
                 .value_parser(value_parser!(u32))
                 .help("Sets socket buffers to custom size"),
+            Arg::new("single-data-thread")
+                .long("single-data-thread")
+                .action(clap::ArgAction::SetTrue)
+                .help("Handle both Rx and Tx traffic on a single data plane thread"),
         ])
         .get_matches();
 
@@ -141,6 +145,11 @@ fn main() {
         firewall_process_inbound_callback: None,
         firewall_process_outbound_callback: None,
         skt_buffer_size,
+        data_plane_layout: if matches.get_flag("single-data-thread") {
+            DataPlaneLayout::Single
+        } else {
+            DataPlaneLayout::Split
+        },
     };
 
     let mut device_handle: DeviceHandle = match DeviceHandle::new(&tun_name, config) {

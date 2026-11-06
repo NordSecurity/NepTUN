@@ -17,14 +17,12 @@ use crate::{
     device::{
         dev_lock::Lock,
         peer::Peer,
+        tun::TunSocket,
         waker::{poll_retry, Resume, Waker},
-        Device, Error, MAX_PKT_SIZE,
+        Device, Error, MAX_DRAIN_BATCH, MAX_PKT_SIZE,
     },
     noise::{self, rate_limiter::RateLimiter, Packet, PacketData, Received, Tunn, TunnResult},
 };
-
-/// drain batch size limit to prevent a busy socket from starving the others
-const MAX_DRAIN_BATCH: usize = 128;
 
 pub(super) struct Inbound {
     device: Arc<Lock<Device>>,
@@ -71,12 +69,7 @@ impl Inbound {
         let view = match InboundView::new(&device, &self.waker) {
             Ok(v) => v,
             Err(e) => {
-                match e {
-                    ViewFailed::NotConnected => {
-                        tracing::debug!(message = "Not connected, parked until sockets are opened.")
-                    }
-                    ViewFailed::EmptyKeyPair => tracing::trace!(message = "Empty key pair"),
-                }
+                e.log();
                 return Ok(Resume::OnWake);
             }
         };
@@ -92,51 +85,7 @@ impl Inbound {
                 return Ok(Resume::Now);
             }
 
-            let mut invalidated = false;
-
-            for (slot, revents) in poll_set.ready() {
-                if revents.contains(PollFlags::POLLNVAL) {
-                    return Err(Error::InternalError(format!(
-                        "Polled an invalid fd on {}",
-                        slot.kind()
-                    )));
-                }
-
-                if revents.contains(PollFlags::POLLHUP) {
-                    // only a local shutdown hangs up a UDP socket
-                    invalidated = true;
-                    continue;
-                }
-
-                if revents.contains(PollFlags::POLLERR) {
-                    match slot {
-                        Slot::Conn(conn) => {
-                            let error = conn.sock.take_error();
-                            tracing::debug!(message = "Connected socket failed", error = ?error);
-                            view.request_disconnect(&conn.peer);
-                        }
-                        Slot::Anon(sock) => {
-                            let error = sock.take_error();
-                            tracing::warn!(message = "UDP socket error", error = ?error);
-                        }
-                    }
-                    continue;
-                }
-
-                if revents.contains(PollFlags::POLLIN) {
-                    let result = match slot {
-                        Slot::Anon(sock) => view.drain_anon(sock, rcvbuf, dstbuf)?,
-                        Slot::Conn(conn) => view.drain_conn(conn, rcvbuf, dstbuf)?,
-                    };
-
-                    if result.is_break() {
-                        invalidated = true;
-                        break;
-                    }
-                }
-            }
-
-            if invalidated {
+            if view.process_ready(&poll_set, rcvbuf, dstbuf)?.is_break() {
                 return Ok(Resume::Now);
             }
         }
@@ -159,7 +108,7 @@ fn verify_incoming<'a, 'c>(
     }
 }
 
-struct InboundView<'a> {
+pub(super) struct InboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
     udp4: &'a Socket,
@@ -168,13 +117,8 @@ struct InboundView<'a> {
     conns: Vec<Conn>,
 }
 
-enum ViewFailed {
-    NotConnected,
-    EmptyKeyPair,
-}
-
 impl<'a> InboundView<'a> {
-    fn new(device: &'a Device, waker: &'a Waker) -> Result<Self, ViewFailed> {
+    pub(super) fn new(device: &'a Device, waker: &'a Waker) -> Result<Self, ViewFailed> {
         let (Some(udp4), Some(udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
             return Err(ViewFailed::NotConnected);
         };
@@ -203,6 +147,63 @@ impl<'a> InboundView<'a> {
             udp4,
             udp6,
             conns,
+        })
+    }
+
+    pub(super) fn process_ready(
+        &self,
+        poll_set: &PollSet<'_>,
+        rcvbuf: &mut [u8; MAX_PKT_SIZE],
+        dstbuf: &mut [u8; MAX_PKT_SIZE],
+    ) -> Result<ControlFlow<()>, Error> {
+        let mut invalidated = false;
+
+        for (slot, revents) in poll_set.ready() {
+            if revents.contains(PollFlags::POLLNVAL) {
+                return Err(Error::InternalError(format!(
+                    "Polled an invalid fd on {}",
+                    slot.kind()
+                )));
+            }
+
+            if revents.contains(PollFlags::POLLHUP) {
+                // only a local shutdown hangs up a UDP socket
+                invalidated = true;
+                continue;
+            }
+
+            if revents.contains(PollFlags::POLLERR) {
+                match slot {
+                    Slot::Conn(conn) => {
+                        let error = conn.sock.take_error();
+                        tracing::debug!(message = "Connected socket failed", error = ?error);
+                        self.request_disconnect(&conn.peer);
+                    }
+                    Slot::Anon(sock) => {
+                        let error = sock.take_error();
+                        tracing::warn!(message = "UDP socket error", error = ?error);
+                    }
+                }
+                continue;
+            }
+
+            if revents.contains(PollFlags::POLLIN) {
+                let result = match slot {
+                    Slot::Anon(sock) => self.drain_anon(sock, rcvbuf, dstbuf)?,
+                    Slot::Conn(conn) => self.drain_conn(conn, rcvbuf, dstbuf)?,
+                };
+
+                if result.is_break() {
+                    invalidated = true;
+                    break;
+                }
+            }
+        }
+
+        Ok(if invalidated {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         })
     }
 
@@ -410,6 +411,22 @@ impl<'a> InboundView<'a> {
     }
 }
 
+pub(super) enum ViewFailed {
+    NotConnected,
+    EmptyKeyPair,
+}
+
+impl ViewFailed {
+    pub(super) fn log(&self) {
+        match self {
+            ViewFailed::NotConnected => {
+                tracing::debug!(message = "Not connected, parked until sockets are opened.")
+            }
+            ViewFailed::EmptyKeyPair => tracing::trace!(message = "Empty key pair"),
+        }
+    }
+}
+
 struct Conn {
     peer: Arc<Peer>,
     sock: Socket,
@@ -431,22 +448,37 @@ impl Slot<'_> {
 }
 
 // TODO: consider PollSet restructuring to clearly distinguish always present waker
-struct PollSet<'a> {
-    // pfds[0] is always the waker
+pub(super) struct PollSet<'a> {
+    // pfds[0] is always the waker, followed by the TUN in if it's polled too
     pfds: Vec<PollFd<'a>>,
     slots: Vec<Slot<'a>>,
+    has_tun: bool,
 }
 
 impl<'a> PollSet<'a> {
     fn new(view: &'a InboundView) -> Self {
+        Self::build(view, None)
+    }
+
+    /// Includes TUN in a PollSet, used for the single-thread data plane
+    pub(super) fn with_tun(view: &'a InboundView, tun: &'a TunSocket) -> Self {
+        Self::build(view, Some(tun))
+    }
+
+    fn build(view: &'a InboundView, tun: Option<&'a TunSocket>) -> Self {
         // TODO: ony pass the relevant part of the snap
         // 3 pfds are always present: a waker and two anonymous UDP sockets
-        let capacity = 3 + view.conns.len();
+        let capacity = 3 + usize::from(tun.is_some()) + view.conns.len();
         let mut pfds = Vec::with_capacity(capacity);
         let mut slots = Vec::with_capacity(capacity);
 
         // Push Waker's PollFd first, it has no corresponding slot
         pfds.push(PollFd::new(view.waker.wait_fd(), PollFlags::POLLIN));
+
+        // Push TUN's PollFd second, it has no corresponding slot
+        if let Some(tun) = tun {
+            pfds.push(PollFd::new(tun.as_fd(), PollFlags::POLLIN));
+        }
 
         // Push anonymous UDP sockets' PollFds and their corresponding anon slots
         for sock in [&view.udp4, &view.udp6] {
@@ -460,26 +492,41 @@ impl<'a> PollSet<'a> {
             slots.push(Slot::Conn(conn));
         }
 
-        Self { pfds, slots }
+        Self {
+            pfds,
+            slots,
+            has_tun: tun.is_some(),
+        }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [PollFd<'a>] {
+    pub(super) fn as_mut_slice(&mut self) -> &mut [PollFd<'a>] {
         &mut self.pfds
     }
 
     // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?
-    fn woken(&self) -> bool {
+    pub(super) fn woken(&self) -> bool {
         self.pfds
             .first() // pfds[0] is Waker's PollFd
             .and_then(|pfd| pfd.revents())
             .is_some_and(|revents| !revents.is_empty())
     }
 
+    pub(super) fn tun_revents(&self) -> PollFlags {
+        if !self.has_tun {
+            return PollFlags::empty();
+        }
+
+        self.pfds
+            .get(1) // pfds[1] is TUN's PollFd
+            .and_then(|pfd| pfd.revents())
+            .unwrap_or(PollFlags::empty())
+    }
+
     // TODO: looks more like a property of a poll rather than a set of pfds (struct Poll { poll_set: PollSet })?
     fn ready(&self) -> impl Iterator<Item = (&Slot<'a>, PollFlags)> + '_ {
         self.pfds
             .iter()
-            .skip(1) // skip waker's PollFd
+            .skip(1 + usize::from(self.has_tun)) // skip waker's and (if present) TUN's PollFds
             .zip(&self.slots)
             .filter_map(|(pfd, slot)| {
                 let revents = pfd.revents().unwrap_or(PollFlags::empty());

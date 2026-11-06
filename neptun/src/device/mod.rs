@@ -6,6 +6,7 @@ pub mod allowed_ips;
 pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
+pub(crate) mod duplex;
 pub(crate) mod inbound;
 pub(crate) mod outbound;
 pub mod peer;
@@ -28,6 +29,7 @@ pub mod tun;
 
 pub mod waker;
 
+use crate::device::duplex::Duplex;
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
 use crate::device::waker::Waker;
@@ -93,6 +95,9 @@ const HANDSHAKE_BATCH_SIZE: usize = 64; // Number of handshake messages handled 
 const MAX_PKT_SIZE: usize = 1550;
 const WG_HEADER_OFFSET: usize = 16;
 const MAX_LISTEN_SOCKET_BIND_ATTEMPTS: usize = 100;
+
+/// drain batch size limit to prevent a busy socket from starving the others
+const MAX_DRAIN_BATCH: usize = 128;
 
 fn bind_listen_sockets(port: u16) -> io::Result<(socket2::Socket, socket2::Socket, u16)> {
     bind_listen_sockets_with(port, |socket, address| socket.bind(&address.into()))
@@ -211,6 +216,19 @@ pub struct DeviceHandle {
     threads: Vec<DeviceThread>,
 }
 
+/// Determines how the data plane traffic is spread over threads
+///
+/// On platforms where the kernel runs the network stack in its own threads
+/// that preempt the tunnel threads, a second busy data plane thread competes
+/// with kernel threads for performance cores
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataPlaneLayout {
+    /// Separate threads for the inbound and outbound traffic
+    Split,
+    /// One thread for both directions
+    Single,
+}
+
 #[derive(Clone)]
 pub struct DeviceConfig {
     pub use_connected_socket: bool,
@@ -221,6 +239,7 @@ pub struct DeviceConfig {
     pub firewall_process_outbound_callback:
         Option<Arc<dyn Fn(&[u8; 32], &mut [u8], &mut dyn std::io::Write) -> bool + Send + Sync>>,
     pub skt_buffer_size: Option<usize>,
+    pub data_plane_layout: DataPlaneLayout,
 }
 
 pub struct Device {
@@ -377,7 +396,7 @@ impl DeviceHandle {
     }
 
     fn start_device_threads(&mut self) -> Result<(), Error> {
-        let (thread_data, stop, out_waker, in_waker) = {
+        let (thread_data, stop, out_waker, in_waker, layout) = {
             let d = &self.device.read();
             let thread_data = ControlThreadData {
                 dst_buf: [0u8; MAX_PKT_SIZE],
@@ -388,6 +407,7 @@ impl DeviceHandle {
                 d.data_stop.clone(),
                 d.out_waker.clone(),
                 d.in_waker.clone(),
+                d.config.data_plane_layout,
             )
         };
 
@@ -399,14 +419,25 @@ impl DeviceHandle {
         self.threads.push(control);
 
         // Data plane
-        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker);
-        let outbound = Outbound::new(self.device.clone(), stop, out_waker);
+        match layout {
+            DataPlaneLayout::Split => {
+                let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker);
+                let outbound = Outbound::new(self.device.clone(), stop, out_waker);
 
-        let inbound = DeviceThread::start("neptun-in", move || inbound.run())?;
-        self.threads.push(inbound);
+                let inbound = DeviceThread::start("neptun-in", move || inbound.run())?;
+                self.threads.push(inbound);
 
-        let outbound = DeviceThread::start("neptun-out", move || outbound.run())?;
-        self.threads.push(outbound);
+                let outbound = DeviceThread::start("neptun-out", move || outbound.run())?;
+                self.threads.push(outbound);
+            }
+            DataPlaneLayout::Single => {
+                // out_waker clones in_waker for single data plane layout, so they both point to the same waker
+                let duplex = Duplex::new(self.device.clone(), stop, in_waker);
+
+                let duplex = DeviceThread::start("neptun-duplex", move || duplex.run())?;
+                self.threads.push(duplex);
+            }
+        }
 
         Ok(())
     }
@@ -749,6 +780,13 @@ impl Device {
     ) -> Result<Device, Error> {
         let poll = EventPoll::<Handler>::new()?;
 
+        let in_waker = Arc::new(Waker::new()?);
+        let out_waker = match config.data_plane_layout {
+            DataPlaneLayout::Split => Arc::new(Waker::new()?),
+            // A single data plane thread must be woken by the notifications for either direction
+            DataPlaneLayout::Single => in_waker.clone(),
+        };
+
         let mut device = Device {
             queue: Arc::new(poll),
             iface,
@@ -770,8 +808,8 @@ impl Device {
             rate_limiter: None,
             update_seq: 0,
             data_stop: Arc::new(AtomicBool::new(false)),
-            out_waker: Arc::new(Waker::new()?),
-            in_waker: Arc::new(Waker::new()?),
+            out_waker,
+            in_waker,
             control_waker: Waker::new()?,
             handshake_queue: Mutex::new(VecDeque::new()),
             conns_drop_requested: AtomicBool::new(false),
@@ -1430,6 +1468,7 @@ mod tests {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
+            data_plane_layout: DataPlaneLayout::Split,
         };
 
         (
@@ -1518,6 +1557,7 @@ mod tests {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
+            data_plane_layout: DataPlaneLayout::Split,
         };
 
         let device_secret = x25519::StaticSecret::random_from_rng(&mut OsRng);

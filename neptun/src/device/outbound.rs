@@ -18,7 +18,7 @@ use crate::{
         peer::Peer,
         tun::TunSocket,
         waker::{poll_retry, Resume, Waker},
-        Device, Error, IfaceReadResult, MAX_PKT_SIZE, WG_HEADER_OFFSET,
+        Device, Error, IfaceReadResult, MAX_DRAIN_BATCH, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
     noise::{self, Encapsulated, Tunn},
 };
@@ -98,7 +98,7 @@ impl Outbound {
     }
 }
 
-struct OutboundView<'a> {
+pub(super) struct OutboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
     udp4: &'a Socket,
@@ -106,7 +106,7 @@ struct OutboundView<'a> {
 }
 
 impl<'a> OutboundView<'a> {
-    fn new(device: &'a Device, waker: &'a Waker) -> Option<Self> {
+    pub(super) fn new(device: &'a Device, waker: &'a Waker) -> Option<Self> {
         let (Some(udp4), Some(udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
             return None;
         };
@@ -119,7 +119,8 @@ impl<'a> OutboundView<'a> {
         })
     }
 
-    fn drain_tun(&self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<ControlFlow<()>, Error> {
+    /// Encapsulates and sends at most ['MAX_DRAIN_BATCH'] packets read from the TUN
+    pub(super) fn drain_tun(&self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<ControlFlow<()>, Error> {
         let mtu = match CheckedMtu::new(self.device.mtu.load(Ordering::Relaxed)) {
             Some(m) => m,
             None => {
@@ -135,7 +136,7 @@ impl<'a> OutboundView<'a> {
             .firewall_process_outbound_callback
             .as_ref();
 
-        loop {
+        for _ in 0..MAX_DRAIN_BATCH {
             if self.waker.is_pending() {
                 self.waker.ack();
                 return Ok(ControlFlow::Break(()));
@@ -175,6 +176,8 @@ impl<'a> OutboundView<'a> {
                 }
             }
         }
+
+        Ok(ControlFlow::Continue(()))
     }
 
     fn wait_for_tun(&self, pfds: &mut Pfds<'_>) -> Result<ControlFlow<Resume>, Error> {
@@ -187,19 +190,7 @@ impl<'a> OutboundView<'a> {
             return Ok(ControlFlow::Break(Resume::Now));
         }
 
-        let tun_revents = pfds.get_revents(PfdIndex::Tun);
-
-        if tun_revents.contains(PollFlags::POLLNVAL) {
-            return Err(Error::InternalError(
-                "Polled an invalid TUN fd (fd not open)".to_owned(),
-            ));
-        }
-
-        if tun_revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-            return Err(Error::InternalError(format!(
-                "TUN iface invalidated: {tun_revents:?}"
-            )));
-        }
+        check_tun_revents(pfds.get_revents(PfdIndex::Tun))?;
 
         Ok(ControlFlow::Continue(()))
     }
@@ -280,6 +271,22 @@ impl<'a> OutboundView<'a> {
             tracing::error!("No endpoint");
         }
     }
+}
+
+pub(super) fn check_tun_revents(revents: PollFlags) -> Result<(), Error> {
+    if revents.contains(PollFlags::POLLNVAL) {
+        return Err(Error::InternalError(
+            "Polled an invalid TUN fd (fd not open)".to_owned(),
+        ));
+    }
+
+    if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+        return Err(Error::InternalError(format!(
+            "TUN iface invalidated: {revents:?}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// PollFd count in the [`Pfds`] must be equal to number of [`PfdIndex`] variants

@@ -22,7 +22,7 @@
 use base64::encode as base64encode;
 use hex::encode;
 use neptun::device::tun::TunSocket;
-use neptun::device::{DeviceConfig, DeviceHandle};
+use neptun::device::{DataPlaneLayout, DeviceConfig, DeviceHandle};
 use neptun::x25519::{PublicKey, StaticSecret};
 use rand_core::OsRng;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -273,6 +273,7 @@ impl WGHandle {
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
                 skt_buffer_size: None,
+                data_plane_layout: DataPlaneLayout::Split,
             },
         )
     }
@@ -503,6 +504,7 @@ fn test_wg_start_ipv4_non_connected() {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
+            data_plane_layout: DataPlaneLayout::Split,
         },
     );
 
@@ -706,6 +708,52 @@ fn test_wg_start_ipv4_traffic_flows_after_reject_after_time() {
 }
 
 #[test]
+/// Test if wireguard can handle simple ipv4 connections on a single data plane thread
+fn test_wg_start_ipv4_single_data_thread() {
+    let port = next_port();
+    let private_key = StaticSecret::random_from_rng(OsRng);
+    let public_key = PublicKey::from(&private_key);
+    let addr_v4 = next_ip();
+    let addr_v6 = next_ip_v6();
+
+    let mut wg = WGHandle::init_with_config(
+        addr_v4,
+        addr_v6,
+        DeviceConfig {
+            use_connected_socket: false,
+            open_uapi_socket: true,
+            protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
+            firewall_process_inbound_callback: None,
+            firewall_process_outbound_callback: None,
+            skt_buffer_size: None,
+            data_plane_layout: DataPlaneLayout::Single,
+        },
+    );
+
+    assert_eq!(wg.wg_set_port(port), "errno=0\n\n");
+    assert_eq!(wg.wg_set_key(private_key), "errno=0\n\n");
+
+    let mut peer = Peer::new(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), next_port()),
+        vec![AllowedIp {
+            ip: next_ip_v4(),
+            cidr: 32,
+        }],
+    );
+
+    peer.start_in_container(&public_key, &addr_v4, port);
+
+    let peer = Arc::new(peer);
+
+    wg.add_peer(Arc::clone(&peer));
+    wg.start();
+
+    let response = peer.get_request();
+
+    assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
+}
+
+#[test]
 /// Test if wireguard can handle simple ipv6 connections
 fn test_wg_start_ipv6() {
     let port = next_port();
@@ -797,6 +845,7 @@ fn test_wg_start_ipv6_endpoint_not_connected() {
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
+            data_plane_layout: DataPlaneLayout::Split,
         },
     );
 
