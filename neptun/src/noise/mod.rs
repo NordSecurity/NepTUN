@@ -383,18 +383,14 @@ impl Tunn {
         });
         self.handshake
             .set_static_private(static_private, static_public)?;
-        for s in &mut self.sessions {
-            *s = None;
-        }
+        self.sessions.fill(None);
         Ok(())
     }
 
     /// Update the preshared key and clear sessions
     pub fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         self.handshake.set_preshared_key(preshared_key);
-        for s in &mut self.sessions {
-            *s = None;
-        }
+        self.sessions.fill(None);
     }
 
     /// Encapsulate a single packet from the tunnel interface.

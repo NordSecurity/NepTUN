@@ -16,7 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
-    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Install Rust toolchain
+      run: rustup toolchain install
     - if: matrix.os == 'ubuntu-24.04'
       run: sudo apt-get install -y libpcap-dev
     - name: Install hack
@@ -27,7 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
-    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Install Rust toolchain
+      run: rustup toolchain install
     - run: sudo dpkg --add-architecture i386 && sudo apt-get update
     - run: sudo apt-get install -y gcc-multilib libc6:i386 libpcap-dev:i386
     - name: Add 32bit target
@@ -43,7 +45,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
-    - uses: actions-rs/toolchain@b2417cde72dcf67f306c0ae8e0828a81bf0b189f # v1.0.6
+    - name: Install Rust toolchain
+      run: rustup toolchain install
     - run: cargo bench -p neptun --no-run
 
   performance-tests:
