@@ -14,8 +14,8 @@ alias d := deny
 [private]
 alias p := prepush
 
-nightly := "nightly-2025-08-07"
-rust_stable := "1.89.0"
+nightly := "nightly-2026-10-11"
+rust_stable := "1.99.1"
 
 # Run all rust tests
 test:
