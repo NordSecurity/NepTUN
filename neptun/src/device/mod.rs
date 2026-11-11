@@ -27,6 +27,10 @@ pub mod tun;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 mod packet_workers;
 
+#[cfg(test)]
+#[path = "tests/test_protect.rs"]
+mod test_protect;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -193,14 +197,39 @@ enum Action {
 // Event handler function
 type Handler = Box<dyn Fn(&mut LockReadGuard<Device>, &mut ThreadData) -> Action + Send + Sync>;
 
+/// Returned by [`MakeExternalNeptun::make_external`]. Keep it alive for as long as
+/// the socket is open; dropping it lets the protector forget the socket.
+#[derive(Default)]
+pub struct ExternalGuard {
+    // Never read, only held so its `Drop` runs together with the guard
+    _inner: Option<Box<dyn Send + Sync>>,
+}
+
+impl ExternalGuard {
+    pub fn new(inner: impl Send + Sync + 'static) -> Self {
+        Self {
+            _inner: Some(Box::new(inner)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ExternalGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalGuard")
+    }
+}
+
 pub trait MakeExternalNeptun: Send + Sync {
-    fn make_external(&self, socket: RawFd);
+    #[must_use]
+    fn make_external(&self, socket: RawFd) -> ExternalGuard;
 }
 
 pub struct MakeExternalNeptunNoop;
 
 impl MakeExternalNeptun for MakeExternalNeptunNoop {
-    fn make_external(&self, _socket: std::os::fd::RawFd) {}
+    fn make_external(&self, _socket: std::os::fd::RawFd) -> ExternalGuard {
+        ExternalGuard::default()
+    }
 }
 
 pub struct DeviceHandle {
@@ -241,6 +270,7 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
+    udp_guards: Vec<ExternalGuard>,
     udp4: Option<Arc<socket2::Socket>>,
     udp6: Option<Arc<socket2::Socket>>,
 
@@ -780,6 +810,7 @@ impl Device {
             peers: Default::default(),
             peers_by_idx: Default::default(),
             peers_by_ip: AllowedIps::new(),
+            udp_guards: Default::default(),
             udp4: Default::default(),
             udp6: Default::default(),
             cleanup_paths: Default::default(),
@@ -823,6 +854,8 @@ impl Device {
         if self.udp4.is_some() {
             self.workers.shutdown();
         }
+        // Unregister old sockets from the protector before they are closed
+        self.udp_guards.clear();
         if let Some(udp) = self.udp4.take() {
             unsafe {
                 // Safe: the event loop is either not started yet or parked
@@ -846,8 +879,10 @@ impl Device {
         let (udp_sock4, udp_sock6, port) = bind_listen_sockets(port)?;
         udp_sock4.set_nonblocking(true)?;
         udp_sock6.set_nonblocking(true)?;
-        self.config.protect.make_external(udp_sock4.as_raw_fd());
-        self.config.protect.make_external(udp_sock6.as_raw_fd());
+        self.udp_guards = vec![
+            self.config.protect.make_external(udp_sock4.as_raw_fd()),
+            self.config.protect.make_external(udp_sock6.as_raw_fd()),
+        ];
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = self.config.skt_buffer_size {
@@ -1555,6 +1590,8 @@ impl Default for IndexLfsr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::test_protect::RecordingProtect;
+    use std::collections::HashSet;
 
     #[test]
     fn random_listen_port_retries_ipv6_address_in_use() {
@@ -1649,6 +1686,13 @@ mod tests {
     }
 
     fn mock_device(n_threads: usize) -> (Device, std::os::unix::net::UnixStream) {
+        mock_device_with_protect(n_threads, Arc::new(MakeExternalNeptunNoop))
+    }
+
+    fn mock_device_with_protect(
+        n_threads: usize,
+        protect: Arc<dyn MakeExternalNeptun>,
+    ) -> (Device, std::os::unix::net::UnixStream) {
         use std::os::unix::io::IntoRawFd;
         use std::os::unix::net::UnixStream;
 
@@ -1669,7 +1713,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             use_multi_queue: false,
             open_uapi_socket: false,
-            protect: Arc::new(MakeExternalNeptunNoop),
+            protect,
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
@@ -1681,6 +1725,56 @@ mod tests {
             Device::new_with_mock_tun(tun, MOCK_MTU, config).unwrap(),
             far,
         )
+    }
+
+    fn listen_fds(device: &Device) -> HashSet<RawFd> {
+        device
+            .udp4
+            .iter()
+            .chain(device.udp6.iter())
+            .map(|udp| udp.as_raw_fd())
+            .collect()
+    }
+
+    #[test]
+    fn open_listen_socket_registers_listen_sockets() {
+        let protect = RecordingProtect::default();
+        let (mut device, _far) = mock_device_with_protect(1, Arc::new(protect.clone()));
+
+        device.open_listen_socket(0).unwrap();
+        println!("{:?}", device.udp_guards);
+
+        let fds = listen_fds(&device);
+        assert_eq!(fds.len(), 2);
+        assert_eq!(protect.registered(), fds);
+    }
+
+    /// The listen sockets are rebuilt on port and network changes, the old ones
+    /// must not stay registered with the protector.
+    #[test]
+    fn reopening_listen_socket_unregisters_old_listen_sockets() {
+        let protect = RecordingProtect::default();
+        let (mut device, _far) = mock_device_with_protect(1, Arc::new(protect.clone()));
+
+        device.open_listen_socket(0).unwrap();
+        device.open_listen_socket(0).unwrap();
+
+        let fds = listen_fds(&device);
+        assert_eq!(fds.len(), 2);
+        assert_eq!(protect.registered(), fds);
+        protect.assert_unregistered_before_close();
+    }
+
+    #[test]
+    fn dropping_device_unregisters_listen_sockets() {
+        let protect = RecordingProtect::default();
+        let (mut device, _far) = mock_device_with_protect(1, Arc::new(protect.clone()));
+
+        device.open_listen_socket(0).unwrap();
+        drop(device);
+
+        assert!(protect.registered().is_empty());
+        protect.assert_unregistered_before_close();
     }
 
     #[test]
