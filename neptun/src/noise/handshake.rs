@@ -13,7 +13,7 @@ use aead::{Aead, Payload};
 use blake2::digest::consts::{U16, U24};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::{KeyInit as _, XChaCha20Poly1305};
+use chacha20poly1305::XChaCha20Poly1305;
 use rand_core::OsRng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
@@ -733,7 +733,13 @@ impl Handshake {
         };
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
             .map_err(|_| WireGuardError::InvalidAeadTag)?
-            .decrypt(packet.nonce.into(), payload)
+            .decrypt(
+                packet
+                    .nonce
+                    .try_into()
+                    .map_err(|_| WireGuardError::InvalidPacket)?,
+                payload,
+            )
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         let cookie = plaintext
