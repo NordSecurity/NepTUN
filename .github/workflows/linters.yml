@@ -18,7 +18,7 @@ jobs:
         include:
         - os: ubuntu-24.04
           packages: ""
-        - os: macos-14
+        - os: macos-15
           packages: ""
         - os: windows-2022
           packages: "-p neptun"
@@ -35,7 +35,7 @@ jobs:
         include:
         - os: ubuntu-24.04
           packages: ""
-        - os: macos-14
+        - os: macos-15
           packages: ""
         - os: windows-2022
           packages: -p neptun
