@@ -7,16 +7,19 @@ use socket2::{Domain, Protocol, Type};
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crate::device::modify_skt_buffer_size;
 use crate::device::{AllowedIps, Error, MakeExternalNeptun};
 use crate::noise::Tunn;
 use crate::serialization::PubKey;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use std::os::fd::AsFd;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::device::modify_skt_buffer_size;
+
 use std::os::fd::AsRawFd;
 
 #[derive(Default, Debug)]
@@ -37,6 +40,11 @@ pub struct Peer {
     allowed_ips: RwLock<AllowedIps<()>>,
     preshared_key: RwLock<Option<[u8; 32]>>,
     protect: Arc<dyn MakeExternalNeptun>,
+    // control plane fields
+    handshake_requested: AtomicBool,
+    endpoint_requested: AtomicBool,
+    requested_endpoint: Mutex<Option<SocketAddr>>,
+    disconnect_requested: AtomicBool,
 }
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug)]
@@ -86,33 +94,89 @@ impl Peer {
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
             protect,
+            handshake_requested: AtomicBool::new(false),
+            endpoint_requested: AtomicBool::new(false),
+            requested_endpoint: Mutex::new(None),
+            disconnect_requested: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn request_handshake(&self) -> bool {
+        !self.handshake_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_handshake_request(&self) -> bool {
+        self.handshake_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn needs_endpoint_update(&self, addr: SocketAddr, connect: bool) -> bool {
+        let endpoint = self.endpoint.read();
+        endpoint.addr != Some(addr) || (connect && endpoint.conn.is_none())
+    }
+
+    /// Requests the control plane to update the endpoint (latest request wins)
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
+    pub(crate) fn request_endpoint(&self, addr: SocketAddr) -> bool {
+        *self.requested_endpoint.lock() = Some(addr);
+        !self.endpoint_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_endpoint_request(&self) -> Option<SocketAddr> {
+        if !self.endpoint_requested.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.requested_endpoint.lock().take()
     }
 
     pub fn endpoint(&self) -> parking_lot::RwLockReadGuard<'_, Endpoint> {
         self.endpoint.read()
     }
 
-    pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
-            tracing::info!("Disconnecting from endpoint");
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+    /// Removes the peer's connected socket.
+    ///
+    /// Returns `false` if the peer didn't have a connected socket.
+    pub fn shutdown_endpoint(&self) -> bool {
+        match self.endpoint.write().conn.take() {
+            Some(conn) => {
+                tracing::info!("Disconnecting from endpoint");
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
+            None => false,
         }
     }
 
-    pub fn set_endpoint(&self, addr: SocketAddr) {
+    /// Sets an endpoint on the peer.
+    ///
+    /// Returns `true` if the peer had a connected socket and it was removed, `false` otherwise.
+    pub fn set_endpoint(&self, addr: SocketAddr) -> bool {
+        // avoid the unnecessary write lock, which contends with the outbound thread's endpoint reads
+        if self.endpoint.read().addr == Some(addr) {
+            return false;
+        }
+
         let mut endpoint = self.endpoint.write();
+
+        // re-check - read guard was released above
         if endpoint.addr == Some(addr) {
-            return;
+            return false;
         }
-        if let Some(conn) = endpoint.conn.take() {
-            if let Err(e) = conn.shutdown(Shutdown::Both) {
-                tracing::error!("Error in conn shutdown {}", e);
+
+        let had_conn = match endpoint.conn.take() {
+            Some(conn) => {
+                if let Err(e) = conn.shutdown(Shutdown::Both) {
+                    tracing::error!("Error in conn shutdown {}", e);
+                }
+                true
             }
-        }
+            None => false,
+        };
+
         endpoint.addr = Some(addr);
+        had_conn
     }
 
     /// On Apple platforms, it is optimal to rely on the kernel autotuning of the socket size.
@@ -126,21 +190,18 @@ impl Peer {
         )]
         skt_buffer_size: Option<usize>,
     ) -> Result<socket2::Socket, Error> {
-        let mut endpoint = self.endpoint.write();
-
-        if endpoint.conn.is_some() {
-            return Err(Error::Connect("Connected".to_owned()));
-        }
-
-        let addr = endpoint.addr.ok_or_else(||
-            {
-                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
-                Error::InternalError(
-                    "Peer endpoint was not specified".to_owned(),
-                )
+        let addr = {
+            let endpoint = self.endpoint.read();
+            if endpoint.conn.is_some() {
+                return Err(Error::Connect("Connected".to_owned()));
             }
-        )?;
+            endpoint.addr.ok_or_else(|| {
+                tracing::warn!("Requested to connect_endpoint without endpoint specified. Falling back to unconnected sockets");
+                Error::InternalError("Peer endpoint was not specified".to_owned())
+            })?
+        };
 
+        // Socket is set up without the endpoint lock, so it does not block data plane's endpoint reads
         let udp_conn =
             socket2::Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
         udp_conn.set_reuse_address(true)?;
@@ -156,20 +217,43 @@ impl Peer {
         // Also mind that all socket setup functions should be called before .connect().
         udp_conn.connect(&addr.into())?;
 
+        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+        if let Some(buffer_size) = skt_buffer_size {
+            modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
+        }
+
+        let conn = udp_conn.try_clone()?;
+        {
+            let mut endpoint = self.endpoint.write();
+            if endpoint.conn.is_some() {
+                return Err(Error::Connect("Connected".to_owned()));
+            }
+            if endpoint.addr != Some(addr) {
+                return Err(Error::Connect(
+                    "Endpoint changed while connecting".to_owned(),
+                ));
+            }
+            endpoint.conn = Some(conn);
+        }
+
         tracing::info!(
             message="Connected endpoint",
             port=port,
             endpoint=?addr
         );
 
-        endpoint.conn = Some(udp_conn.try_clone()?);
-
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-        if let Some(buffer_size) = skt_buffer_size {
-            modify_skt_buffer_size(udp_conn.as_fd(), buffer_size);
-        }
-
         Ok(udp_conn)
+    }
+
+    /// Requests the control plane to remove the connected socket
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
+    pub(crate) fn request_disconnect(&self) -> bool {
+        !self.disconnect_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_disconnect_request(&self) -> bool {
+        self.disconnect_requested.swap(false, Ordering::AcqRel)
     }
 
     pub fn is_allowed_ip<I: Into<IpAddr>>(&self, addr: I) -> bool {
