@@ -34,7 +34,7 @@ use crate::device::waker::Waker;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{flush_queued_off_lock, Packet, Tunn, TunnResult};
+use crate::noise::{Packet, Tunn, TunnResult};
 use crate::serialization::PubKey;
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -1110,7 +1110,7 @@ impl Device {
 
             let res = {
                 let mut tun = peer.tunnel.lock();
-                tun.initiate_requested_handshake(dst)
+                tun.initiate_handshake(dst)
             };
             let addr = peer.endpoint().addr;
 
@@ -1130,7 +1130,7 @@ impl Device {
     }
 
     fn flush_queued(&self, peer: &Peer, addr: SocketAddr, dst: &mut [u8]) {
-        while let TunnResult::WriteToNetwork(packet) = flush_queued_off_lock(&peer.tunnel, dst) {
+        while let TunnResult::WriteToNetwork(packet) = encapsulate_queued(&peer.tunnel, dst) {
             self.send_to_addr(packet, addr);
         }
     }
@@ -1299,6 +1299,18 @@ impl Device {
         self.out_waker.ack();
         self.in_waker.ack();
         self.data_stop.store(false, Ordering::Relaxed);
+    }
+}
+
+fn encapsulate_queued<'a>(tunnel: &Mutex<Tunn>, dst: &'a mut [u8]) -> TunnResult<'a> {
+    let Some(dequeued) = tunnel.lock().begin_flush() else {
+        return TunnResult::Done;
+    };
+
+    // Tunnel lock is released at this point
+    match dequeued.seal(dst) {
+        Ok(sealed) => TunnResult::WriteToNetwork(tunnel.lock().commit_tx(sealed)),
+        Err(unsent) => TunnResult::Err(tunnel.lock().requeue(unsent)),
     }
 }
 

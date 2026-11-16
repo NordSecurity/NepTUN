@@ -11,6 +11,7 @@ use std::{
 };
 
 use nix::poll::PollFlags;
+use parking_lot::Mutex;
 use socket2::Socket;
 
 use crate::{
@@ -21,7 +22,9 @@ use crate::{
         waker::Waker,
         Device, Error, Resume, MAX_PKT_SIZE,
     },
-    noise::{self, rate_limiter::RateLimiter, Packet, PacketData, Received, Tunn, TunnResult},
+    noise::{
+        rate_limiter::RateLimiter, Decapsulated, Packet, PacketData, RxResult, Tunn, TunnResult,
+    },
 };
 
 /// Drain batch size limit to prevent a busy socket from starving the others
@@ -366,18 +369,18 @@ impl<'a> InboundView<'a> {
     ///
     /// Returns `true` if the packet should update peer's endpoint
     fn deliver_data(&self, peer: &Peer, data: PacketData<'_>, dstbuf: &mut [u8]) -> bool {
-        let Received {
-            result,
+        let RxResult {
+            decapsulated,
             queue_ready,
-        } = noise::decapsulate_data_off_lock(&peer.tunnel, data, dstbuf);
+        } = decapsulate(&peer.tunnel, data, dstbuf);
 
         if queue_ready && peer.request_flush() {
             self.device.notify_control();
         }
 
-        match result {
-            TunnResult::Done => true,
-            TunnResult::WriteToTunnel(packet, src_addr) => {
+        match decapsulated {
+            Ok(Decapsulated::Keepalive) => true,
+            Ok(Decapsulated::IpPacket(packet, src_addr)) => {
                 if let Some(callback) = &self.device.config.firewall_process_inbound_callback {
                     if !callback(peer.public_key.as_bytes(), packet) {
                         return false;
@@ -401,12 +404,8 @@ impl<'a> InboundView<'a> {
                 }
                 true
             }
-            TunnResult::Err(e) => {
+            Err(e) => {
                 tracing::warn!(message = "Failed to handle packet", error = ?e);
-                false
-            }
-            TunnResult::WriteToNetwork(_) => {
-                tracing::error!("Unexpected result from decapsulate");
                 false
             }
         }
@@ -453,5 +452,22 @@ fn verify_incoming<'a, 'c>(
             Err(_) => Err(None),
         },
         None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
+    }
+}
+
+fn decapsulate<'a>(
+    tunnel: &Mutex<Tunn>,
+    packet: PacketData<'_>,
+    dst: &'a mut [u8],
+) -> RxResult<'a> {
+    let rx = match tunnel.lock().begin_rx(packet) {
+        Ok(rx) => rx,
+        Err(e) => return e.into(),
+    };
+
+    // Tunnel lock is released at this point
+    match rx.open(dst) {
+        Ok(opened) => tunnel.lock().commit_rx(opened),
+        Err(e) => e.into(),
     }
 }

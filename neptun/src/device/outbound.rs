@@ -10,6 +10,7 @@ use std::{
 };
 
 use nix::poll::PollFlags;
+use parking_lot::Mutex;
 use socket2::Socket;
 
 use crate::{
@@ -20,7 +21,7 @@ use crate::{
         waker::Waker,
         Device, Error, IfaceReadResult, Resume, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
-    noise::{self, Encapsulated, Tunn},
+    noise::{errors::WireGuardError, NoSession, Tunn},
 };
 
 struct CheckedMtu(usize);
@@ -35,6 +36,24 @@ impl CheckedMtu {
 
     fn get(&self) -> usize {
         self.0
+    }
+}
+
+/// Packet encapsulation result
+enum TxResult<'a> {
+    Packet(&'a mut [u8]),
+    Queued,
+    NeedsHandshake,
+    Err(WireGuardError),
+}
+
+impl From<NoSession> for TxResult<'_> {
+    fn from(value: NoSession) -> Self {
+        match value {
+            NoSession::Queued => Self::Queued,
+            NoSession::NeedsHandshake => Self::NeedsHandshake,
+            NoSession::Err(e) => Self::Err(e),
+        }
     }
 }
 
@@ -180,17 +199,17 @@ impl<'a> OutboundView<'a> {
                 }
             }
 
-            let res = noise::encapsulate_in_place_off_lock(&peer.tunnel, payload.len(), buf);
+            let res = encapsulate(&peer.tunnel, payload.len(), buf);
 
             match res {
-                Encapsulated::Packet(packet) => self.send_packet(&peer, packet),
-                Encapsulated::Queued => {}
-                Encapsulated::NeedsHandshake => {
+                TxResult::Packet(packet) => self.send_packet(&peer, packet),
+                TxResult::Queued => {}
+                TxResult::NeedsHandshake => {
                     if peer.request_handshake() {
                         self.device.notify_control();
                     }
                 }
-                Encapsulated::Err(e) => {
+                TxResult::Err(e) => {
                     tracing::error!(message = "Encapsulate error",
                         error = ?e,
                         peer = %peer.public_key);
@@ -274,6 +293,19 @@ impl<'a> OutboundView<'a> {
         } else {
             tracing::error!("No endpoint");
         }
+    }
+}
+
+fn encapsulate<'a>(tunnel: &Mutex<Tunn>, src_len: usize, dst: &'a mut [u8]) -> TxResult<'a> {
+    let tx = match tunnel.lock().begin_tx(src_len, dst) {
+        Ok(tx) => tx,
+        Err(no_session) => return no_session.into(),
+    };
+
+    // Tunnel lock is released at this point
+    match tx.seal(dst) {
+        Ok(sealed) => TxResult::Packet(tunnel.lock().commit_tx(sealed)),
+        Err(e) => TxResult::Err(e),
     }
 }
 
