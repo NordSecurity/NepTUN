@@ -5,7 +5,11 @@
 use parking_lot::{Mutex, RwLock};
 use socket2::{Domain, Protocol, Type};
 
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use std::os::fd::AsFd;
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::AsRawFd;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -15,12 +19,7 @@ use crate::noise::Tunn;
 use crate::serialization::PubKey;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use std::os::fd::AsFd;
-
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::device::modify_skt_buffer_size;
-
-use std::os::fd::AsRawFd;
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -42,6 +41,7 @@ pub struct Peer {
     protect: Arc<dyn MakeExternalNeptun>,
     // control plane fields
     handshake_requested: AtomicBool,
+    flush_requested: AtomicBool,
     endpoint_requested: AtomicBool,
     requested_endpoint: Mutex<Option<SocketAddr>>,
     disconnect_requested: AtomicBool,
@@ -95,18 +95,33 @@ impl Peer {
             preshared_key: RwLock::new(preshared_key),
             protect,
             handshake_requested: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
             endpoint_requested: AtomicBool::new(false),
             requested_endpoint: Mutex::new(None),
             disconnect_requested: AtomicBool::new(false),
         }
     }
 
+    /// Requests the control plane to initiate a handshake
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
     pub(crate) fn request_handshake(&self) -> bool {
         !self.handshake_requested.swap(true, Ordering::AcqRel)
     }
 
     pub(crate) fn take_handshake_request(&self) -> bool {
         self.handshake_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Requests the control plane to send the queued packets
+    ///
+    /// Returns `true` if there was no pending request, so that the control plane needs to be woken
+    pub(crate) fn request_flush(&self) -> bool {
+        !self.flush_requested.swap(true, Ordering::AcqRel)
+    }
+
+    pub(crate) fn take_flush_request(&self) -> bool {
+        self.flush_requested.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn needs_endpoint_update(&self, addr: SocketAddr, connect: bool) -> bool {

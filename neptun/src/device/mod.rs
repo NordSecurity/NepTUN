@@ -959,6 +959,7 @@ impl Device {
                 d.disconnect_requested(); // drop stale connected sockets before the handshakes open new ones
                 d.handle_queued_handshakes(&mut t.dst_buf[..]);
                 d.update_requested_endpoints();
+                d.flush_requested_queues(&mut t.dst_buf[..]);
                 d.initiate_requested_handshakes(&mut t.dst_buf[..]);
                 Action::Continue
             }),
@@ -1083,6 +1084,22 @@ impl Device {
         }
     }
 
+    fn flush_requested_queues(&self, dst: &mut [u8]) {
+        for peer in self.peers.values() {
+            if !peer.take_flush_request() {
+                continue;
+            }
+
+            let _span = peer_span(peer.public_key);
+
+            let Some(addr) = peer.endpoint().addr else {
+                continue;
+            };
+
+            self.flush_queued(peer, addr, dst);
+        }
+    }
+
     fn initiate_requested_handshakes(&self, dst: &mut [u8]) {
         for peer in self.peers.values() {
             if !peer.take_handshake_request() {
@@ -1107,15 +1124,8 @@ impl Device {
                     tracing::error!(message = "Handshake initiation error", error = ?e);
                     continue;
                 }
-                _ => {
-                    tracing::error!("Unexpected result from handshake initiation");
-                    continue;
-                }
+                _ => tracing::error!("Unexpected result from handshake initiation"),
             };
-
-            if let Some(addr) = addr {
-                self.flush_queued(peer, addr, dst);
-            }
         }
     }
 

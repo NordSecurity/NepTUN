@@ -24,7 +24,7 @@ use crate::{
     noise::{self, rate_limiter::RateLimiter, Packet, PacketData, Received, Tunn, TunnResult},
 };
 
-/// drain batch size limit to prevent a busy socket from starving the others
+/// Drain batch size limit to prevent a busy socket from starving the others
 const MAX_DRAIN_BATCH: usize = 128;
 
 pub(super) struct Inbound {
@@ -84,90 +84,35 @@ impl Inbound {
             }
         };
 
-        let mut poll = DataPoll::with_context(&self.waker, view.slots());
+        let mut poll = DataPoll::with_fd_data(&self.waker, view.polled_sockets());
 
-        // Sockets readiness loop
         loop {
+            // Park the thread while waiting for the packets to arrive
             if let Event::Woken = poll.wait()? {
                 return Ok(Resume::Now);
             }
 
-            let mut invalidated = false;
-
-            for (slot, revents) in poll.ready() {
-                if revents.contains(PollFlags::POLLNVAL) {
-                    return Err(Error::InternalError(format!(
-                        "Polled an invalid fd on {}",
-                        slot.kind()
-                    )));
-                }
-
-                if revents.contains(PollFlags::POLLHUP) {
-                    // only a local shutdown hangs up a UDP socket
-                    invalidated = true;
-                    continue;
-                }
-
-                if revents.contains(PollFlags::POLLERR) {
-                    match slot {
-                        Slot::Conn(conn) => {
-                            let error = conn.sock.take_error();
-                            tracing::debug!(message = "Connected socket failed", error = ?error);
-                            view.request_disconnect(&conn.peer);
-                        }
-                        Slot::Anon(sock) => {
-                            let error = sock.take_error();
-                            tracing::warn!(message = "UDP socket error", error = ?error);
-                        }
-                    }
-                    continue;
-                }
-
-                if revents.contains(PollFlags::POLLIN) {
-                    let result = match slot {
-                        Slot::Anon(sock) => view.drain_anon(sock, rcvbuf, dstbuf)?,
-                        Slot::Conn(conn) => view.drain_conn(conn, rcvbuf, dstbuf)?,
-                    };
-
-                    if result.is_break() {
-                        invalidated = true;
-                        break;
-                    }
-                }
-            }
-
-            if invalidated {
+            if view.process_ready(&poll, rcvbuf, dstbuf)?.is_break() {
                 return Ok(Resume::Now);
             }
         }
     }
 }
 
-fn verify_incoming<'a, 'c>(
-    rate_limiter: Option<&RateLimiter>,
-    src_addr: Option<IpAddr>,
-    datagram: &'a [u8],
-    cookie_buf: &'c mut [u8],
-) -> Result<Packet<'a>, Option<&'c mut [u8]>> {
-    match rate_limiter {
-        Some(rate_limiter) => match rate_limiter.verify_packet(src_addr, datagram, cookie_buf) {
-            Ok(packet) => Ok(packet),
-            Err(TunnResult::WriteToNetwork(cookie)) => Err(Some(cookie)),
-            Err(_) => Err(None),
-        },
-        None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
-    }
-}
-
+/// Borrowed view of the device with UDP sockets open, plus owned connected sockets
+///
+/// Note that the `conns` are owned, so that the sockets aren't borrowed from the peers' locked endpoints.
+/// Borrowing would keep the endpoint locks held while waiting for a wake, which the control plane sends
+/// only after taking a write lock on an endpoint, resulting in a deadlock.
 struct InboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
     udp4: &'a Socket,
     udp6: &'a Socket,
-    // this is owned, as the `try_clone`d fds must outlive the poll
     conns: Vec<Conn>,
 }
 
+/// Reason for the [`InboundView`] creation failure
 enum ViewFailed {
     NotConnected,
     EmptyKeyPair,
@@ -206,15 +151,72 @@ impl<'a> InboundView<'a> {
         })
     }
 
-    fn slots(&self) -> impl Iterator<Item = (BorrowedFd<'_>, Slot<'_>)> + '_ {
+    fn polled_sockets(&self) -> impl Iterator<Item = (BorrowedFd<'_>, PolledSocket<'_>)> + '_ {
         let anon = IntoIterator::into_iter([self.udp4, self.udp6])
-            .map(|sock| (sock.as_fd(), Slot::Anon(sock)));
+            .map(|sock| (sock.as_fd(), PolledSocket::Anon(sock)));
         let conns = self
             .conns
             .iter()
-            .map(|conn| (conn.sock.as_fd(), Slot::Conn(conn)));
+            .map(|conn| (conn.sock.as_fd(), PolledSocket::Conn(conn)));
 
         anon.chain(conns)
+    }
+
+    /// Returns [`ControlFlow::Break`] if the view needs rebuilding
+    fn process_ready(
+        &self,
+        poll: &DataPoll<'_, PolledSocket<'_>>,
+        rcvbuf: &mut [u8; MAX_PKT_SIZE],
+        dstbuf: &mut [u8; MAX_PKT_SIZE],
+    ) -> Result<ControlFlow<()>, Error> {
+        let mut invalidated = false;
+
+        for (polled_socket, revents) in poll.ready() {
+            if revents.contains(PollFlags::POLLNVAL) {
+                return Err(Error::InternalError(format!(
+                    "Polled an invalid fd on {}",
+                    polled_socket.kind()
+                )));
+            }
+
+            if revents.contains(PollFlags::POLLHUP) {
+                // connected socket was shut down by the control plane
+                invalidated = true;
+                continue;
+            }
+
+            if revents.contains(PollFlags::POLLERR) {
+                match polled_socket {
+                    PolledSocket::Conn(conn) => {
+                        let error = conn.sock.take_error();
+                        tracing::debug!(message = "Connected socket failed", error = ?error);
+                        self.request_disconnect(&conn.peer);
+                    }
+                    PolledSocket::Anon(sock) => {
+                        let error = sock.take_error();
+                        tracing::warn!(message = "UDP socket error", error = ?error);
+                    }
+                }
+                continue;
+            }
+
+            if revents.contains(PollFlags::POLLIN) {
+                let result = match polled_socket {
+                    PolledSocket::Anon(sock) => self.drain_anon(sock, rcvbuf, dstbuf)?,
+                    PolledSocket::Conn(conn) => self.drain_conn(conn, rcvbuf, dstbuf)?,
+                };
+
+                if result.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+
+        Ok(if invalidated {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
     }
 
     fn drain_anon(
@@ -313,6 +315,7 @@ impl<'a> InboundView<'a> {
                 unsafe { &mut *(&mut rcvbuf[..] as *mut [u8] as *mut [MaybeUninit<u8>]) };
 
             let read_bytes = match conn.sock.recv(recv_buf) {
+                Ok(0) => break, // empty datagram or EOF after a local shutdown (next poll reports it as POLLHUP)
                 Ok(n) => n,
                 Err(e) => match e.kind() {
                     io::ErrorKind::WouldBlock => break,
@@ -325,40 +328,35 @@ impl<'a> InboundView<'a> {
                 },
             };
 
-            if read_bytes > 0 {
-                #[allow(clippy::indexing_slicing)]
-                let datagram = &rcvbuf[..read_bytes];
+            #[allow(clippy::indexing_slicing)]
+            let datagram = &rcvbuf[..read_bytes];
 
-                let parsed_packet = match verify_incoming(
-                    self.device.rate_limiter.as_deref(),
-                    Some(conn.peer_addr.ip()),
-                    datagram,
-                    dstbuf,
-                ) {
-                    Ok(packet) => packet,
-                    Err(Some(cookie)) => {
-                        if let Err(err) = conn.sock.send(cookie) {
-                            tracing::warn!(message = "Failed to send cookie", error = ?err);
-                        }
-                        continue;
+            let parsed_packet = match verify_incoming(
+                self.device.rate_limiter.as_deref(),
+                Some(conn.peer_addr.ip()),
+                datagram,
+                dstbuf,
+            ) {
+                Ok(packet) => packet,
+                Err(Some(cookie)) => {
+                    if let Err(err) = conn.sock.send(cookie) {
+                        tracing::warn!(message = "Failed to send cookie", error = ?err);
                     }
-                    Err(None) => continue,
-                };
+                    continue;
+                }
+                Err(None) => continue,
+            };
 
-                let data = match parsed_packet {
-                    Packet::PacketData(data) => data,
-                    // handshake messages are handled by the control plane
-                    _ => {
-                        self.device.queue_handshake(datagram, conn.peer_addr);
-                        continue;
-                    }
-                };
+            let data = match parsed_packet {
+                Packet::PacketData(data) => data,
+                // handshake messages are handled by the control plane
+                _ => {
+                    self.device.queue_handshake(datagram, conn.peer_addr);
+                    continue;
+                }
+            };
 
-                self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
-            } else {
-                // empty packet or EOF after a local shutdown (next poll reports it as POLLHUP)
-                break;
-            }
+            self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
         }
 
         Ok(ControlFlow::Continue(()))
@@ -373,7 +371,7 @@ impl<'a> InboundView<'a> {
             queue_ready,
         } = noise::decapsulate_data_off_lock(&peer.tunnel, data, dstbuf);
 
-        if queue_ready && peer.request_handshake() {
+        if queue_ready && peer.request_flush() {
             self.device.notify_control();
         }
 
@@ -421,22 +419,39 @@ impl<'a> InboundView<'a> {
     }
 }
 
+/// [`Peer`]'s connected socket
 struct Conn {
     peer: Arc<Peer>,
     sock: Socket,
     peer_addr: SocketAddr,
 }
 
-enum Slot<'a> {
+enum PolledSocket<'a> {
     Anon(&'a Socket),
     Conn(&'a Conn),
 }
 
-impl Slot<'_> {
+impl PolledSocket<'_> {
     fn kind(&self) -> &'static str {
         match self {
-            Slot::Anon(_) => "anonymous UDP socket",
-            Slot::Conn(..) => "connected peer socket",
+            PolledSocket::Anon(_) => "anonymous UDP socket",
+            PolledSocket::Conn(_) => "connected peer socket",
         }
+    }
+}
+
+fn verify_incoming<'a, 'c>(
+    rate_limiter: Option<&RateLimiter>,
+    src_addr: Option<IpAddr>,
+    datagram: &'a [u8],
+    cookie_buf: &'c mut [u8],
+) -> Result<Packet<'a>, Option<&'c mut [u8]>> {
+    match rate_limiter {
+        Some(rate_limiter) => match rate_limiter.verify_packet(src_addr, datagram, cookie_buf) {
+            Ok(packet) => Ok(packet),
+            Err(TunnResult::WriteToNetwork(cookie)) => Err(Some(cookie)),
+            Err(_) => Err(None),
+        },
+        None => Tunn::parse_incoming_packet(datagram).map_err(|_| None),
     }
 }
