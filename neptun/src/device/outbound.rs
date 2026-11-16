@@ -90,18 +90,14 @@ impl Outbound {
                 return Ok(Resume::Now);
             }
 
-            for (_, revents) in poll.ready() {
-                check_tun_revents(revents)?;
-            }
-
-            // Process TUN packets
-            if view.drain_tun(buf)?.is_break() {
+            if view.process_ready(&poll, buf)?.is_break() {
                 return Ok(Resume::Now);
             }
         }
     }
 }
 
+/// Borrowed view of the device with UDP sockets open
 struct OutboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
@@ -121,6 +117,28 @@ impl<'a> OutboundView<'a> {
             udp4,
             udp6,
         })
+    }
+
+    fn process_ready(
+        &self,
+        poll: &DataPoll<'_, ()>,
+        buf: &mut [u8; MAX_PKT_SIZE],
+    ) -> Result<ControlFlow<()>, Error> {
+        for (_, revents) in poll.ready() {
+            if revents.contains(PollFlags::POLLNVAL) {
+                return Err(Error::InternalError(
+                    "Polled an invalid TUN fd (fd not open)".to_owned(),
+                ));
+            }
+
+            if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
+                return Err(Error::InternalError(format!(
+                    "TUN iface invalidated: {revents:?}"
+                )));
+            }
+        }
+
+        self.drain_tun(buf)
     }
 
     fn drain_tun(&self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<ControlFlow<()>, Error> {
@@ -257,22 +275,6 @@ impl<'a> OutboundView<'a> {
             tracing::error!("No endpoint");
         }
     }
-}
-
-fn check_tun_revents(revents: PollFlags) -> Result<(), Error> {
-    if revents.contains(PollFlags::POLLNVAL) {
-        return Err(Error::InternalError(
-            "Polled an invalid TUN fd (fd not open)".to_owned(),
-        ));
-    }
-
-    if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP) {
-        return Err(Error::InternalError(format!(
-            "TUN iface invalidated: {revents:?}"
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

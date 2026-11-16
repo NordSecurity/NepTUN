@@ -16,37 +16,41 @@ pub(super) enum Event {
 }
 
 /// `poll(2)` over a fixed set of fds, interruptible by a [`Waker`]
-pub(super) struct DataPoll<'a, S> {
+pub(super) struct DataPoll<'a, D> {
     /// Interrupts the wait
     waker: &'a Waker,
-    /// `poll(2)` input/output; `pfds[0]` is the `waker`'s fd, `pfds[i + 1]` corresponds to `slots[i]`
+    /// `poll(2)` input/output; `pfds[0]` is the `waker`'s fd, `pfds[i + 1]` corresponds to `fd_data[i]`
     pfds: Vec<PollFd<'a>>,
-    /// Caller's context for each polled fd
-    slots: Vec<S>,
+    /// Data associated with each polled fd
+    fd_data: Vec<D>,
 }
 
-impl<'a, S> DataPoll<'a, S> {
-    /// Polls each fd with its context
-    pub(super) fn with_context(
+impl<'a, D> DataPoll<'a, D> {
+    /// Polls each fd with its associated data
+    pub(super) fn with_fd_data(
         waker: &'a Waker,
-        fds: impl IntoIterator<Item = (BorrowedFd<'a>, S)>,
+        fds: impl IntoIterator<Item = (BorrowedFd<'a>, D)>,
     ) -> Self {
         let fds = fds.into_iter();
         let (len, _) = fds.size_hint();
 
         let mut pfds = Vec::with_capacity(len + 1);
-        let mut slots = Vec::with_capacity(len);
+        let mut fd_data = Vec::with_capacity(len);
 
         pfds.push(PollFd::new(waker.wait_fd(), PollFlags::POLLIN));
-        for (fd, slot) in fds {
+        for (fd, data) in fds {
             pfds.push(PollFd::new(fd, PollFlags::POLLIN));
-            slots.push(slot);
+            fd_data.push(data);
         }
 
-        Self { waker, pfds, slots }
+        Self {
+            waker,
+            pfds,
+            fd_data,
+        }
     }
 
-    /// Blocks until the waker or a polled fd is ready; a wake is acked and takes precedence
+    /// Blocks until the waker or a polled fd is ready; a wake is acked and takes precedence over ready fds
     ///
     /// Fails on a `poll(2)` error or an invalid waker fd
     pub(super) fn wait(&mut self) -> Result<Event, Error> {
@@ -72,15 +76,15 @@ impl<'a, S> DataPoll<'a, S> {
         Ok(Event::Ready)
     }
 
-    /// Context and `revents` of each polled fd reported as ready by the last wait
-    pub(super) fn ready(&self) -> impl Iterator<Item = (&S, PollFlags)> + '_ {
+    /// Data and `revents` of each polled fd reported as ready by the last wait
+    pub(super) fn ready(&self) -> impl Iterator<Item = (&D, PollFlags)> + '_ {
         self.pfds
             .iter()
             .skip(1) // skip waker's PollFd
-            .zip(&self.slots)
-            .filter_map(|(pfd, slot)| {
+            .zip(&self.fd_data)
+            .filter_map(|(pfd, data)| {
                 let revents = pfd.revents().unwrap_or(PollFlags::empty());
-                (!revents.is_empty()).then_some((slot, revents))
+                (!revents.is_empty()).then_some((data, revents))
             })
     }
 }
@@ -88,13 +92,13 @@ impl<'a, S> DataPoll<'a, S> {
 impl<'a> DataPoll<'a, ()> {
     /// Polls a single fd
     pub(super) fn new(waker: &'a Waker, fd: BorrowedFd<'a>) -> Self {
-        Self::with_context(waker, std::iter::once((fd, ())))
+        Self::with_fd_data(waker, std::iter::once((fd, ())))
     }
 }
 
 /// Blocks until a signal is pending, then acks it
 pub(super) fn park_on(waker: &Waker) -> Result<(), Error> {
-    DataPoll::<()>::with_context(waker, std::iter::empty()).wait()?;
+    DataPoll::<()>::with_fd_data(waker, std::iter::empty()).wait()?;
     Ok(())
 }
 
@@ -119,25 +123,25 @@ mod tests {
         let waker = Waker::new().unwrap();
         waker.wake();
 
-        let mut poll = DataPoll::<()>::with_context(&waker, std::iter::empty());
+        let mut poll = DataPoll::<()>::with_fd_data(&waker, std::iter::empty());
         assert!(matches!(poll.wait().unwrap(), Event::Woken));
         assert!(!waker.is_pending());
     }
 
     #[test]
-    fn ready_fd_is_reported_with_its_slot() {
+    fn ready_fd_is_reported_with_its_data() {
         let waker = Waker::new().unwrap();
         let (tx, rx) = UnixDatagram::pair().unwrap();
         let (_idle_tx, idle) = UnixDatagram::pair().unwrap();
         tx.send(b"x").unwrap();
 
         let mut poll =
-            DataPoll::with_context(&waker, vec![(idle.as_fd(), "idle"), (rx.as_fd(), "rx")]);
+            DataPoll::with_fd_data(&waker, vec![(idle.as_fd(), "idle"), (rx.as_fd(), "rx")]);
         assert!(matches!(poll.wait().unwrap(), Event::Ready));
 
         let ready: Vec<_> = poll
             .ready()
-            .map(|(slot, revents)| (*slot, revents.contains(PollFlags::POLLIN)))
+            .map(|(data, revents)| (*data, revents.contains(PollFlags::POLLIN)))
             .collect();
         assert_eq!(ready, vec![("rx", true)]);
     }
