@@ -10,6 +10,7 @@ use crate::serialization::PubKey;
 use crate::sleepyinstant::Instant;
 use crate::x25519;
 use aead::{Aead, Payload};
+use blake2::digest::consts::{U16, U24};
 use blake2::digest::{FixedOutput, KeyInit};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::XChaCha20Poly1305;
@@ -74,7 +75,8 @@ pub(crate) fn b2s_hmac2(
 
 #[inline]
 pub(crate) fn b2s_keyed_mac_16(key: &[u8], data1: &[u8]) -> Result<[u8; 16], WireGuardError> {
-    let mut hmac = Blake2sMac::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
+    let mut hmac =
+        Blake2sMac::<U16>::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
     blake2::digest::Update::update(&mut hmac, data1);
     Ok(hmac.finalize_fixed().into())
 }
@@ -85,14 +87,16 @@ pub(crate) fn b2s_keyed_mac_16_2(
     data1: &[u8],
     data2: &[u8],
 ) -> Result<[u8; 16], WireGuardError> {
-    let mut hmac = Blake2sMac::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
+    let mut hmac =
+        Blake2sMac::<U16>::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
     blake2::digest::Update::update(&mut hmac, data1);
     blake2::digest::Update::update(&mut hmac, data2);
     Ok(hmac.finalize_fixed().into())
 }
 
 pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> Result<[u8; 24], WireGuardError> {
-    let mut hmac = Blake2sMac::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
+    let mut hmac =
+        Blake2sMac::<U24>::new_from_slice(key).map_err(|_| WireGuardError::InvalidLength)?;
     blake2::digest::Update::update(&mut hmac, data1);
     Ok(hmac.finalize_fixed().into())
 }
@@ -729,7 +733,13 @@ impl Handshake {
         };
         let plaintext = XChaCha20Poly1305::new_from_slice(&key)
             .map_err(|_| WireGuardError::InvalidAeadTag)?
-            .decrypt(packet.nonce.into(), payload)
+            .decrypt(
+                packet
+                    .nonce
+                    .try_into()
+                    .map_err(|_| WireGuardError::InvalidPacket)?,
+                payload,
+            )
             .map_err(|_| WireGuardError::InvalidAeadTag)?;
 
         let cookie = plaintext

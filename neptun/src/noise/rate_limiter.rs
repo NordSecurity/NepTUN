@@ -12,8 +12,7 @@ use std::net::IpAddr;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 
-use aead::generic_array::GenericArray;
-use aead::{AeadInPlace, KeyInit};
+use aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
@@ -151,16 +150,17 @@ impl RateLimiter {
         message_type.copy_from_slice(&super::COOKIE_REPLY.to_le_bytes());
         // msg.receiver_index = little_endian(initiator.sender_index)
         receiver_index.copy_from_slice(&idx.to_le_bytes());
-        nonce.copy_from_slice(&self.nonce()?[..]);
+        let nonce_bytes = self.nonce()?;
+        nonce.copy_from_slice(&nonce_bytes[..]);
 
         let cipher = XChaCha20Poly1305::new(&self.cookie_key);
 
-        let iv = GenericArray::from_slice(nonce);
+        let iv = (&nonce_bytes).into();
 
         let (encrypted_part, tag_part) = encrypted_cookie.split_at_mut(16);
         encrypted_part.copy_from_slice(&cookie);
         let tag = cipher
-            .encrypt_in_place_detached(iv, mac1, encrypted_part)
+            .encrypt_inout_detached(iv, mac1, encrypted_part.into())
             .map_err(|_| WireGuardError::DestinationBufferTooSmall)?;
 
         tag_part.copy_from_slice(&tag);
