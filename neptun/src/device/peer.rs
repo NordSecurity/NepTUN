@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::device::modify_skt_buffer_size;
-use crate::device::{AllowedIps, Error, MakeExternalNeptun};
+use crate::device::{AllowedIps, Error, ExternalGuard, MakeExternalNeptun};
 use crate::noise::Tunn;
 use crate::serialization::PubKey;
 
@@ -23,6 +23,7 @@ use std::os::fd::AsRawFd;
 pub struct Endpoint {
     pub addr: Option<SocketAddr>,
     pub conn: Option<socket2::Socket>,
+    conn_guard: Option<ExternalGuard>,
 }
 
 pub struct Peer {
@@ -82,6 +83,7 @@ impl Peer {
             endpoint: RwLock::new(Endpoint {
                 addr: endpoint,
                 conn: None,
+                conn_guard: None,
             }),
             allowed_ips: RwLock::new(allowed_ips.iter().map(|ip| (ip, ())).collect()),
             preshared_key: RwLock::new(preshared_key),
@@ -94,7 +96,9 @@ impl Peer {
     }
 
     pub fn shutdown_endpoint(&self) {
-        if let Some(conn) = self.endpoint.write().conn.take() {
+        let mut endpoint = self.endpoint.write();
+        endpoint.conn_guard = None;
+        if let Some(conn) = endpoint.conn.take() {
             tracing::info!("Disconnecting from endpoint");
             if let Err(e) = conn.shutdown(Shutdown::Both) {
                 tracing::error!("Error in conn shutdown {}", e);
@@ -107,6 +111,7 @@ impl Peer {
         if endpoint.addr == Some(addr) {
             return;
         }
+        endpoint.conn_guard = None;
         if let Some(conn) = endpoint.conn.take() {
             if let Err(e) = conn.shutdown(Shutdown::Both) {
                 tracing::error!("Error in conn shutdown {}", e);
@@ -152,7 +157,8 @@ impl Peer {
         udp_conn.bind(&bind_addr)?;
         udp_conn.set_nonblocking(true)?;
         // fw_mark is being set inside make_external(), so no need to set it twice as in Cloudflare's repo.
-        self.protect.make_external(udp_conn.as_raw_fd());
+        // Dropped (and the socket unregistered) on any early return below.
+        let conn_guard = self.protect.make_external(udp_conn.as_raw_fd());
         // Also mind that all socket setup functions should be called before .connect().
         udp_conn.connect(&addr.into())?;
 
@@ -163,6 +169,7 @@ impl Peer {
         );
 
         endpoint.conn = Some(udp_conn.try_clone()?);
+        endpoint.conn_guard = Some(conn_guard);
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = skt_buffer_size {
@@ -217,6 +224,8 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::test_protect::RecordingProtect;
+    use std::collections::HashSet;
     use x25519_dalek::{PublicKey, StaticSecret};
 
     // Introduced this test to prevent LLT-5351 recurring in the future:
@@ -238,5 +247,75 @@ mod tests {
         );
 
         peer.connect_endpoint(12345, None).unwrap();
+    }
+
+    const ENDPOINT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54321);
+
+    fn peer_with_protect(protect: &RecordingProtect) -> Peer {
+        let a_secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
+
+        let b_secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let b_public_key = PublicKey::from(&b_secret_key);
+
+        let tunnel = Tunn::new(a_secret_key, b_public_key, None, None, 0, None).unwrap();
+        Peer::new(
+            tunnel,
+            0,
+            Some(ENDPOINT),
+            &[],
+            None,
+            Arc::new(protect.clone()),
+        )
+    }
+
+    #[test]
+    fn shutdown_endpoint_unregisters_connected_socket() {
+        let protect = RecordingProtect::default();
+        let peer = peer_with_protect(&protect);
+
+        let conn = peer.connect_endpoint(0, None).unwrap();
+        assert_eq!(protect.registered(), HashSet::from([conn.as_raw_fd()]));
+
+        peer.shutdown_endpoint();
+        assert!(protect.registered().is_empty());
+
+        drop(conn);
+        protect.assert_unregistered_before_close();
+    }
+
+    #[test]
+    fn set_endpoint_to_new_address_unregisters_connected_socket() {
+        let protect = RecordingProtect::default();
+        let peer = peer_with_protect(&protect);
+
+        let conn = peer.connect_endpoint(0, None).unwrap();
+        peer.set_endpoint(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 54322));
+        assert!(protect.registered().is_empty());
+
+        drop(conn);
+        protect.assert_unregistered_before_close();
+    }
+
+    #[test]
+    fn set_endpoint_to_same_address_keeps_connected_socket_registered() {
+        let protect = RecordingProtect::default();
+        let peer = peer_with_protect(&protect);
+
+        let conn = peer.connect_endpoint(0, None).unwrap();
+        peer.set_endpoint(ENDPOINT);
+        assert_eq!(protect.registered(), HashSet::from([conn.as_raw_fd()]));
+    }
+
+    #[test]
+    fn dropping_peer_unregisters_connected_socket() {
+        let protect = RecordingProtect::default();
+        let peer = peer_with_protect(&protect);
+
+        let conn = peer.connect_endpoint(0, None).unwrap();
+        drop(peer);
+        assert!(protect.registered().is_empty());
+
+        drop(conn);
+        protect.assert_unregistered_before_close();
     }
 }
