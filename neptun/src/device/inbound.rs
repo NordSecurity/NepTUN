@@ -291,7 +291,7 @@ impl<'a> InboundView<'a> {
                 continue;
             }
 
-            if peer.needs_endpoint_update(sock_addr, self.device.uses_connected_sockets())
+            if peer.needs_endpoint_update(sock_addr)
                 && peer.request_endpoint(sock_addr)
             {
                 self.device.notify_control();
@@ -359,7 +359,12 @@ impl<'a> InboundView<'a> {
                 }
             };
 
-            self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
+            let _needs_update = self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
+
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            if _needs_update {
+                conn.peer.conn_watch.on_conn_receive();
+            }
         }
 
         Ok(ControlFlow::Continue(()))

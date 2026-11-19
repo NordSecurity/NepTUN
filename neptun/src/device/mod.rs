@@ -28,6 +28,9 @@ pub mod tun;
 #[path = "tun_linux.rs"]
 pub mod tun;
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+mod conn_watch;
+
 use crate::device::inbound::Inbound;
 use crate::device::outbound::Outbound;
 use crate::device::waker::Waker;
@@ -107,6 +110,8 @@ where
         let udp_sock4 = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         udp_sock4.set_reuse_address(true)?;
         udp_sock4.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+        udp_sock4.set_reuse_port(true)?;
 
         let bound_port = if port == 0 {
             udp_sock4
@@ -125,7 +130,11 @@ where
             &udp_sock6,
             SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bound_port, 0, 0),
         ) {
-            Ok(()) => return Ok((udp_sock4, udp_sock6, bound_port)),
+            Ok(()) => {
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+                udp_sock6.set_reuse_port(true)?;
+                return Ok((udp_sock4, udp_sock6, bound_port))
+            }
             Err(error)
                 if port == 0
                     && error.kind() == io::ErrorKind::AddrInUse
@@ -193,6 +202,9 @@ type Handler =
 
 pub trait MakeExternalNeptun: Send + Sync {
     fn make_external(&self, socket: RawFd);
+
+    /// Called before an external socket is closed
+    fn clean(&self, _socket: RawFd) {}
 }
 
 pub struct MakeExternalNeptunNoop;
@@ -208,7 +220,7 @@ pub struct DeviceHandle {
 
 #[derive(Clone)]
 pub struct DeviceConfig {
-    pub use_connected_socket: bool,
+    pub use_connected_socket: bool, // TODO: either add conditional calls or remove the option
     pub open_uapi_socket: bool,
     pub protect: Arc<dyn MakeExternalNeptun>,
     pub firewall_process_inbound_callback:
@@ -768,8 +780,9 @@ impl Device {
     fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket
-        _ = self.udp4.take();
-        _ = self.udp6.take();
+        for udp in [self.udp4.take(), self.udp6.take()].iter().flatten() {
+            self.config.protect.clean(udp.as_raw_fd());
+        }
 
         for peer in self.peers.values() {
             peer.shutdown_endpoint();
@@ -1003,24 +1016,14 @@ impl Device {
         self.update_endpoint(peer, message.src);
     }
 
-    fn uses_connected_sockets(&self) -> bool {
-        cfg!(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos"
-        ))) && self.config.use_connected_socket
-    }
-
     fn update_endpoint(&self, peer: &Peer, addr: SocketAddr) {
         let mut conn_skts_changed = peer.set_endpoint(addr);
 
-        if self.uses_connected_sockets() {
-            match peer.connect_endpoint(self.listen_port, self.config.skt_buffer_size) {
-                Ok(_) => conn_skts_changed = true,
-                Err(Error::Connect(_)) => {}
-                Err(e) => {
-                    tracing::error!(message = "Failed to create connected socket for a peer", error = ?e)
-                }
+        match peer.connect_endpoint(self.listen_port, self.config.skt_buffer_size) {
+            Ok(_) => conn_skts_changed = true,
+            Err(Error::Connect(_)) => {}
+            Err(e) => {
+                tracing::error!(message = "Failed to create connected socket for a peer", error = ?e)
             }
         }
 
@@ -1134,6 +1137,11 @@ impl Device {
                         None => continue,
                     };
                     let _span = peer_span(peer.public_key);
+
+                    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+                    if peer.conn_watch.is_stale() && peer.shutdown_endpoint() {
+                        d.notify_inbound();
+                    }
 
                     let res = {
                         let mut tun = peer.tunnel.lock();
@@ -1410,7 +1418,7 @@ mod tests {
         let tun = TunSocket::new_mock_from_fd(near.into_raw_fd());
 
         let config = DeviceConfig {
-            use_connected_socket: false,
+            use_connected_socket: true, // TODO: assume conn skts are used on every platform
             open_uapi_socket: false,
             protect: Arc::new(MakeExternalNeptunNoop),
             firewall_process_inbound_callback: None,
@@ -1498,7 +1506,7 @@ mod tests {
         let tun = TunSocket::new_from_fd(near.into_raw_fd()).unwrap();
 
         let config = DeviceConfig {
-            use_connected_socket: false,
+            use_connected_socket: true, // TODO: assume conn skts are used on every platform
             open_uapi_socket: false,
             protect: Arc::new(MakeExternalNeptunNoop),
             firewall_process_inbound_callback: None,

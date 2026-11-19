@@ -271,6 +271,9 @@ impl<'a> OutboundView<'a> {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                     tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
                 }
+                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
+                    tracing::debug!(message = "Connected socket interface queue full, dropping packet", error = ?err);
+                }
                 Err(err) => {
                     tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
                     if peer.request_disconnect() {
