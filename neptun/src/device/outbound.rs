@@ -1,6 +1,5 @@
 use std::{
     io,
-    net::SocketAddr,
     ops::ControlFlow,
     os::fd::AsFd,
     sync::{
@@ -11,13 +10,12 @@ use std::{
 
 use nix::poll::PollFlags;
 use parking_lot::Mutex;
-use socket2::Socket;
 
 use crate::{
     device::{
         data_poll::{self, DataPoll, Event},
         dev_lock::Lock,
-        peer::Peer,
+        packet_workers::{BatchSender, NetPacket},
         waker::Waker,
         Device, Error, IfaceReadResult, Resume, MAX_PKT_SIZE, WG_HEADER_OFFSET,
     },
@@ -61,25 +59,32 @@ pub(super) struct Outbound {
     device: Arc<Lock<Device>>,
     stop: Arc<AtomicBool>,
     waker: Arc<Waker>,
+    net: BatchSender<NetPacket>,
 }
 
 impl Outbound {
-    pub fn new(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>, waker: Arc<Waker>) -> Self {
+    pub fn new(
+        device: Arc<Lock<Device>>,
+        stop: Arc<AtomicBool>,
+        waker: Arc<Waker>,
+        net: BatchSender<NetPacket>,
+    ) -> Self {
         Self {
             device,
             stop,
             waker,
+            net,
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(mut self) {
         if let Err(e) = self.main_loop() {
             tracing::error!(message = "Critical outbound thread failure, closing device", error = ?e);
             self.device.read().trigger_exit();
         }
     }
 
-    fn main_loop(&self) -> Result<(), Error> {
+    fn main_loop(&mut self) -> Result<(), Error> {
         let mut buf = [0u8; MAX_PKT_SIZE];
 
         while !self.stop.load(Ordering::Relaxed) {
@@ -92,7 +97,7 @@ impl Outbound {
         Ok(())
     }
 
-    fn inner_loop(&self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<Resume, Error> {
+    fn inner_loop(&mut self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<Resume, Error> {
         // Inner loop runs under the device read lock guard
         let device = self.device.read();
 
@@ -109,7 +114,9 @@ impl Outbound {
                 return Ok(Resume::Now);
             }
 
-            if view.process_ready(&poll, buf)?.is_break() {
+            let flow = view.process_ready(&poll, buf, &mut self.net)?;
+            self.net.flush()?;
+            if flow.is_break() {
                 return Ok(Resume::Now);
             }
         }
@@ -120,28 +127,22 @@ impl Outbound {
 struct OutboundView<'a> {
     device: &'a Device,
     waker: &'a Waker,
-    udp4: &'a Socket,
-    udp6: &'a Socket,
 }
 
 impl<'a> OutboundView<'a> {
     fn new(device: &'a Device, waker: &'a Waker) -> Option<Self> {
-        let (Some(udp4), Some(udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
+        let (Some(_udp4), Some(_udp6)) = (device.udp4.as_deref(), device.udp6.as_deref()) else {
             return None;
         };
 
-        Some(Self {
-            device,
-            waker,
-            udp4,
-            udp6,
-        })
+        Some(Self { device, waker })
     }
 
     fn process_ready(
         &self,
         poll: &DataPoll<'_, ()>,
         buf: &mut [u8; MAX_PKT_SIZE],
+        net: &mut BatchSender<NetPacket>,
     ) -> Result<ControlFlow<()>, Error> {
         for (_, revents) in poll.ready() {
             if revents.contains(PollFlags::POLLNVAL) {
@@ -157,10 +158,14 @@ impl<'a> OutboundView<'a> {
             }
         }
 
-        self.drain_tun(buf)
+        self.drain_tun(buf, net)
     }
 
-    fn drain_tun(&self, buf: &mut [u8; MAX_PKT_SIZE]) -> Result<ControlFlow<()>, Error> {
+    fn drain_tun(
+        &self,
+        buf: &mut [u8; MAX_PKT_SIZE],
+        net: &mut BatchSender<NetPacket>,
+    ) -> Result<ControlFlow<()>, Error> {
         let mtu = match CheckedMtu::new(self.device.mtu.load(Ordering::Relaxed)) {
             Some(m) => m,
             None => {
@@ -202,7 +207,11 @@ impl<'a> OutboundView<'a> {
             let res = encapsulate(&peer.tunnel, payload.len(), buf);
 
             match res {
-                TxResult::Packet(packet) => self.send_packet(&peer, packet),
+                TxResult::Packet(packet) => {
+                    if let Some(packet) = NetPacket::new(packet, peer) {
+                        net.push(packet)?;
+                    }
+                }
                 TxResult::Queued => {}
                 TxResult::NeedsHandshake => {
                     if peer.request_handshake() {
@@ -254,47 +263,6 @@ impl<'a> OutboundView<'a> {
                 tracing::error!(message = "Unexpected error on tun interface", error = ?e);
                 IfaceReadResult::Fatal(e)
             }
-        }
-    }
-
-    fn send_packet(&self, peer: &Arc<Peer>, packet: &mut [u8]) {
-        let endpoint = peer.endpoint();
-        if let Some(conn) = endpoint.conn.as_ref() {
-            match conn.send(packet) {
-                Ok(_) => {
-                    tracing::trace!(
-                        "Pkt -> ConnSock ({:?}), len: {}",
-                        endpoint.addr,
-                        packet.len()
-                    );
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    tracing::debug!(message = "Connected socket send buffer full, dropping packet", error = ?err);
-                }
-                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
-                    tracing::debug!(message = "Connected socket interface queue full, dropping packet", error = ?err);
-                }
-                Err(err) => {
-                    tracing::debug!(message = "Failed to send packet with the connected socket", error = ?err);
-                    if peer.request_disconnect() {
-                        self.device.notify_control();
-                    }
-                }
-            }
-        } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
-            if let Err(err) = self.udp4.send_to(packet, &addr.into()) {
-                tracing::warn!(message = "Failed to write packet to network v4", error = ?err, dst = ?addr);
-            } else {
-                tracing::trace!(message = "Writing packet to network v4", packet_length = packet.len(), src_addr = ?addr, peer = %peer.public_key);
-            }
-        } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-            if let Err(err) = self.udp6.send_to(packet, &addr.into()) {
-                tracing::warn!(message = "Failed to write packet to network v6", error = ?err, dst = ?addr);
-            } else {
-                tracing::trace!(message = "Writing packet to network v6", packet_length = packet.len(), src_addr = ?addr, peer = %peer.public_key);
-            }
-        } else {
-            tracing::error!("No endpoint");
         }
     }
 }

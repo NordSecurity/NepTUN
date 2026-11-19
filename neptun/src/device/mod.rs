@@ -9,6 +9,7 @@ mod dev_lock;
 pub mod drop_privileges;
 pub(crate) mod inbound;
 pub(crate) mod outbound;
+mod packet_workers;
 pub mod peer;
 pub mod waker;
 
@@ -133,7 +134,7 @@ where
             Ok(()) => {
                 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
                 udp_sock6.set_reuse_port(true)?;
-                return Ok((udp_sock4, udp_sock6, bound_port))
+                return Ok((udp_sock4, udp_sock6, bound_port));
             }
             Err(error)
                 if port == 0
@@ -263,9 +264,11 @@ pub struct Device {
     data_stop: Arc<AtomicBool>,
     out_waker: Arc<Waker>,
     in_waker: Arc<Waker>,
-    control_waker: Waker,
+    control_waker: Arc<Waker>,
     handshake_queue: Mutex<VecDeque<HandshakeMessage>>,
     conns_drop_requested: AtomicBool,
+
+    net_sockets: Arc<packet_workers::NetSockets>,
 }
 
 struct ControlThreadData {
@@ -377,9 +380,29 @@ impl DeviceHandle {
         })?;
         self.threads.push(control);
 
+        let (net, net_rx) = packet_workers::channel();
+        let (tun, tun_rx) = packet_workers::channel();
+        let (net_sockets, control_waker, iface, firewall) = {
+            let d = self.device.read();
+            (
+                d.net_sockets.clone(),
+                d.control_waker.clone(),
+                d.iface.clone(),
+                d.config.firewall_process_inbound_callback.clone(),
+            )
+        };
+        self.threads
+            .push(DeviceThread::start("neptun-net", move || {
+                packet_workers::network_worker(net_rx, net_sockets, control_waker);
+            })?);
+        self.threads
+            .push(DeviceThread::start("neptun-tun", move || {
+                packet_workers::tun_worker(tun_rx, iface, firewall);
+            })?);
+
         // Data plane
-        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker);
-        let outbound = Outbound::new(self.device.clone(), stop, out_waker);
+        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker, tun);
+        let outbound = Outbound::new(self.device.clone(), stop, out_waker, net);
 
         let inbound = DeviceThread::start("neptun-in", move || inbound.run())?;
         self.threads.push(inbound);
@@ -746,9 +769,10 @@ impl Device {
             data_stop: Arc::new(AtomicBool::new(false)),
             out_waker: Arc::new(Waker::new()?),
             in_waker: Arc::new(Waker::new()?),
-            control_waker: Waker::new()?,
+            control_waker: Arc::new(Waker::new()?),
             handshake_queue: Mutex::new(VecDeque::new()),
             conns_drop_requested: AtomicBool::new(false),
+            net_sockets: Default::default(),
         };
 
         if device.config.open_uapi_socket {
@@ -778,6 +802,10 @@ impl Device {
     }
 
     fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
+        let slot = Arc::clone(&self.net_sockets);
+        let mut net_sockets = slot.write();
+        *net_sockets = None;
+
         // Binds the network facing interfaces
         // First close any existing open socket
         for udp in [self.udp4.take(), self.udp6.take()].iter().flatten() {
@@ -804,8 +832,9 @@ impl Device {
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
-        self.udp4 = Some(udp4.clone());
-        self.udp6 = Some(udp6.clone());
+        *net_sockets = Some((udp4.clone(), udp6.clone()));
+        self.udp4 = Some(udp4);
+        self.udp6 = Some(udp6);
 
         self.listen_port = port;
 

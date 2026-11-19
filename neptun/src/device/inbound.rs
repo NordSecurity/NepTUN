@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write},
+    io,
     mem::MaybeUninit,
     net::{IpAddr, SocketAddr},
     ops::ControlFlow,
@@ -18,6 +18,7 @@ use crate::{
     device::{
         data_poll::{self, DataPoll, Event},
         dev_lock::Lock,
+        packet_workers::{BatchSender, TunPacket},
         peer::Peer,
         waker::Waker,
         Device, Error, Resume, MAX_PKT_SIZE,
@@ -34,25 +35,32 @@ pub(super) struct Inbound {
     device: Arc<Lock<Device>>,
     stop: Arc<AtomicBool>,
     waker: Arc<Waker>,
+    tun: BatchSender<TunPacket>,
 }
 
 impl Inbound {
-    pub fn new(device: Arc<Lock<Device>>, stop: Arc<AtomicBool>, waker: Arc<Waker>) -> Self {
+    pub fn new(
+        device: Arc<Lock<Device>>,
+        stop: Arc<AtomicBool>,
+        waker: Arc<Waker>,
+        tun: BatchSender<TunPacket>,
+    ) -> Self {
         Self {
             device,
             stop,
             waker,
+            tun,
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(mut self) {
         if let Err(e) = self.main_loop() {
             tracing::error!(message = "Critical inbound thread failure, closing device", error = ?e);
             self.device.read().trigger_exit();
         }
     }
 
-    fn main_loop(&self) -> Result<(), Error> {
+    fn main_loop(&mut self) -> Result<(), Error> {
         let mut rcvbuf = [0u8; MAX_PKT_SIZE];
         let mut dstbuf = [0u8; MAX_PKT_SIZE];
 
@@ -67,7 +75,7 @@ impl Inbound {
     }
 
     fn inner_loop(
-        &self,
+        &mut self,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
     ) -> Result<Resume, Error> {
@@ -95,7 +103,9 @@ impl Inbound {
                 return Ok(Resume::Now);
             }
 
-            if view.process_ready(&poll, rcvbuf, dstbuf)?.is_break() {
+            let flow = view.process_ready(&poll, rcvbuf, dstbuf, &mut self.tun)?;
+            self.tun.flush()?;
+            if flow.is_break() {
                 return Ok(Resume::Now);
             }
         }
@@ -171,6 +181,7 @@ impl<'a> InboundView<'a> {
         poll: &DataPoll<'_, PolledSocket<'_>>,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
+        tun: &mut BatchSender<TunPacket>,
     ) -> Result<ControlFlow<()>, Error> {
         let mut invalidated = false;
 
@@ -205,8 +216,8 @@ impl<'a> InboundView<'a> {
 
             if revents.contains(PollFlags::POLLIN) {
                 let result = match polled_socket {
-                    PolledSocket::Anon(sock) => self.drain_anon(sock, rcvbuf, dstbuf)?,
-                    PolledSocket::Conn(conn) => self.drain_conn(conn, rcvbuf, dstbuf)?,
+                    PolledSocket::Anon(sock) => self.drain_anon(sock, rcvbuf, dstbuf, tun)?,
+                    PolledSocket::Conn(conn) => self.drain_conn(conn, rcvbuf, dstbuf, tun)?,
                 };
 
                 if result.is_break() {
@@ -227,6 +238,7 @@ impl<'a> InboundView<'a> {
         sock: &Socket,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
+        tun: &mut BatchSender<TunPacket>,
     ) -> Result<ControlFlow<()>, Error> {
         for _ in 0..MAX_DRAIN_BATCH {
             if self.waker.is_pending() {
@@ -287,13 +299,11 @@ impl<'a> InboundView<'a> {
                 continue;
             };
 
-            if !self.deliver_data(peer, data, &mut dstbuf[..]) {
+            if !self.deliver_data(peer, data, &mut dstbuf[..], tun)? {
                 continue;
             }
 
-            if peer.needs_endpoint_update(sock_addr)
-                && peer.request_endpoint(sock_addr)
-            {
+            if peer.needs_endpoint_update(sock_addr) && peer.request_endpoint(sock_addr) {
                 self.device.notify_control();
             }
         }
@@ -306,6 +316,7 @@ impl<'a> InboundView<'a> {
         conn: &Conn,
         rcvbuf: &mut [u8; MAX_PKT_SIZE],
         dstbuf: &mut [u8; MAX_PKT_SIZE],
+        tun: &mut BatchSender<TunPacket>,
     ) -> Result<ControlFlow<()>, Error> {
         for _ in 0..MAX_DRAIN_BATCH {
             if self.waker.is_pending() {
@@ -359,7 +370,7 @@ impl<'a> InboundView<'a> {
                 }
             };
 
-            let _needs_update = self.deliver_data(&conn.peer, data, &mut dstbuf[..]);
+            let _needs_update = self.deliver_data(&conn.peer, data, &mut dstbuf[..], tun)?;
 
             #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
             if _needs_update {
@@ -370,10 +381,16 @@ impl<'a> InboundView<'a> {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Decrypts a data packet and writes it to the tunnel
+    /// Decrypts a data packet and queues it to the tunnel
     ///
     /// Returns `true` if the packet should update peer's endpoint
-    fn deliver_data(&self, peer: &Peer, data: PacketData<'_>, dstbuf: &mut [u8]) -> bool {
+    fn deliver_data(
+        &self,
+        peer: &Arc<Peer>,
+        data: PacketData<'_>,
+        dstbuf: &mut [u8],
+        tun: &mut BatchSender<TunPacket>,
+    ) -> Result<bool, Error> {
         let RxResult {
             decapsulated,
             queue_ready,
@@ -384,34 +401,16 @@ impl<'a> InboundView<'a> {
         }
 
         match decapsulated {
-            Ok(Decapsulated::Keepalive) => true,
+            Ok(Decapsulated::Keepalive) => Ok(true),
             Ok(Decapsulated::IpPacket(packet, src_addr)) => {
-                if let Some(callback) = &self.device.config.firewall_process_inbound_callback {
-                    if !callback(peer.public_key.as_bytes(), packet) {
-                        return false;
-                    }
+                if let Some(packet) = TunPacket::new(packet, Arc::clone(peer), src_addr) {
+                    tun.push(packet)?;
                 }
-
-                if peer.is_allowed_ip(src_addr) {
-                    _ = self.device.iface.as_ref().write(packet);
-                    tracing::trace!(
-                        message = "Writing packet to tunnel",
-                        interface = ?self.device.iface.name(),
-                        packet_length = packet.len(),
-                        src_addr = ?src_addr,
-                        peer = %peer.public_key,
-                    );
-                } else {
-                    tracing::debug!(
-                        message = "Dropping packet from outside of allowed IPs",
-                        src_addr = ?src_addr,
-                    );
-                }
-                true
+                Ok(true)
             }
             Err(e) => {
                 tracing::warn!(message = "Failed to handle packet", error = ?e);
-                false
+                Ok(false)
             }
         }
     }
