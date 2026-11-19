@@ -52,19 +52,14 @@ use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use thiserror::Error;
 use tun::TunSocket;
-
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-use dispatch2::{
-    DispatchGroup, DispatchQoS, DispatchQueue, DispatchQueueAttr, DispatchRetained, DispatchTime,
-};
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use {
     nix::sys::socket as NixSocket,
     std::os::fd::{AsFd, BorrowedFd},
-    std::thread::{self, JoinHandle},
 };
 
 /// Entered span carrying a peer's masked id, so every log statement in the
@@ -291,10 +286,7 @@ enum Resume {
 
 struct DeviceThread {
     name: String,
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     thread: JoinHandle<()>,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    thread: DispatchRetained<DispatchGroup>,
 }
 
 impl DeviceThread {
@@ -302,20 +294,6 @@ impl DeviceThread {
     where
         F: FnOnce() + Send + 'static,
     {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-        let thread = {
-            let attr = DispatchQueueAttr::with_qos_class(
-                DispatchQueueAttr::SERIAL,
-                DispatchQoS::UserInitiated,
-                0,
-            );
-            let queue = DispatchQueue::new(name, Some(&attr));
-            let group = DispatchGroup::new();
-            group.exec_async(&queue, runner);
-            group
-        };
-
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         let thread = {
             thread::Builder::new()
                 .name(name.to_string())
@@ -328,7 +306,6 @@ impl DeviceThread {
         })
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
     pub(crate) fn join(self) {
         if let Err(e) = self.thread.join() {
             tracing::error!(
@@ -337,24 +314,6 @@ impl DeviceThread {
                 error = ?e
             );
         }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-    pub(crate) fn join(self) {
-        if let Err(e) = self.thread.wait(DispatchTime::FOREVER) {
-            tracing::error!(
-                message = "Unable to gracefully close thread.",
-                thread = %self.name,
-                error = ?e
-            );
-        }
-    }
-
-    #[cfg(all(feature = "docker-tests", target_os = "macos"))]
-    pub fn is_running(&self) -> bool {
-        // A zero-timeout wait succeeds only once the dispatch group is empty,
-        // so a timeout means that the task in the group is running.
-        self.thread.wait(DispatchTime::NOW).is_err()
     }
 }
 
@@ -488,11 +447,6 @@ impl DeviceHandle {
         while let Some(thread) = self.threads.pop() {
             thread.join();
         }
-    }
-
-    #[cfg(all(feature = "docker-tests", target_os = "macos"))]
-    pub fn are_device_threads_active(&self) -> bool {
-        self.threads.iter().all(|g| g.is_running())
     }
 
     pub fn clean(&mut self) {
