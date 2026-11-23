@@ -34,10 +34,20 @@ const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
-const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+const N_WORDS: u64 = 128; // Suffice to reorder 64*128 = 8192 packets
 const N_BITS: u64 = WORD_SIZE * N_WORDS;
 
-#[derive(Debug, Clone, Default)]
+impl Default for ReceivingKeyCounterValidator {
+    fn default() -> Self {
+        Self {
+            next: Default::default(),
+            receive_cnt: Default::default(),
+            bitmap: [0; N_WORDS as usize],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
