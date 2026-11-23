@@ -9,6 +9,7 @@ mod dev_lock;
 pub mod drop_privileges;
 pub(crate) mod inbound;
 pub(crate) mod outbound;
+mod packet_workers;
 pub mod peer;
 mod waker;
 
@@ -294,9 +295,11 @@ pub struct Device {
     data_stop: Arc<AtomicBool>,
     out_waker: Arc<Waker>,
     in_waker: Arc<Waker>,
-    control_waker: Waker,
+    control_waker: Arc<Waker>,
     handshake_queue: Mutex<VecDeque<HandshakeMessage>>,
     conns_drop_requested: AtomicBool,
+
+    net_sockets: Arc<packet_workers::NetSockets>,
 }
 
 struct ControlThreadData {
@@ -408,9 +411,30 @@ impl DeviceHandle {
         })?;
         self.threads.push(control);
 
+        // Packet workers for data plane
+        let (tun_batcher, tun_queue) = packet_workers::batch_queue();
+        let (net_batcher, net_queue) = packet_workers::batch_queue();
+        let (net_sockets, control_waker, iface, firewall) = {
+            let d = self.device.read();
+            (
+                d.net_sockets.clone(),
+                d.control_waker.clone(),
+                d.iface.clone(),
+                d.config.firewall_process_inbound_callback.clone(),
+            )
+        };
+        self.threads
+            .push(DeviceThread::start("neptun-in-tun", move || {
+                packet_workers::tun_worker(tun_queue, iface, firewall);
+            })?);
+        self.threads
+            .push(DeviceThread::start("neptun-out-net", move || {
+                packet_workers::network_worker(net_queue, net_sockets, control_waker);
+            })?);
+
         // Data plane
-        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker);
-        let outbound = Outbound::new(self.device.clone(), stop, out_waker);
+        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker, tun_batcher);
+        let outbound = Outbound::new(self.device.clone(), stop, out_waker, net_batcher);
 
         let inbound = DeviceThread::start("neptun-in", move || inbound.run())?;
         self.threads.push(inbound);
@@ -778,9 +802,10 @@ impl Device {
             data_stop: Arc::new(AtomicBool::new(false)),
             out_waker: Arc::new(Waker::new()?),
             in_waker: Arc::new(Waker::new()?),
-            control_waker: Waker::new()?,
+            control_waker: Arc::new(Waker::new()?),
             handshake_queue: Mutex::new(VecDeque::new()),
             conns_drop_requested: AtomicBool::new(false),
+            net_sockets: Default::default(),
         };
 
         if device.config.open_uapi_socket {
@@ -811,6 +836,10 @@ impl Device {
 
     // Binds the network facing interfaces
     fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
+        // Pause the network worker and release the sockets for the port rebinding
+        let mut net_sockets = self.net_sockets.write();
+        *net_sockets = None;
+
         // Unregister old sockets from the protector before they are closed.
         // This lets the the socket protector to forget about the socket
         // (and avoid potential rebinding, even if the socket FD is re-used in other processes)
@@ -842,8 +871,9 @@ impl Device {
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
-        self.udp4 = Some(udp4.clone());
-        self.udp6 = Some(udp6.clone());
+        *net_sockets = Some((udp4.clone(), udp6.clone()));
+        self.udp4 = Some(udp4);
+        self.udp6 = Some(udp6);
 
         self.listen_port = port;
 
