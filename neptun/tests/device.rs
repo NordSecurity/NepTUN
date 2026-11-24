@@ -267,17 +267,12 @@ impl WGHandle {
             addr_v4,
             addr_v6,
             DeviceConfig {
-                n_threads: 2,
                 use_connected_socket: true,
-                #[cfg(target_os = "linux")]
-                use_multi_queue: true,
                 open_uapi_socket: true,
                 protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
                 firewall_process_inbound_callback: None,
                 firewall_process_outbound_callback: None,
                 skt_buffer_size: None,
-                inter_thread_channel_size: None,
-                max_inter_thread_batched_pkts: None,
             },
         )
     }
@@ -386,19 +381,6 @@ fn test_wireguard_get_on_device() {
 }
 
 #[test]
-/// Test that the event loop is registered with the dispatch group on creating DeviceHandle (registration is atomic)
-#[cfg(target_os = "macos")] // specific to dispatch crate's API (Apple's GCD wrapper)
-fn test_event_loop_active_directly_after_device_creation() {
-    let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
-
-    assert!(
-        wg.device.is_event_loop_active(),
-        "Device event loop's dispatch group is empty immediately after `DeviceHandle::new` returned. \
-        A call to `DeviceHandle::wait()` would return instantly."
-    );
-}
-
-#[test]
 #[cfg(not(target_os = "macos"))] // macOS implementation does not support UAPI command chaining within a single connection
 fn test_wireguard_uapi_chaining() {
     let wg = WGHandle::init("192.0.2.0".parse().unwrap(), "::2".parse().unwrap());
@@ -502,17 +484,12 @@ fn test_wg_start_ipv4_non_connected() {
         addr_v4,
         addr_v6,
         DeviceConfig {
-            n_threads: 2,
             use_connected_socket: false,
-            #[cfg(target_os = "linux")]
-            use_multi_queue: true,
             open_uapi_socket: true,
             protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
-            inter_thread_channel_size: None,
-            max_inter_thread_batched_pkts: None,
         },
     );
 
@@ -801,17 +778,12 @@ fn test_wg_start_ipv6_endpoint_not_connected() {
         addr_v4,
         addr_v6,
         DeviceConfig {
-            n_threads: 2,
             use_connected_socket: false,
-            #[cfg(target_os = "linux")]
-            use_multi_queue: true,
             open_uapi_socket: true,
             protect: Arc::new(neptun::device::MakeExternalNeptunNoop),
             firewall_process_inbound_callback: None,
             firewall_process_outbound_callback: None,
             skt_buffer_size: None,
-            inter_thread_channel_size: None,
-            max_inter_thread_batched_pkts: None,
         },
     );
 

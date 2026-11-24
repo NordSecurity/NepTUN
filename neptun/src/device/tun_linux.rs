@@ -5,8 +5,8 @@
 use super::Error;
 use libc::{
     self, __c_anonymous_ifr_ifru, c_char, c_short, close, fcntl, ifreq, open, read, socket, write,
-    AF_INET, F_GETFL, F_SETFL, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, IFNAMSIZ, IF_NAMESIZE,
-    IPPROTO_IP, O_NONBLOCK, O_RDWR, SIOCGIFMTU, SOCK_STREAM,
+    AF_INET, F_GETFL, F_SETFL, IFF_NO_PI, IFF_TUN, IFNAMSIZ, IF_NAMESIZE, IPPROTO_IP, O_NONBLOCK,
+    O_RDWR, SIOCGIFMTU, SOCK_STREAM,
 };
 use nix::{ioctl_read_bad, ioctl_write_ptr_bad};
 use std::io::{self, Write};
@@ -99,7 +99,7 @@ impl TunSocket {
             let mut ifr = ifreq {
                 ifr_name: [0; IFNAMSIZ],
                 ifr_ifru: __c_anonymous_ifr_ifru {
-                    ifru_flags: (IFF_TUN | IFF_MULTI_QUEUE | IFF_NO_PI) as _,
+                    ifru_flags: (IFF_TUN | IFF_NO_PI) as _,
                 },
             };
 
