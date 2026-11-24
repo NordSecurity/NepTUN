@@ -4,6 +4,7 @@
 
 pub mod allowed_ips;
 pub mod api;
+mod data_poll;
 mod dev_lock;
 pub mod drop_privileges;
 pub mod peer;
@@ -186,6 +187,8 @@ pub enum Error {
     SetTunnel,
     #[error("Internal error occured: {0}")]
     InternalError(String),
+    #[error("Poll error: {0}")]
+    Poll(io::Error),
 }
 
 // What the event loop should do after a handler returns
