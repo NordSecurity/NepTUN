@@ -7,6 +7,7 @@ pub mod api;
 mod dev_lock;
 pub mod drop_privileges;
 pub mod peer;
+mod waker;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 #[path = "kqueue.rs"]
