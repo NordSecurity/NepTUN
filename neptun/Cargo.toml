@@ -47,7 +47,7 @@ subtle = "2.6.1"
 dispatch2 = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = [
+nix = { version = "0.31.4", default-features = false, features = [
     "ioctl",
     "time",
     "user",
