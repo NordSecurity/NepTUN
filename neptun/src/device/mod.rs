@@ -9,6 +9,7 @@ mod dev_lock;
 pub mod drop_privileges;
 pub(crate) mod inbound;
 pub(crate) mod outbound;
+mod packet_workers;
 pub mod peer;
 mod waker;
 
@@ -243,6 +244,31 @@ impl MakeExternalNeptun for MakeExternalNeptunNoop {
     }
 }
 
+/// Socket registered with the protector for as long as it is open
+pub(crate) struct ProtectedSocket {
+    /// Declared first, so the protector forgets the fd before it is closed
+    /// (see [`MakeExternalNeptun::make_external`])
+    _guard: ExternalGuard,
+    socket: socket2::Socket,
+}
+
+impl ProtectedSocket {
+    pub(crate) fn new(protect: &dyn MakeExternalNeptun, socket: socket2::Socket) -> Self {
+        Self {
+            _guard: protect.make_external(socket.as_raw_fd()),
+            socket,
+        }
+    }
+}
+
+impl std::ops::Deref for ProtectedSocket {
+    type Target = socket2::Socket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
+
 pub struct DeviceHandle {
     pub device: Arc<Lock<Device>>, // The interface this handle owns
     threads: Vec<DeviceThread>,
@@ -270,9 +296,8 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
-    udp_guards: Vec<ExternalGuard>,
-    udp4: Option<Arc<socket2::Socket>>,
-    udp6: Option<Arc<socket2::Socket>>,
+    udp4: Option<Arc<ProtectedSocket>>,
+    udp6: Option<Arc<ProtectedSocket>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -294,9 +319,11 @@ pub struct Device {
     data_stop: Arc<AtomicBool>,
     out_waker: Arc<Waker>,
     in_waker: Arc<Waker>,
-    control_waker: Waker,
+    control_waker: Arc<Waker>,
     handshake_queue: Mutex<VecDeque<HandshakeMessage>>,
     conns_drop_requested: AtomicBool,
+
+    net_sockets: Arc<packet_workers::NetSockets>,
 }
 
 struct ControlThreadData {
@@ -408,9 +435,30 @@ impl DeviceHandle {
         })?;
         self.threads.push(control);
 
+        // Packet workers for data plane
+        let (tun_batcher, tun_queue) = packet_workers::batch_queue();
+        let (net_batcher, net_queue) = packet_workers::batch_queue();
+        let (net_sockets, control_waker, iface, firewall) = {
+            let d = self.device.read();
+            (
+                d.net_sockets.clone(),
+                d.control_waker.clone(),
+                d.iface.clone(),
+                d.config.firewall_process_inbound_callback.clone(),
+            )
+        };
+        self.threads
+            .push(DeviceThread::start("neptun-in-tun", move || {
+                packet_workers::tun_worker(tun_queue, iface, firewall);
+            })?);
+        self.threads
+            .push(DeviceThread::start("neptun-out-net", move || {
+                packet_workers::network_worker(net_queue, net_sockets, control_waker);
+            })?);
+
         // Data plane
-        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker);
-        let outbound = Outbound::new(self.device.clone(), stop, out_waker);
+        let inbound = Inbound::new(self.device.clone(), stop.clone(), in_waker, tun_batcher);
+        let outbound = Outbound::new(self.device.clone(), stop, out_waker, net_batcher);
 
         let inbound = DeviceThread::start("neptun-in", move || inbound.run())?;
         self.threads.push(inbound);
@@ -768,7 +816,6 @@ impl Device {
             peers: Default::default(),
             peers_by_idx: Default::default(),
             peers_by_ip: AllowedIps::new(),
-            udp_guards: Default::default(),
             udp4: Default::default(),
             udp6: Default::default(),
             cleanup_paths: Default::default(),
@@ -778,9 +825,10 @@ impl Device {
             data_stop: Arc::new(AtomicBool::new(false)),
             out_waker: Arc::new(Waker::new()?),
             in_waker: Arc::new(Waker::new()?),
-            control_waker: Waker::new()?,
+            control_waker: Arc::new(Waker::new()?),
             handshake_queue: Mutex::new(VecDeque::new()),
             conns_drop_requested: AtomicBool::new(false),
+            net_sockets: Default::default(),
         };
 
         if device.config.open_uapi_socket {
@@ -811,12 +859,11 @@ impl Device {
 
     // Binds the network facing interfaces
     fn open_listen_socket(&mut self, port: u16) -> Result<(), Error> {
-        // Unregister old sockets from the protector before they are closed.
-        // This lets the the socket protector to forget about the socket
-        // (and avoid potential rebinding, even if the socket FD is re-used in other processes)
-        self.udp_guards.clear();
+        // Pause the network worker and release the sockets for the port rebinding
+        let mut net_sockets = self.net_sockets.write();
+        *net_sockets = None;
 
-        // Close any existing open socket
+        // Close any existing open socket and forget its related fd
         _ = self.udp4.take();
         _ = self.udp6.take();
 
@@ -828,10 +875,9 @@ impl Device {
         let (udp_sock4, udp_sock6, port) = bind_listen_sockets(port)?;
         udp_sock4.set_nonblocking(true)?;
         udp_sock6.set_nonblocking(true)?;
-        self.udp_guards = vec![
-            self.config.protect.make_external(udp_sock4.as_raw_fd()),
-            self.config.protect.make_external(udp_sock6.as_raw_fd()),
-        ];
+
+        let udp_sock4 = ProtectedSocket::new(&*self.config.protect, udp_sock4);
+        let udp_sock6 = ProtectedSocket::new(&*self.config.protect, udp_sock6);
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = self.config.skt_buffer_size {
@@ -842,8 +888,9 @@ impl Device {
 
         let udp4 = Arc::new(udp_sock4);
         let udp6 = Arc::new(udp_sock6);
-        self.udp4 = Some(udp4.clone());
-        self.udp6 = Some(udp6.clone());
+        *net_sockets = Some((udp4.clone(), udp6.clone()));
+        self.udp4 = Some(udp4);
+        self.udp6 = Some(udp6);
 
         self.listen_port = port;
 
@@ -1498,7 +1545,6 @@ mod tests {
         let (mut device, _far) = mock_device_with_protect(Arc::new(protect.clone()));
 
         device.open_listen_socket(0).unwrap();
-        println!("{:?}", device.udp_guards);
 
         let fds = listen_fds(&device);
         assert_eq!(fds.len(), 2);
