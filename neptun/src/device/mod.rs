@@ -244,6 +244,31 @@ impl MakeExternalNeptun for MakeExternalNeptunNoop {
     }
 }
 
+/// Socket registered with the protector for as long as it is open
+pub(crate) struct ProtectedSocket {
+    /// Declared first, so the protector forgets the fd before it is closed
+    /// (see [`MakeExternalNeptun::make_external`])
+    _guard: ExternalGuard,
+    socket: socket2::Socket,
+}
+
+impl ProtectedSocket {
+    pub(crate) fn new(protect: &dyn MakeExternalNeptun, socket: socket2::Socket) -> Self {
+        Self {
+            _guard: protect.make_external(socket.as_raw_fd()),
+            socket,
+        }
+    }
+}
+
+impl std::ops::Deref for ProtectedSocket {
+    type Target = socket2::Socket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
+
 pub struct DeviceHandle {
     pub device: Arc<Lock<Device>>, // The interface this handle owns
     threads: Vec<DeviceThread>,
@@ -271,9 +296,8 @@ pub struct Device {
 
     iface: Arc<TunSocket>,
     closed: bool,
-    udp_guards: Vec<ExternalGuard>,
-    udp4: Option<Arc<socket2::Socket>>,
-    udp6: Option<Arc<socket2::Socket>>,
+    udp4: Option<Arc<ProtectedSocket>>,
+    udp6: Option<Arc<ProtectedSocket>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -792,7 +816,6 @@ impl Device {
             peers: Default::default(),
             peers_by_idx: Default::default(),
             peers_by_ip: AllowedIps::new(),
-            udp_guards: Default::default(),
             udp4: Default::default(),
             udp6: Default::default(),
             cleanup_paths: Default::default(),
@@ -840,12 +863,7 @@ impl Device {
         let mut net_sockets = self.net_sockets.write();
         *net_sockets = None;
 
-        // Unregister old sockets from the protector before they are closed.
-        // This lets the the socket protector to forget about the socket
-        // (and avoid potential rebinding, even if the socket FD is re-used in other processes)
-        self.udp_guards.clear();
-
-        // Close any existing open socket
+        // Close any existing open socket and forget its related fd
         _ = self.udp4.take();
         _ = self.udp6.take();
 
@@ -857,10 +875,9 @@ impl Device {
         let (udp_sock4, udp_sock6, port) = bind_listen_sockets(port)?;
         udp_sock4.set_nonblocking(true)?;
         udp_sock6.set_nonblocking(true)?;
-        self.udp_guards = vec![
-            self.config.protect.make_external(udp_sock4.as_raw_fd()),
-            self.config.protect.make_external(udp_sock6.as_raw_fd()),
-        ];
+
+        let udp_sock4 = ProtectedSocket::new(&*self.config.protect, udp_sock4);
+        let udp_sock6 = ProtectedSocket::new(&*self.config.protect, udp_sock6);
 
         #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
         if let Some(buffer_size) = self.config.skt_buffer_size {
@@ -1528,7 +1545,6 @@ mod tests {
         let (mut device, _far) = mock_device_with_protect(Arc::new(protect.clone()));
 
         device.open_listen_socket(0).unwrap();
-        println!("{:?}", device.udp_guards);
 
         let fds = listen_fds(&device);
         assert_eq!(fds.len(), 2);

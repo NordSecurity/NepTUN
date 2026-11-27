@@ -13,7 +13,9 @@ use std::{
 use parking_lot::RwLock;
 use socket2::Socket;
 
-use crate::device::{peer::Peer, tun::TunSocket, waker::Waker, Error, MAX_PKT_SIZE};
+use crate::device::{
+    peer::Peer, tun::TunSocket, waker::Waker, Error, ProtectedSocket, MAX_PKT_SIZE,
+};
 
 /// Maximum number of packets in a batch
 const MAX_BATCH_SIZE: usize = 64;
@@ -22,7 +24,7 @@ const MAX_BATCH_SIZE: usize = 64;
 const QUEUE_SIZE: usize = 16;
 
 /// IPv4 and IPv6 listen sockets
-pub(super) type NetSockets = RwLock<Option<(Arc<Socket>, Arc<Socket>)>>;
+pub(super) type NetSockets = RwLock<Option<(Arc<ProtectedSocket>, Arc<ProtectedSocket>)>>;
 
 type InboundFirewall = Arc<dyn Fn(&[u8; 32], &mut [u8]) -> bool + Send + Sync>;
 
