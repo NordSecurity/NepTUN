@@ -13,6 +13,23 @@ use std::sync::atomic::AtomicBool;
 
 const CTRL_NAME: &[u8] = b"com.apple.net.utun_control";
 
+// libc >= 0.2.190 provides these only on macOS, but the kernel control and utun
+// ABI is the same on iOS and tvOS (<sys/sys_domain.h>, <net/if_utun.h>)
+const SYSPROTO_CONTROL: c_int = 2;
+const AF_SYS_CONTROL: c_int = 2;
+const UTUN_OPT_IFNAME: c_int = 2;
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct sockaddr_ctl {
+    sc_len: c_uchar,
+    sc_family: c_uchar,
+    ss_sysaddr: u16,
+    sc_id: u32,
+    sc_unit: u32,
+    sc_reserved: [u32; 5],
+}
+
 #[repr(C)]
 pub struct ctl_info {
     pub ctl_id: u32,
